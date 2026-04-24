@@ -1,0 +1,2 @@
+crc=4180a209	ts=2026-04-23 20:56:54.071467	shard=0	seq=0	level=INFO	payload=[/root/workspace/seastar-log-engine/src/unit_tests.cc:85] compat-info
+crc=dcc02c9d	ts=2026-04-23 20:56:54.071475	shard=0	seq=1	level=WARN	payload=[/root/workspace/seastar-log-engine/src/unit_tests.cc:86] compat-warn
