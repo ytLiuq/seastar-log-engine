@@ -110,6 +110,46 @@ seastar::future<> test_compat_logging(const std::string& root_dir) {
     co_return;
 }
 
+seastar::future<> test_compat_unbound_drops_messages(const std::string& root_dir) {
+    namespace fs = std::filesystem;
+    const auto log_dir = (fs::path(root_dir) / "compat-unbound-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "compat-unbound-archive").string();
+    fs::create_directories(log_dir);
+    fs::create_directories(archive_dir);
+    for (const auto& entry : fs::directory_iterator(log_dir)) {
+        fs::remove(entry.path());
+    }
+    for (const auto& entry : fs::directory_iterator(archive_dir)) {
+        fs::remove(entry.path());
+    }
+
+    LOG_INFO << "unbound-message-should-drop";
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 1;
+    config.stream_buffer_size = 512;
+    config.write_behind = 1;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    log_engine::compat::bind(engine);
+    co_await log_engine::compat::flush();
+    co_await engine.info("bound-message", "route-b");
+    log_engine::compat::unbind();
+    co_await engine.stop();
+
+    log_engine::ReadQuery query;
+    query.include_archive = false;
+    query.limit = 10;
+    const auto files = log_engine::collect_log_files(config, query);
+    const auto records = log_engine::read_records(files, query);
+    require(records.size() == 1, "unbound compat logging should not leak into later flushes");
+    require(records.front().payload == "bound-message", "expected only explicitly bound log message");
+    co_return;
+}
+
 seastar::future<> test_time_rotation_and_archive_read(const std::string& root_dir) {
     namespace fs = std::filesystem;
     const auto log_dir = (fs::path(root_dir) / "time-logs").string();
@@ -229,6 +269,7 @@ int main(int argc, char** argv) {
         co_await test_record_codec();
         co_await test_config_loader(root_dir);
         co_await test_compat_logging(root_dir);
+        co_await test_compat_unbound_drops_messages(root_dir);
         co_await test_time_rotation_and_archive_read(root_dir);
         co_await test_recovery_scan(root_dir);
         co_return;

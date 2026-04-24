@@ -75,6 +75,11 @@ void LogLine::send() {
         ? payload
         : ("[" + _file + ":" + std::to_string(_line) + "] " + payload);
 
+    if (!bound_engine) {
+        std::fprintf(stderr, "[log_engine::compat] logger not initialized: %s\n", full_message.c_str());
+        return;
+    }
+
     pending_messages.push_back(LogMessage{
         .level = _level,
         .payload = std::move(full_message),

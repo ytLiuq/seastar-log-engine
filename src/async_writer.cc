@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <utility>
+#include <vector>
 
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/future-util.hh>
@@ -324,13 +325,25 @@ seastar::future<> AsyncWriter::persist_checkpoint() {
 
 seastar::future<> AsyncWriter::write_aligned_buffer(const seastar::temporary_buffer<char>& buffer, std::size_t expected) {
     std::exception_ptr last_error;
+    const auto base_offset = _write_offset;
+    const auto chunk_limit = std::max(align_up(_config.stream_buffer_size, _alignment), _alignment);
+    std::vector<std::size_t> chunk_offsets;
+    chunk_offsets.reserve((expected + chunk_limit - 1) / chunk_limit);
+    for (std::size_t offset = 0; offset < expected; offset += chunk_limit) {
+        chunk_offsets.push_back(offset);
+    }
+
     for (std::size_t attempt = 0; attempt < _config.write_retry_count; ++attempt) {
         bool success = false;
         try {
-            const auto written = co_await _file->dma_write(_write_offset, buffer.get(), buffer.size());
-            if (written != expected) {
-                throw std::runtime_error("short dma_write while flushing log batch");
-            }
+            co_await seastar::max_concurrent_for_each(chunk_offsets, _config.write_behind, [this, &buffer, expected, chunk_limit, base_offset](std::size_t chunk_offset) {
+                const auto chunk_size = std::min(chunk_limit, expected - chunk_offset);
+                return _file->dma_write(base_offset + chunk_offset, buffer.get() + chunk_offset, chunk_size).then([chunk_size](std::size_t written) {
+                    if (written != chunk_size) {
+                        throw std::runtime_error("short dma_write while flushing log batch");
+                    }
+                });
+            });
             co_await _file->flush();
             success = true;
         } catch (...) {
