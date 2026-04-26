@@ -1,8 +1,10 @@
 #include "log_engine/async_writer.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -23,6 +25,56 @@ namespace {
 
 seastar::logger applog("log-engine");
 
+template <typename Visitor>
+void for_each_chunk_prefix(
+    const std::deque<seastar::temporary_buffer<char>>& first,
+    const std::deque<seastar::temporary_buffer<char>>& second,
+    std::size_t bytes,
+    Visitor&& visitor) {
+    auto visit = [&visitor, &bytes](const auto& chunks) {
+        for (const auto& chunk : chunks) {
+            if (bytes == 0) {
+                break;
+            }
+            const auto span = std::min(bytes, chunk.size());
+            visitor(chunk.get(), span);
+            bytes -= span;
+        }
+    };
+
+    visit(first);
+    visit(second);
+}
+
+std::deque<seastar::temporary_buffer<char>> collect_remaining_chunks(
+    std::deque<seastar::temporary_buffer<char>> first,
+    std::deque<seastar::temporary_buffer<char>> second,
+    std::size_t consumed) {
+    std::deque<seastar::temporary_buffer<char>> remaining;
+
+    auto consume = [&remaining, &consumed](auto& chunks) {
+        while (!chunks.empty()) {
+            auto chunk = std::move(chunks.front());
+            chunks.pop_front();
+            if (consumed >= chunk.size()) {
+                consumed -= chunk.size();
+                continue;
+            }
+            if (consumed > 0) {
+                chunk.trim_front(consumed);
+                consumed = 0;
+            }
+            remaining.emplace_back(std::move(chunk));
+        }
+    };
+
+    consume(first);
+    consume(second);
+    return remaining;
+}
+
+const std::deque<seastar::temporary_buffer<char>> kEmptyChunks;
+
 }
 
 AsyncWriter::AsyncWriter()
@@ -38,7 +90,8 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
     _config.validate();
     co_await _log_manager.prepare(_config);
     _pending.clear();
-    _tail_buffer.clear();
+    _tail_chunks.clear();
+    _tail_bytes = 0;
     _sequence = 0;
     _write_offset = 0;
     _logical_size = 0;
@@ -136,28 +189,41 @@ seastar::future<> AsyncWriter::flush_once() {
     auto guard = seastar::defer([this] { _flush_in_progress = false; });
     co_await open_file();
 
-    std::deque<seastar::sstring> batch;
+    std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_pending);
 
     std::size_t bytes = 0;
     for (const auto& entry : batch) {
         bytes += entry.size();
     }
-
-    std::string joined;
-    joined.reserve(bytes);
-    for (auto& entry : batch) {
-        joined.append(entry.data(), entry.size());
-    }
-    _logical_size += joined.size();
-    _tail_buffer.append(joined);
+    _logical_size += bytes;
 
     try {
-        co_await flush_tail(false);
+        if (!batch.empty()) {
+            const auto total_bytes = _tail_bytes + bytes;
+            const auto writable_bytes = (total_bytes / _alignment) * _alignment;
+            if (writable_bytes > 0) {
+                auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, writable_bytes);
+                char* out = buffer.get_write();
+                for_each_chunk_prefix(_tail_chunks, batch, writable_bytes, [&out](const char* data, std::size_t size) {
+                    std::memcpy(out, data, size);
+                    out += size;
+                });
+                co_await write_aligned_buffer(buffer, writable_bytes);
+                _write_offset += writable_bytes;
+                _tail_chunks = collect_remaining_chunks(std::move(_tail_chunks), std::move(batch), writable_bytes);
+                _tail_bytes = total_bytes - writable_bytes;
+            } else {
+                while (!batch.empty()) {
+                    _tail_chunks.emplace_back(std::move(batch.front()));
+                    batch.pop_front();
+                }
+                _tail_bytes = total_bytes;
+            }
+        }
         co_await maybe_rotate();
     } catch (...) {
-        _logical_size -= joined.size();
-        _tail_buffer.resize(_tail_buffer.size() - joined.size());
+        _logical_size -= bytes;
         while (!batch.empty()) {
             _pending.emplace_front(std::move(batch.back()));
             batch.pop_back();
@@ -192,13 +258,7 @@ seastar::future<> AsyncWriter::flush_tail(bool closing) {
         co_return;
     }
 
-    std::size_t writable_bytes = 0;
-    if (closing) {
-        writable_bytes = align_up(_tail_buffer.size(), _alignment);
-    } else {
-        writable_bytes = (_tail_buffer.size() / _alignment) * _alignment;
-    }
-
+    const auto writable_bytes = closing ? align_up(_tail_bytes, _alignment) : (_tail_bytes / _alignment) * _alignment;
     if (writable_bytes == 0) {
         if (closing) {
             co_await _file->truncate(_logical_size);
@@ -209,18 +269,17 @@ seastar::future<> AsyncWriter::flush_tail(bool closing) {
 
     auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, writable_bytes);
     std::memset(buffer.get_write(), 0, writable_bytes);
-    const auto copy_bytes = std::min(writable_bytes, _tail_buffer.size());
-    std::memcpy(buffer.get_write(), _tail_buffer.data(), copy_bytes);
+    char* out = buffer.get_write();
+    for_each_chunk_prefix(_tail_chunks, kEmptyChunks, _tail_bytes, [&out](const char* data, std::size_t size) {
+        std::memcpy(out, data, size);
+        out += size;
+    });
 
     const auto expected = writable_bytes;
     co_await write_aligned_buffer(buffer, expected);
     _write_offset += expected;
-
-    if (expected >= _tail_buffer.size()) {
-        _tail_buffer.clear();
-    } else {
-        _tail_buffer.erase(0, expected);
-    }
+    _tail_chunks.clear();
+    _tail_bytes = 0;
 
     if (closing) {
         co_await _file->truncate(_logical_size);
@@ -249,23 +308,26 @@ seastar::future<> AsyncWriter::maybe_rotate() {
         _rotation_index);
     _write_offset = 0;
     _logical_size = 0;
-    _tail_buffer.clear();
+    _tail_chunks.clear();
+    _tail_bytes = 0;
     co_await open_file();
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
     }
 }
 
-seastar::sstring AsyncWriter::format_record(LogMessage&& message) {
-    return encode_record(
+seastar::temporary_buffer<char> AsyncWriter::format_record(LogMessage&& message) {
+    const auto timestamp = format_timestamp();
+    return encode_record_buffer(
+        _config,
         seastar::this_shard_id(),
         _sequence++,
         message.level,
-        format_timestamp(),
-        std::move(message.payload));
+        timestamp.view(),
+        message.payload);
 }
 
-std::string AsyncWriter::format_timestamp() {
+AsyncWriter::TimestampBuffer AsyncWriter::format_timestamp() {
     using clock = std::chrono::system_clock;
     const auto now = clock::now();
     const auto time = clock::to_time_t(now);
@@ -277,10 +339,10 @@ std::string AsyncWriter::format_timestamp() {
     std::tm tm{};
     localtime_r(&time, &tm);
 
-    char buffer[64];
-    std::snprintf(
-        buffer,
-        sizeof(buffer),
+    TimestampBuffer buffer;
+    const auto written = std::snprintf(
+        buffer.data.data(),
+        buffer.data.size(),
         "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
         tm.tm_year + 1900,
         tm.tm_mon + 1,
@@ -289,6 +351,7 @@ std::string AsyncWriter::format_timestamp() {
         tm.tm_min,
         tm.tm_sec,
         static_cast<long long>(micros));
+    buffer.size = written > 0 ? static_cast<std::size_t>(written) : 0;
     return buffer;
 }
 
@@ -305,8 +368,12 @@ seastar::future<> AsyncWriter::recover_from_checkpoint() {
     _logical_size = recovery.logical_size;
     _sequence = recovery.sequence;
     _rotation_index = recovery.rotation_index;
-    _tail_buffer = recovery.tail_buffer;
-    _write_offset = _logical_size - _tail_buffer.size();
+    _tail_chunks.clear();
+    _tail_bytes = recovery.tail_buffer.size();
+    if (_tail_bytes > 0) {
+        _tail_chunks.emplace_back(seastar::temporary_buffer<char>::copy_of(recovery.tail_buffer));
+    }
+    _write_offset = _logical_size - _tail_bytes;
     co_await _file->truncate(_logical_size);
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();

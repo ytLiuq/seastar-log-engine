@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include <seastar/core/sstring.hh>
+#include <seastar/core/temporary_buffer.hh>
 
 #include "log_engine/config.hh"
 
@@ -29,11 +30,20 @@ struct ParsedRecord {
 };
 
 seastar::sstring encode_record(
+    const EngineConfig& config,
     unsigned shard_id,
     std::uint64_t sequence,
     LogLevel level,
-    std::string timestamp,
-    std::string payload);
+    std::string_view timestamp,
+    std::string_view payload);
+
+seastar::temporary_buffer<char> encode_record_buffer(
+    const EngineConfig& config,
+    unsigned shard_id,
+    std::uint64_t sequence,
+    LogLevel level,
+    std::string_view timestamp,
+    std::string_view payload);
 
 VerifiedLogState scan_log_content(std::string_view content);
 bool verify_record_line(std::string_view line);

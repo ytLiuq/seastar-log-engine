@@ -2,8 +2,7 @@
 
 #include <array>
 #include <charconv>
-
-#include <seastar/core/print.hh>
+#include <cstring>
 
 namespace log_engine {
 
@@ -22,6 +21,7 @@ constexpr std::array<std::uint32_t, 256> make_crc32_table() {
 }
 
 constexpr auto crc32_table = make_crc32_table();
+constexpr char hex_digits[] = "0123456789abcdef";
 
 std::optional<std::uint32_t> parse_crc_hex(std::string_view input) {
     std::uint32_t value = 0;
@@ -50,29 +50,121 @@ std::optional<std::string_view> extract_field(std::string_view body, std::string
     return std::nullopt;
 }
 
+std::size_t decimal_length(std::uint64_t value) noexcept {
+    std::size_t digits = 1;
+    while (value >= 10) {
+        value /= 10;
+        ++digits;
+    }
+    return digits;
+}
+
+char* append_literal(char* out, std::string_view value) noexcept {
+    if (!value.empty()) {
+        std::memcpy(out, value.data(), value.size());
+        out += value.size();
+    }
+    return out;
+}
+
+char* append_decimal(char* out, std::uint64_t value) {
+    auto result = std::to_chars(out, out + 32, value, 10);
+    return result.ptr;
+}
+
+char* append_field_prefix(char* out, bool& first, std::string_view key) noexcept {
+    if (!first) {
+        *out++ = '\t';
+    } else {
+        first = false;
+    }
+    return append_literal(out, key);
+}
+
+void write_crc_prefix(char* out, std::uint32_t crc) noexcept {
+    out[0] = 'c';
+    out[1] = 'r';
+    out[2] = 'c';
+    out[3] = '=';
+    for (int i = 0; i < 8; ++i) {
+        out[11 - i] = hex_digits[crc & 0xfU];
+        crc >>= 4U;
+    }
+    out[12] = '\t';
+}
+
 }  // namespace
 
-seastar::sstring encode_record(
+seastar::temporary_buffer<char> encode_record_buffer(
+    const EngineConfig& config,
     unsigned shard_id,
     std::uint64_t sequence,
     LogLevel level,
-    std::string timestamp,
-    std::string payload) {
-    for (char& ch : payload) {
-        if (ch == '\n' || ch == '\r' || ch == '\t') {
-            ch = ' ';
-        }
+    std::string_view timestamp,
+    std::string_view payload) {
+    const auto shard_len = decimal_length(shard_id);
+    const auto seq_len = decimal_length(sequence);
+    const auto level_value = std::string_view(level_to_string(level));
+
+    std::size_t body_estimate = payload.size() + 32;
+    if (config.record_timestamp_enabled) {
+        body_estimate += 3 + timestamp.size();
+    }
+    if (config.record_shard_id_enabled) {
+        body_estimate += 6 + shard_len;
+    }
+    body_estimate += 4 + seq_len;
+    if (config.record_level_enabled) {
+        body_estimate += 6 + level_value.size();
     }
 
-    const auto body = seastar::format(
-        "ts={}\tshard={}\tseq={}\tlevel={}\tpayload={}",
-        timestamp,
-        shard_id,
-        sequence,
-        level_to_string(level),
-        payload);
+    const std::size_t prefix_size = config.record_crc_enabled ? 13 : 0;
+    auto buffer = seastar::temporary_buffer<char>(prefix_size + body_estimate + 1);
+    auto* const base = buffer.get_write();
+    char* body = base + prefix_size;
+    char* out = body;
+    bool first = true;
 
-    return seastar::format("crc={:08x}\t{}\n", crc32(body), body);
+    if (config.record_timestamp_enabled) {
+        out = append_field_prefix(out, first, "ts=");
+        out = append_literal(out, timestamp);
+    }
+    if (config.record_shard_id_enabled) {
+        out = append_field_prefix(out, first, "shard=");
+        out = append_decimal(out, shard_id);
+    }
+
+    out = append_field_prefix(out, first, "seq=");
+    out = append_decimal(out, sequence);
+
+    if (config.record_level_enabled) {
+        out = append_field_prefix(out, first, "level=");
+        out = append_literal(out, level_value);
+    }
+
+    out = append_field_prefix(out, first, "payload=");
+    for (const char ch : payload) {
+        *out++ = (ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
+    }
+
+    const auto body_size = static_cast<std::size_t>(out - body);
+    if (config.record_crc_enabled) {
+        write_crc_prefix(base, crc32(std::string_view(body, body_size)));
+    }
+    *out++ = '\n';
+    buffer.trim(static_cast<std::size_t>(out - base));
+    return buffer;
+}
+
+seastar::sstring encode_record(
+    const EngineConfig& config,
+    unsigned shard_id,
+    std::uint64_t sequence,
+    LogLevel level,
+    std::string_view timestamp,
+    std::string_view payload) {
+    auto buffer = encode_record_buffer(config, shard_id, sequence, level, timestamp, payload);
+    return seastar::sstring(buffer.get(), buffer.size());
 }
 
 VerifiedLogState scan_log_content(std::string_view content) {
@@ -110,7 +202,7 @@ VerifiedLogState scan_log_content(std::string_view content) {
 bool verify_record_line(std::string_view line) {
     constexpr std::string_view prefix = "crc=";
     if (line.rfind(prefix, 0) != 0) {
-        return false;
+        return extract_sequence(line).has_value();
     }
 
     const auto tab = line.find('\t');
@@ -128,13 +220,19 @@ bool verify_record_line(std::string_view line) {
 }
 
 std::optional<std::uint64_t> extract_sequence(std::string_view line) {
-    const auto tab = line.find('\t');
-    if (tab == std::string_view::npos || tab + 1 >= line.size()) {
+    const auto body = line.rfind("crc=", 0) == 0
+        ? ([&]() -> std::optional<std::string_view> {
+              const auto tab = line.find('\t');
+              if (tab == std::string_view::npos || tab + 1 >= line.size()) {
+                  return std::nullopt;
+              }
+              return line.substr(tab + 1);
+          })()
+        : std::optional<std::string_view>(line);
+    if (!body) {
         return std::nullopt;
     }
-
-    const auto body = line.substr(tab + 1);
-    const auto seq = extract_field(body, "seq=");
+    const auto seq = extract_field(*body, "seq=");
     if (!seq) {
         return std::nullopt;
     }
@@ -149,27 +247,27 @@ std::optional<std::uint64_t> extract_sequence(std::string_view line) {
 
 std::optional<ParsedRecord> parse_record_line(std::string_view line) {
     constexpr std::string_view prefix = "crc=";
-    if (line.rfind(prefix, 0) != 0) {
-        return std::nullopt;
-    }
+    std::optional<std::uint32_t> encoded_crc;
+    std::string_view body = line;
+    if (line.rfind(prefix, 0) == 0) {
+        const auto tab = line.find('\t');
+        if (tab == std::string_view::npos || tab <= prefix.size()) {
+            return std::nullopt;
+        }
 
-    const auto tab = line.find('\t');
-    if (tab == std::string_view::npos || tab <= prefix.size()) {
-        return std::nullopt;
-    }
+        encoded_crc = parse_crc_hex(line.substr(prefix.size(), tab - prefix.size()));
+        if (!encoded_crc) {
+            return std::nullopt;
+        }
 
-    const auto encoded_crc = parse_crc_hex(line.substr(prefix.size(), tab - prefix.size()));
-    if (!encoded_crc) {
-        return std::nullopt;
-    }
-
-    const auto body = line.substr(tab + 1);
-    if (*encoded_crc != crc32(body)) {
-        return std::nullopt;
+        body = line.substr(tab + 1);
+        if (*encoded_crc != crc32(body)) {
+            return std::nullopt;
+        }
     }
 
     ParsedRecord record;
-    record.crc = *encoded_crc;
+    record.crc = encoded_crc.value_or(0);
     record.raw_line.assign(line);
 
     const auto ts = extract_field(body, "ts=");
@@ -177,12 +275,14 @@ std::optional<ParsedRecord> parse_record_line(std::string_view line) {
     const auto seq = extract_field(body, "seq=");
     const auto level = extract_field(body, "level=");
     const auto payload = extract_field(body, "payload=");
-    if (!ts || !shard || !seq || !level || !payload) {
+    if (!seq || !payload) {
         return std::nullopt;
     }
 
-    record.timestamp.assign(ts->data(), ts->size());
-    {
+    if (ts) {
+        record.timestamp.assign(ts->data(), ts->size());
+    }
+    if (shard) {
         unsigned parsed = 0;
         const auto result = std::from_chars(shard->data(), shard->data() + shard->size(), parsed, 10);
         if (result.ec != std::errc{} || result.ptr != shard->data() + shard->size()) {
@@ -198,14 +298,16 @@ std::optional<ParsedRecord> parse_record_line(std::string_view line) {
         }
         record.sequence = parsed;
     }
-    if (*level == "INFO") {
-        record.level = LogLevel::info;
-    } else if (*level == "WARN") {
-        record.level = LogLevel::warn;
-    } else if (*level == "ERROR") {
-        record.level = LogLevel::error;
-    } else {
-        return std::nullopt;
+    if (level) {
+        if (*level == "INFO") {
+            record.level = LogLevel::info;
+        } else if (*level == "WARN") {
+            record.level = LogLevel::warn;
+        } else if (*level == "ERROR") {
+            record.level = LogLevel::error;
+        } else {
+            return std::nullopt;
+        }
     }
     record.payload.assign(payload->data(), payload->size());
     return record;

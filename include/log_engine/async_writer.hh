@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <deque>
 #include <optional>
 #include <string>
@@ -9,6 +10,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/timer.hh>
 
 #include "log_engine/config.hh"
@@ -37,8 +39,16 @@ private:
     seastar::future<> recover_from_checkpoint();
     seastar::future<> persist_checkpoint();
     seastar::future<> write_aligned_buffer(const seastar::temporary_buffer<char>& buffer, std::size_t expected);
-    seastar::sstring format_record(LogMessage&& message);
-    static std::string format_timestamp();
+    seastar::temporary_buffer<char> format_record(LogMessage&& message);
+    struct TimestampBuffer {
+        std::array<char, 64> data{};
+        std::size_t size = 0;
+
+        [[nodiscard]] std::string_view view() const noexcept {
+            return std::string_view(data.data(), size);
+        }
+    };
+    static TimestampBuffer format_timestamp();
     static std::size_t align_up(std::size_t value, std::size_t alignment) noexcept;
 
 private:
@@ -46,9 +56,10 @@ private:
     seastar::timer<seastar::lowres_clock> _flush_timer;
     seastar::gate _gate;
     std::optional<seastar::file> _file;
-    std::deque<seastar::sstring> _pending;
+    std::deque<seastar::temporary_buffer<char>> _pending;
     std::string _file_path;
-    std::string _tail_buffer;
+    std::deque<seastar::temporary_buffer<char>> _tail_chunks;
+    std::size_t _tail_bytes = 0;
     std::uint64_t _sequence = 0;
     std::uint64_t _write_offset = 0;
     std::uint64_t _logical_size = 0;
