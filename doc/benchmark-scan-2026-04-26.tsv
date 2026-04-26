@@ -1,0 +1,15 @@
+scenario	target	messages	payload_size	batch_size	inflight	checkpoint_enabled	elapsed_us	throughput_msg_per_sec	avg_submit_us
+payload-128	log_engine	50000	128	256	64	1	133987	373170.53	2.6797
+payload-128	glog	50000	128				78173	639607	
+payload-128	spdlog	50000	128				51668	967717	
+payload-512	log_engine	50000	512	256	64	1	271821	183944.58	5.4364
+payload-512	glog	50000	512				92913	538138	
+payload-512	spdlog	50000	512				75138	665442	
+batch-64	log_engine	50000	128	64	64	1	132544	377233.22	2.6509
+batch-256	log_engine	50000	128	256	64	1	115330	433538.54	2.3066
+batch-1024	log_engine	50000	128	1024	64	1	117160	426766.81	2.3432
+inflight-16	log_engine	50000	128	256	16	1	143552	348305.84	2.8710
+inflight-64	log_engine	50000	128	256	64	1	130355	383567.95	2.6071
+inflight-256	log_engine	50000	128	256	256	1	134546	371620.12	2.6909
+checkpoint-0	log_engine	50000	128	256	64	0	122956	406649.53	2.4591
+checkpoint-1	log_engine	50000	128	256	64	1	128173	390097.76	2.5635
