@@ -16,6 +16,10 @@ list(APPEND CMAKE_MODULE_PATH
 
 find_package(Seastar REQUIRED CONFIG PATHS "${SEASTAR_BUILD_DIR}" NO_DEFAULT_PATH)
 find_package(ZLIB REQUIRED)
+find_package(fmt QUIET CONFIG)
+find_package(spdlog QUIET CONFIG)
+find_library(SYSTEM_FMT_LIBRARY fmt PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu NO_DEFAULT_PATH)
+find_library(FMT_LIBRARY fmt)
 find_library(GLOG_LIBRARY glog)
 
 add_library(log_engine_core
@@ -77,4 +81,34 @@ if (GLOG_LIBRARY)
     target_link_libraries(glog_bench
         PRIVATE
             ${GLOG_LIBRARY})
+endif ()
+
+if (spdlog_FOUND)
+    add_executable(spdlog_bench
+        src/spdlog_bench.cc)
+    target_include_directories(spdlog_bench
+        BEFORE PRIVATE
+            /usr/include)
+    if (TARGET spdlog::spdlog)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                spdlog::spdlog)
+    elseif (TARGET spdlog::spdlog_header_only)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                spdlog::spdlog_header_only)
+    endif ()
+    if (SYSTEM_FMT_LIBRARY)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                ${SYSTEM_FMT_LIBRARY})
+    elseif (TARGET fmt::fmt)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                fmt::fmt)
+    elseif (FMT_LIBRARY)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                ${FMT_LIBRARY})
+    endif ()
 endif ()

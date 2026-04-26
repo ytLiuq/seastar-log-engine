@@ -104,6 +104,10 @@ EngineConfig apply_engine_config_overrides(
     base.checkpoint_enabled = resolve_bool_option(cli, file_values, "checkpoint-enabled", base.checkpoint_enabled);
     base.compress_archives = resolve_bool_option(cli, file_values, "compress-archives", base.compress_archives);
     base.use_dsync = resolve_bool_option(cli, file_values, "dsync", base.use_dsync);
+    base.record_crc_enabled = resolve_bool_option(cli, file_values, "record-crc-enabled", base.record_crc_enabled);
+    base.record_timestamp_enabled = resolve_bool_option(cli, file_values, "record-timestamp-enabled", base.record_timestamp_enabled);
+    base.record_level_enabled = resolve_bool_option(cli, file_values, "record-level-enabled", base.record_level_enabled);
+    base.record_shard_id_enabled = resolve_bool_option(cli, file_values, "record-shard-id-enabled", base.record_shard_id_enabled);
     return base;
 }
 

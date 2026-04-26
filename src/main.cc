@@ -49,7 +49,11 @@ int main(int argc, char** argv) {
         ("truncate-on-start", bpo::value<bool>()->default_value(true), "Truncate active log files on startup instead of recovering")
         ("checkpoint-enabled", bpo::value<bool>()->default_value(true), "Persist per-shard checkpoint sidecar files")
         ("compress-archives", bpo::value<bool>()->default_value(true), "Compress rotated archives with gzip")
-        ("dsync", bpo::value<bool>()->default_value(false), "Enable O_DSYNC when opening shard files");
+        ("dsync", bpo::value<bool>()->default_value(false), "Enable O_DSYNC when opening shard files")
+        ("record-crc-enabled", bpo::value<bool>()->default_value(true), "Emit crc= prefix and verify record checksum")
+        ("record-timestamp-enabled", bpo::value<bool>()->default_value(true), "Include ts= field in each record")
+        ("record-level-enabled", bpo::value<bool>()->default_value(true), "Include level= field in each record")
+        ("record-shard-id-enabled", bpo::value<bool>()->default_value(true), "Include shard= field in each record");
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
@@ -70,6 +74,10 @@ int main(int argc, char** argv) {
         base.checkpoint_enabled = app.configuration()["checkpoint-enabled"].as<bool>();
         base.compress_archives = app.configuration()["compress-archives"].as<bool>();
         base.use_dsync = app.configuration()["dsync"].as<bool>();
+        base.record_crc_enabled = app.configuration()["record-crc-enabled"].as<bool>();
+        base.record_timestamp_enabled = app.configuration()["record-timestamp-enabled"].as<bool>();
+        base.record_level_enabled = app.configuration()["record-level-enabled"].as<bool>();
+        base.record_shard_id_enabled = app.configuration()["record-shard-id-enabled"].as<bool>();
 
         const auto config_file = app.configuration()["config"].as<std::string>();
         const auto file_values = log_engine::load_config_file(config_file);

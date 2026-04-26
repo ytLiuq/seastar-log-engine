@@ -25,6 +25,10 @@ struct EngineConfig {
     bool checkpoint_enabled = true;
     bool compress_archives = true;
     bool use_dsync = false;
+    bool record_crc_enabled = true;
+    bool record_timestamp_enabled = true;
+    bool record_level_enabled = true;
+    bool record_shard_id_enabled = true;
 
     void validate() const {
         if (log_dir.empty()) {

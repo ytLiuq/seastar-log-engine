@@ -46,7 +46,11 @@ int main(int argc, char** argv) {
         ("compress-archives", bpo::value<bool>()->default_value(true), "Compress rotated archives with gzip")
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
-        ("inflight", bpo::value<std::size_t>()->default_value(256), "Maximum writes issued concurrently");
+        ("inflight", bpo::value<std::size_t>()->default_value(256), "Maximum writes issued concurrently")
+        ("record-crc-enabled", bpo::value<bool>()->default_value(true), "Emit crc= prefix and verify record checksum")
+        ("record-timestamp-enabled", bpo::value<bool>()->default_value(true), "Include ts= field in each record")
+        ("record-level-enabled", bpo::value<bool>()->default_value(true), "Include level= field in each record")
+        ("record-shard-id-enabled", bpo::value<bool>()->default_value(true), "Include shard= field in each record");
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
@@ -63,6 +67,10 @@ int main(int argc, char** argv) {
         base.compress_archives = app.configuration()["compress-archives"].as<bool>();
         base.write_retry_count = app.configuration()["write-retry-count"].as<std::size_t>();
         base.write_retry_backoff_ms = app.configuration()["write-retry-backoff-ms"].as<std::size_t>();
+        base.record_crc_enabled = app.configuration()["record-crc-enabled"].as<bool>();
+        base.record_timestamp_enabled = app.configuration()["record-timestamp-enabled"].as<bool>();
+        base.record_level_enabled = app.configuration()["record-level-enabled"].as<bool>();
+        base.record_shard_id_enabled = app.configuration()["record-shard-id-enabled"].as<bool>();
 
         const auto config_file = app.configuration()["config"].as<std::string>();
         const auto file_values = log_engine::load_config_file(config_file);

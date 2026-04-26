@@ -20,6 +20,7 @@
 - `demo` / `bench` / `verify` / `read` 四个可执行程序
 - 独立的 `verify` 校验工具
 - `glog` 对比 benchmark
+- `spdlog` 对比 benchmark（当本机安装 `spdlog` 并成功被 CMake 发现时）
 - 最小单元测试可执行程序
 
 当前目录结构：
@@ -31,7 +32,6 @@
 
 当前版本还没有完成实施方案中的以下增强项：
 
-- spdlog 对比 benchmark
 - 更接近 drop-in 的 glog/spdlog 兼容 API 封装层
 - 更系统化的单元测试与长稳压测
 
@@ -105,4 +105,5 @@
 
 ```bash
 ./script/compare_bench.sh 50000 128
+./script/compare_bench.sh --scan
 ```

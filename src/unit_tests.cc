@@ -24,6 +24,7 @@ void require(bool condition, const std::string& message) {
 
 seastar::future<> test_record_codec() {
     const auto encoded = log_engine::encode_record(
+        log_engine::EngineConfig{},
         1,
         42,
         log_engine::LogLevel::warn,
@@ -36,6 +37,26 @@ seastar::future<> test_record_codec() {
     require(parsed->level == log_engine::LogLevel::warn, "level mismatch");
     require(parsed->payload == "payload", "payload mismatch");
     require(log_engine::verify_record_line(encoded.substr(0, encoded.size() - 1)), "verify_record_line should succeed");
+
+    log_engine::EngineConfig compact_config;
+    compact_config.record_crc_enabled = false;
+    compact_config.record_timestamp_enabled = false;
+    compact_config.record_level_enabled = false;
+    compact_config.record_shard_id_enabled = false;
+    const auto compact = log_engine::encode_record(
+        compact_config,
+        3,
+        7,
+        log_engine::LogLevel::error,
+        "2026-01-01 00:00:00.000002",
+        "compact-payload");
+    const auto compact_line = compact.substr(0, compact.size() - 1);
+    const auto compact_parsed = log_engine::parse_record_line(compact_line);
+    require(compact_parsed.has_value(), "parse_record_line should support compact records");
+    require(compact_parsed->sequence == 7, "compact sequence mismatch");
+    require(compact_parsed->payload == "compact-payload", "compact payload mismatch");
+    require(compact_parsed->timestamp.empty(), "compact record should omit timestamp");
+    require(log_engine::verify_record_line(compact_line), "verify_record_line should support records without crc");
     co_return;
 }
 
@@ -48,6 +69,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
         out << "batch-size=17\n";
         out << "rotate-interval-seconds=9\n";
         out << "compress-archives=false\n";
+        out << "record-crc-enabled=false\n";
     }
 
     const auto values = log_engine::load_config_file(config_path);
@@ -57,6 +79,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     require(config.batch_size == 17, "config loader should override batch_size");
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
     require(config.compress_archives == false, "config loader should override compress_archives");
+    require(config.record_crc_enabled == false, "config loader should override record_crc_enabled");
     co_return;
 }
 
