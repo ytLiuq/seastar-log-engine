@@ -1,6 +1,8 @@
+#include <stdexcept>
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/program_options.hpp>
@@ -13,6 +15,16 @@
 #include "log_engine/log_engine.hh"
 
 namespace {
+
+log_engine::WriteMode parse_mode(std::string_view value) {
+    if (value == "fast") {
+        return log_engine::WriteMode::fast;
+    }
+    if (value == "full") {
+        return log_engine::WriteMode::full;
+    }
+    throw std::invalid_argument("mode must be fast or full");
+}
 
 std::string make_payload(std::uint64_t index, std::size_t target_size) {
     std::string payload = "bench-log-" + std::to_string(index) + " ";
@@ -29,6 +41,7 @@ int main(int argc, char** argv) {
     namespace bpo = boost::program_options;
 
     app.add_options()
+        ("mode", bpo::value<std::string>()->default_value("fast"), "Write path mode: fast or full")
         ("config", bpo::value<std::string>()->default_value(""), "Path to key=value config file")
         ("log-dir", bpo::value<std::string>()->default_value("logs"), "Directory for shard log files")
         ("archive-dir", bpo::value<std::string>()->default_value("archive"), "Directory for archived log files")
@@ -36,8 +49,11 @@ int main(int argc, char** argv) {
         ("messages", bpo::value<std::uint64_t>()->default_value(200000), "Number of messages to write")
         ("payload-size", bpo::value<std::size_t>()->default_value(256), "Approximate size of each log payload")
         ("route-keys", bpo::value<std::size_t>()->default_value(0), "Distinct route keys used for shard distribution, 0 keeps writes on the current shard")
-        ("batch-size", bpo::value<std::size_t>()->default_value(1024), "Number of entries per flush batch")
-        ("flush-ms", bpo::value<std::size_t>()->default_value(1), "Periodic flush interval in milliseconds")
+        ("batch-size", bpo::value<std::size_t>()->default_value(32), "Number of entries per flush batch")
+        ("flush-ms", bpo::value<std::size_t>()->default_value(0), "Periodic flush interval in milliseconds, 0 disables timer-based flush")
+        ("fast-path-max-pending-bytes", bpo::value<std::size_t>()->default_value(16384), "Fast path flush threshold in bytes")
+        ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
+        ("write-behind", bpo::value<std::size_t>()->default_value(8), "Output stream write-behind depth")
         ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
         ("rotate-interval-seconds", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after this many seconds, 0 disables time rotation")
         ("archive-retention-seconds", bpo::value<std::uint64_t>()->default_value(0), "Delete archived files older than this many seconds, 0 disables age cleanup")
@@ -46,7 +62,7 @@ int main(int argc, char** argv) {
         ("compress-archives", bpo::value<bool>()->default_value(false), "Compress rotated archives with gzip")
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
-        ("inflight", bpo::value<std::size_t>()->default_value(256), "Maximum writes issued concurrently")
+        ("inflight", bpo::value<std::size_t>()->default_value(1), "Maximum writes issued concurrently")
         ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
         ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
         ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
@@ -55,11 +71,15 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
+        base.write_mode = parse_mode(app.configuration()["mode"].as<std::string>());
         base.log_dir = app.configuration()["log-dir"].as<std::string>();
         base.archive_dir = app.configuration()["archive-dir"].as<std::string>();
         base.shard_file_prefix = app.configuration()["shard-file-prefix"].as<std::string>();
         base.batch_size = app.configuration()["batch-size"].as<std::size_t>();
         base.flush_interval_ms = app.configuration()["flush-ms"].as<std::size_t>();
+        base.fast_path_max_pending_bytes = app.configuration()["fast-path-max-pending-bytes"].as<std::size_t>();
+        base.stream_buffer_size = app.configuration()["stream-buffer-size"].as<std::size_t>();
+        base.write_behind = app.configuration()["write-behind"].as<std::size_t>();
         base.rotate_size_bytes = app.configuration()["rotate-size-bytes"].as<std::uint64_t>();
         base.rotate_interval_seconds = app.configuration()["rotate-interval-seconds"].as<std::uint64_t>();
         base.archive_retention_seconds = app.configuration()["archive-retention-seconds"].as<std::uint64_t>();

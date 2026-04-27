@@ -39,6 +39,16 @@ bool parse_bool(const std::string& value, const char* name) {
     throw std::invalid_argument(std::string("invalid bool for option ") + name + ": " + value);
 }
 
+WriteMode parse_write_mode(const std::string& value, const char* name) {
+    if (value == "fast") {
+        return WriteMode::fast;
+    }
+    if (value == "full") {
+        return WriteMode::full;
+    }
+    throw std::invalid_argument(std::string("invalid mode for option ") + name + ": " + value);
+}
+
 bool should_take_file_value(
     const boost::program_options::variables_map& cli,
     const std::string& name,
@@ -87,11 +97,13 @@ EngineConfig apply_engine_config_overrides(
     EngineConfig base,
     const boost::program_options::variables_map& cli,
     const ConfigMap& file_values) {
+    base.write_mode = resolve_write_mode_option(cli, file_values, "mode", base.write_mode);
     base.log_dir = resolve_string_option(cli, file_values, "log-dir", base.log_dir);
     base.archive_dir = resolve_string_option(cli, file_values, "archive-dir", base.archive_dir);
     base.shard_file_prefix = resolve_string_option(cli, file_values, "shard-file-prefix", base.shard_file_prefix);
     base.batch_size = resolve_size_option(cli, file_values, "batch-size", base.batch_size);
     base.flush_interval_ms = resolve_size_option(cli, file_values, "flush-ms", base.flush_interval_ms);
+    base.fast_path_max_pending_bytes = resolve_size_option(cli, file_values, "fast-path-max-pending-bytes", base.fast_path_max_pending_bytes);
     base.stream_buffer_size = resolve_size_option(cli, file_values, "stream-buffer-size", base.stream_buffer_size);
     base.write_behind = resolve_size_option(cli, file_values, "write-behind", base.write_behind);
     base.write_retry_count = resolve_size_option(cli, file_values, "write-retry-count", base.write_retry_count);
@@ -154,6 +166,17 @@ bool resolve_bool_option(
         return current_value;
     }
     return parse_bool(file_values.at(name), name.c_str());
+}
+
+WriteMode resolve_write_mode_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    WriteMode current_value) {
+    if (!should_take_file_value(cli, name, file_values)) {
+        return current_value;
+    }
+    return parse_write_mode(file_values.at(name), name.c_str());
 }
 
 }  // namespace log_engine

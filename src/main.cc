@@ -1,4 +1,6 @@
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/program_options.hpp>
@@ -12,6 +14,16 @@
 #include "log_engine/log_engine.hh"
 
 namespace {
+
+log_engine::WriteMode parse_mode(std::string_view value) {
+    if (value == "fast") {
+        return log_engine::WriteMode::fast;
+    }
+    if (value == "full") {
+        return log_engine::WriteMode::full;
+    }
+    throw std::invalid_argument("mode must be fast or full");
+}
 
 std::string make_payload(std::uint64_t index, std::size_t target_size) {
     std::string payload = "demo-log-" + std::to_string(index) + " ";
@@ -28,17 +40,19 @@ int main(int argc, char** argv) {
     namespace bpo = boost::program_options;
 
     app.add_options()
+        ("mode", bpo::value<std::string>()->default_value("fast"), "Write path mode: fast or full")
         ("config", bpo::value<std::string>()->default_value(""), "Path to key=value config file")
         ("log-dir", bpo::value<std::string>()->default_value("logs"), "Directory for shard log files")
         ("archive-dir", bpo::value<std::string>()->default_value("archive"), "Directory for archived log files")
         ("shard-file-prefix", bpo::value<std::string>()->default_value("shard"), "Shard log file prefix")
-        ("batch-size", bpo::value<std::size_t>()->default_value(1024), "Number of entries per flush batch")
-        ("flush-ms", bpo::value<std::size_t>()->default_value(1), "Periodic flush interval in milliseconds")
+        ("batch-size", bpo::value<std::size_t>()->default_value(32), "Number of entries per flush batch")
+        ("flush-ms", bpo::value<std::size_t>()->default_value(0), "Periodic flush interval in milliseconds, 0 disables timer-based flush")
+        ("fast-path-max-pending-bytes", bpo::value<std::size_t>()->default_value(16384), "Fast path flush threshold in bytes")
         ("messages", bpo::value<std::uint64_t>()->default_value(10000), "Number of demo messages to write")
         ("payload-size", bpo::value<std::size_t>()->default_value(128), "Approximate size of each log payload")
-        ("route-keys", bpo::value<std::size_t>()->default_value(8), "Distinct route keys used for shard distribution")
+        ("route-keys", bpo::value<std::size_t>()->default_value(0), "Distinct route keys used for shard distribution, 0 keeps writes on the current shard")
         ("emit-delay-ms", bpo::value<std::size_t>()->default_value(0), "Optional delay between demo messages")
-        ("write-behind", bpo::value<std::size_t>()->default_value(4), "Output stream write-behind depth")
+        ("write-behind", bpo::value<std::size_t>()->default_value(8), "Output stream write-behind depth")
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
         ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
@@ -58,11 +72,13 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
+        base.write_mode = parse_mode(app.configuration()["mode"].as<std::string>());
         base.log_dir = app.configuration()["log-dir"].as<std::string>();
         base.archive_dir = app.configuration()["archive-dir"].as<std::string>();
         base.shard_file_prefix = app.configuration()["shard-file-prefix"].as<std::string>();
         base.batch_size = app.configuration()["batch-size"].as<std::size_t>();
         base.flush_interval_ms = app.configuration()["flush-ms"].as<std::size_t>();
+        base.fast_path_max_pending_bytes = app.configuration()["fast-path-max-pending-bytes"].as<std::size_t>();
         base.stream_buffer_size = app.configuration()["stream-buffer-size"].as<std::size_t>();
         base.write_behind = app.configuration()["write-behind"].as<std::size_t>();
         base.write_retry_count = app.configuration()["write-retry-count"].as<std::size_t>();
@@ -98,7 +114,9 @@ int main(int argc, char** argv) {
             if (index >= total_messages) {
                 co_return seastar::stop_iteration::yes;
             }
-            const auto route_key = "route-" + std::to_string(index % route_key_count);
+            const auto route_key = route_key_count == 0
+                ? std::string()
+                : ("route-" + std::to_string(index % route_key_count));
             co_await engine.info(make_payload(index, payload_size), route_key);
             if (emit_delay_ms > 0) {
                 co_await seastar::sleep(std::chrono::milliseconds(emit_delay_ms));
