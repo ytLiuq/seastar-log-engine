@@ -1,6 +1,7 @@
 /build
 /logs/*.log
 /archive/
+*.log.checkpoint
 /logs-glog/*.log*
 /logs-spdlog/
 /test-tmp/
