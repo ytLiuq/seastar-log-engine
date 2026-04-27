@@ -81,16 +81,16 @@ std::vector<ParsedRecord> read_records(const std::vector<std::string>& files, co
             if (!parsed) {
                 continue;
             }
-            if (query.seq_from && parsed->sequence < *query.seq_from) {
+            if (query.seq_from && (!parsed->has_sequence || parsed->sequence < *query.seq_from)) {
                 continue;
             }
-            if (query.seq_to && parsed->sequence > *query.seq_to) {
+            if (query.seq_to && (!parsed->has_sequence || parsed->sequence > *query.seq_to)) {
                 continue;
             }
-            if (query.time_from && parsed->timestamp < *query.time_from) {
+            if (query.time_from && (parsed->timestamp.empty() || parsed->timestamp < *query.time_from)) {
                 continue;
             }
-            if (query.time_to && parsed->timestamp > *query.time_to) {
+            if (query.time_to && (parsed->timestamp.empty() || parsed->timestamp > *query.time_to)) {
                 continue;
             }
             records.push_back(*parsed);

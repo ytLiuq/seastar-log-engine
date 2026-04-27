@@ -35,22 +35,23 @@ int main(int argc, char** argv) {
         ("shard-file-prefix", bpo::value<std::string>()->default_value("shard"), "Shard log file prefix")
         ("messages", bpo::value<std::uint64_t>()->default_value(200000), "Number of messages to write")
         ("payload-size", bpo::value<std::size_t>()->default_value(256), "Approximate size of each log payload")
-        ("route-keys", bpo::value<std::size_t>()->default_value(16), "Distinct route keys used for shard distribution")
+        ("route-keys", bpo::value<std::size_t>()->default_value(0), "Distinct route keys used for shard distribution, 0 keeps writes on the current shard")
         ("batch-size", bpo::value<std::size_t>()->default_value(1024), "Number of entries per flush batch")
         ("flush-ms", bpo::value<std::size_t>()->default_value(1), "Periodic flush interval in milliseconds")
-        ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(64 * 1024 * 1024), "Rotate active file after reaching this size")
+        ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
         ("rotate-interval-seconds", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after this many seconds, 0 disables time rotation")
         ("archive-retention-seconds", bpo::value<std::uint64_t>()->default_value(0), "Delete archived files older than this many seconds, 0 disables age cleanup")
         ("truncate-on-start", bpo::value<bool>()->default_value(true), "Truncate active log files on startup instead of recovering")
-        ("checkpoint-enabled", bpo::value<bool>()->default_value(true), "Persist per-shard checkpoint sidecar files")
-        ("compress-archives", bpo::value<bool>()->default_value(true), "Compress rotated archives with gzip")
+        ("checkpoint-enabled", bpo::value<bool>()->default_value(false), "Persist per-shard checkpoint sidecar files")
+        ("compress-archives", bpo::value<bool>()->default_value(false), "Compress rotated archives with gzip")
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
         ("inflight", bpo::value<std::size_t>()->default_value(256), "Maximum writes issued concurrently")
-        ("record-crc-enabled", bpo::value<bool>()->default_value(true), "Emit crc= prefix and verify record checksum")
-        ("record-timestamp-enabled", bpo::value<bool>()->default_value(true), "Include ts= field in each record")
-        ("record-level-enabled", bpo::value<bool>()->default_value(true), "Include level= field in each record")
-        ("record-shard-id-enabled", bpo::value<bool>()->default_value(true), "Include shard= field in each record");
+        ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
+        ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
+        ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
+        ("record-shard-id-enabled", bpo::value<bool>()->default_value(false), "Include shard= field in each record")
+        ("record-sequence-enabled", bpo::value<bool>()->default_value(false), "Include seq= field in each record");
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
@@ -71,6 +72,7 @@ int main(int argc, char** argv) {
         base.record_timestamp_enabled = app.configuration()["record-timestamp-enabled"].as<bool>();
         base.record_level_enabled = app.configuration()["record-level-enabled"].as<bool>();
         base.record_shard_id_enabled = app.configuration()["record-shard-id-enabled"].as<bool>();
+        base.record_sequence_enabled = app.configuration()["record-sequence-enabled"].as<bool>();
 
         const auto config_file = app.configuration()["config"].as<std::string>();
         const auto file_values = log_engine::load_config_file(config_file);
@@ -92,7 +94,9 @@ int main(int argc, char** argv) {
 
         auto start = std::chrono::steady_clock::now();
         co_await seastar::max_concurrent_for_each(indices, inflight, [&](std::uint64_t current) {
-            const auto route_key = "route-" + std::to_string(current % route_key_count);
+            const auto route_key = route_key_count == 0
+                ? std::string()
+                : ("route-" + std::to_string(current % route_key_count));
             return engine.info(make_payload(current, payload_size), route_key);
         });
 

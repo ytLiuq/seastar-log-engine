@@ -17,18 +17,19 @@ struct EngineConfig {
     std::size_t write_behind = 4;
     std::size_t write_retry_count = 3;
     std::size_t write_retry_backoff_ms = 2;
-    std::uint64_t rotate_size_bytes = 64 * 1024 * 1024;
+    std::uint64_t rotate_size_bytes = 0;
     std::uint64_t rotate_interval_seconds = 0;
     std::uint64_t archive_retention_seconds = 0;
     std::size_t max_archived_files_per_shard = 8;
     bool truncate_on_start = true;
-    bool checkpoint_enabled = true;
-    bool compress_archives = true;
+    bool checkpoint_enabled = false;
+    bool compress_archives = false;
     bool use_dsync = false;
-    bool record_crc_enabled = true;
-    bool record_timestamp_enabled = true;
-    bool record_level_enabled = true;
-    bool record_shard_id_enabled = true;
+    bool record_crc_enabled = false;
+    bool record_timestamp_enabled = false;
+    bool record_level_enabled = false;
+    bool record_shard_id_enabled = false;
+    bool record_sequence_enabled = false;
 
     void validate() const {
         if (log_dir.empty()) {

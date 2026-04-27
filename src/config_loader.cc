@@ -108,6 +108,7 @@ EngineConfig apply_engine_config_overrides(
     base.record_timestamp_enabled = resolve_bool_option(cli, file_values, "record-timestamp-enabled", base.record_timestamp_enabled);
     base.record_level_enabled = resolve_bool_option(cli, file_values, "record-level-enabled", base.record_level_enabled);
     base.record_shard_id_enabled = resolve_bool_option(cli, file_values, "record-shard-id-enabled", base.record_shard_id_enabled);
+    base.record_sequence_enabled = resolve_bool_option(cli, file_values, "record-sequence-enabled", base.record_sequence_enabled);
     return base;
 }
 

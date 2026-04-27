@@ -32,6 +32,10 @@ seastar::future<> LogEngine::stop() {
 
 seastar::future<> LogEngine::append(LogMessage message) {
     const auto shard = route_to_shard(message.route_key);
+    if (shard == seastar::this_shard_id()) {
+        co_await _writers.local().submit(std::move(message));
+        co_return;
+    }
     co_await _writers.invoke_on(shard, [msg = std::move(message)](AsyncWriter& writer) mutable {
         return writer.submit(std::move(msg));
     });
@@ -57,7 +61,7 @@ unsigned LogEngine::route_to_shard(std::string_view route_key) noexcept {
     if (!route_key.empty()) {
         return static_cast<unsigned>(std::hash<std::string_view>{}(route_key) % shard_count);
     }
-    return static_cast<unsigned>(_rr_counter.fetch_add(1, std::memory_order_relaxed) % shard_count);
+    return seastar::this_shard_id();
 }
 
 }  // namespace log_engine

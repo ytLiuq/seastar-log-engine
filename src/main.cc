@@ -42,18 +42,19 @@ int main(int argc, char** argv) {
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
         ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
-        ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(64 * 1024 * 1024), "Rotate active file after reaching this size")
+        ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
         ("rotate-interval-seconds", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after this many seconds, 0 disables time rotation")
         ("archive-retention-seconds", bpo::value<std::uint64_t>()->default_value(0), "Delete archived files older than this many seconds, 0 disables age cleanup")
         ("max-archived-files", bpo::value<std::size_t>()->default_value(8), "Maximum archived files to keep per shard")
         ("truncate-on-start", bpo::value<bool>()->default_value(true), "Truncate active log files on startup instead of recovering")
-        ("checkpoint-enabled", bpo::value<bool>()->default_value(true), "Persist per-shard checkpoint sidecar files")
-        ("compress-archives", bpo::value<bool>()->default_value(true), "Compress rotated archives with gzip")
+        ("checkpoint-enabled", bpo::value<bool>()->default_value(false), "Persist per-shard checkpoint sidecar files")
+        ("compress-archives", bpo::value<bool>()->default_value(false), "Compress rotated archives with gzip")
         ("dsync", bpo::value<bool>()->default_value(false), "Enable O_DSYNC when opening shard files")
-        ("record-crc-enabled", bpo::value<bool>()->default_value(true), "Emit crc= prefix and verify record checksum")
-        ("record-timestamp-enabled", bpo::value<bool>()->default_value(true), "Include ts= field in each record")
-        ("record-level-enabled", bpo::value<bool>()->default_value(true), "Include level= field in each record")
-        ("record-shard-id-enabled", bpo::value<bool>()->default_value(true), "Include shard= field in each record");
+        ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
+        ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
+        ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
+        ("record-shard-id-enabled", bpo::value<bool>()->default_value(false), "Include shard= field in each record")
+        ("record-sequence-enabled", bpo::value<bool>()->default_value(false), "Include seq= field in each record");
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
         base.record_timestamp_enabled = app.configuration()["record-timestamp-enabled"].as<bool>();
         base.record_level_enabled = app.configuration()["record-level-enabled"].as<bool>();
         base.record_shard_id_enabled = app.configuration()["record-shard-id-enabled"].as<bool>();
+        base.record_sequence_enabled = app.configuration()["record-sequence-enabled"].as<bool>();
 
         const auto config_file = app.configuration()["config"].as<std::string>();
         const auto file_values = log_engine::load_config_file(config_file);

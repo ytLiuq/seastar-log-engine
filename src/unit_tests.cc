@@ -23,8 +23,14 @@ void require(bool condition, const std::string& message) {
 }
 
 seastar::future<> test_record_codec() {
+    log_engine::EngineConfig full_config;
+    full_config.record_crc_enabled = true;
+    full_config.record_timestamp_enabled = true;
+    full_config.record_level_enabled = true;
+    full_config.record_shard_id_enabled = true;
+    full_config.record_sequence_enabled = true;
     const auto encoded = log_engine::encode_record(
-        log_engine::EngineConfig{},
+        full_config,
         1,
         42,
         log_engine::LogLevel::warn,
@@ -43,6 +49,7 @@ seastar::future<> test_record_codec() {
     compact_config.record_timestamp_enabled = false;
     compact_config.record_level_enabled = false;
     compact_config.record_shard_id_enabled = false;
+    compact_config.record_sequence_enabled = false;
     const auto compact = log_engine::encode_record(
         compact_config,
         3,
@@ -52,11 +59,11 @@ seastar::future<> test_record_codec() {
         "compact-payload");
     const auto compact_line = compact.substr(0, compact.size() - 1);
     const auto compact_parsed = log_engine::parse_record_line(compact_line);
-    require(compact_parsed.has_value(), "parse_record_line should support compact records");
-    require(compact_parsed->sequence == 7, "compact sequence mismatch");
+    require(compact_parsed.has_value(), "parse_record_line should support payload-only records");
+    require(!compact_parsed->has_sequence, "compact record should omit sequence");
     require(compact_parsed->payload == "compact-payload", "compact payload mismatch");
     require(compact_parsed->timestamp.empty(), "compact record should omit timestamp");
-    require(log_engine::verify_record_line(compact_line), "verify_record_line should support records without crc");
+    require(log_engine::verify_record_line(compact_line), "verify_record_line should support payload-only records");
     co_return;
 }
 
@@ -70,6 +77,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
         out << "rotate-interval-seconds=9\n";
         out << "compress-archives=false\n";
         out << "record-crc-enabled=false\n";
+        out << "record-sequence-enabled=true\n";
     }
 
     const auto values = log_engine::load_config_file(config_path);
@@ -80,6 +88,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
     require(config.compress_archives == false, "config loader should override compress_archives");
     require(config.record_crc_enabled == false, "config loader should override record_crc_enabled");
+    require(config.record_sequence_enabled == true, "config loader should override record_sequence_enabled");
     co_return;
 }
 
@@ -242,6 +251,7 @@ seastar::future<> test_recovery_scan(const std::string& root_dir) {
     config.archive_dir = archive_dir;
     config.batch_size = 2;
     config.checkpoint_enabled = true;
+    config.record_sequence_enabled = false;
 
     log_engine::LogEngine engine;
     co_await engine.start(config);

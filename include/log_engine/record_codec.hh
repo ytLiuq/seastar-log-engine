@@ -23,6 +23,7 @@ struct ParsedRecord {
     std::uint32_t crc = 0;
     std::string timestamp;
     unsigned shard = 0;
+    bool has_sequence = false;
     std::uint64_t sequence = 0;
     LogLevel level = LogLevel::info;
     std::string payload;
