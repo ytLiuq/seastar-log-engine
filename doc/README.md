@@ -23,6 +23,11 @@
 - `spdlog` 对比 benchmark（当本机安装 `spdlog` 并成功被 CMake 发现时）
 - 最小单元测试可执行程序
 
+当前写入路径分成两种模式：
+
+- `fast`：默认模式，尽量贴近 `spdlog` 的轻量异步文件追加；只支持 payload-only record，不支持 checkpoint / recovery / rotate / archive
+- `full`：开启完整日志引擎语义，支持 structured record、checkpoint、恢复、rotate、archive 和压缩
+
 当前目录结构：
 
 - `include/log_engine`: 头文件
@@ -57,13 +62,13 @@
 运行 demo：
 
 ```bash
-./build/log_engine_demo --log-dir ./logs --archive-dir ./archive --messages 100000 --batch-size 1024 --flush-ms 1 --rotate-size-bytes 1048576 --rotate-interval-seconds 0 --compress-archives 1 --checkpoint-enabled 1 --truncate-on-start 1
+./build/log_engine_demo --mode full --log-dir ./logs --archive-dir ./archive --messages 100000 --batch-size 1024 --flush-ms 1 --rotate-size-bytes 1048576 --rotate-interval-seconds 0 --compress-archives 1 --checkpoint-enabled 1 --truncate-on-start 1
 ```
 
 运行 benchmark：
 
 ```bash
-./build/log_engine_bench --log-dir ./logs --archive-dir ./archive --messages 200000 --payload-size 256 --batch-size 1024 --inflight 256 --checkpoint-enabled 1
+./build/log_engine_bench --mode fast --log-dir ./logs --archive-dir ./archive --messages 200000 --payload-size 256 --batch-size 8192 --flush-ms 0 --inflight 1 --checkpoint-enabled 0
 ```
 
 校验日志文件：
@@ -81,7 +86,7 @@
 恢复模式启动：
 
 ```bash
-./build/log_engine_demo --log-dir ./logs --archive-dir ./archive --messages 1000 --truncate-on-start 0 --checkpoint-enabled 1
+./build/log_engine_demo --mode full --log-dir ./logs --archive-dir ./archive --messages 1000 --truncate-on-start 0 --checkpoint-enabled 1
 ```
 
 测试脚本：
