@@ -23,6 +23,7 @@ find_library(FMT_LIBRARY fmt)
 find_library(GLOG_LIBRARY glog)
 
 add_library(log_engine_core
+    src/append_writer.cc
     src/async_writer.cc
     src/compat_glog.cc
     src/config_loader.cc
