@@ -7,14 +7,21 @@
 
 namespace log_engine {
 
+enum class WriteMode {
+    fast,
+    full,
+};
+
 struct EngineConfig {
     std::string log_dir = "logs";
     std::string archive_dir = "archive";
     std::string shard_file_prefix = "shard";
-    std::size_t batch_size = 1024;
-    std::size_t flush_interval_ms = 1;
+    WriteMode write_mode = WriteMode::fast;
+    std::size_t batch_size = 32;
+    std::size_t flush_interval_ms = 0;
+    std::size_t fast_path_max_pending_bytes = 16 * 1024;
     std::size_t stream_buffer_size = 64 * 1024;
-    std::size_t write_behind = 4;
+    std::size_t write_behind = 8;
     std::size_t write_retry_count = 3;
     std::size_t write_retry_backoff_ms = 2;
     std::uint64_t rotate_size_bytes = 0;
@@ -31,11 +38,35 @@ struct EngineConfig {
     bool record_shard_id_enabled = false;
     bool record_sequence_enabled = false;
 
+    [[nodiscard]] bool rotation_enabled() const noexcept {
+        return rotate_size_bytes > 0 || rotate_interval_seconds > 0;
+    }
+
+    [[nodiscard]] bool archive_features_enabled() const noexcept {
+        return rotation_enabled() || archive_retention_seconds > 0 || compress_archives;
+    }
+
+    [[nodiscard]] bool structured_record_enabled() const noexcept {
+        return record_crc_enabled ||
+            record_timestamp_enabled ||
+            record_level_enabled ||
+            record_shard_id_enabled ||
+            record_sequence_enabled;
+    }
+
+    [[nodiscard]] bool is_fast_path() const noexcept {
+        return write_mode == WriteMode::fast;
+    }
+
+    [[nodiscard]] bool is_full_path() const noexcept {
+        return write_mode == WriteMode::full;
+    }
+
     void validate() const {
         if (log_dir.empty()) {
             throw std::invalid_argument("log_dir must not be empty");
         }
-        if (archive_dir.empty()) {
+        if (archive_features_enabled() && archive_dir.empty()) {
             throw std::invalid_argument("archive_dir must not be empty");
         }
         if (shard_file_prefix.empty()) {
@@ -44,11 +75,11 @@ struct EngineConfig {
         if (batch_size == 0) {
             throw std::invalid_argument("batch_size must be greater than zero");
         }
-        if (flush_interval_ms == 0) {
-            throw std::invalid_argument("flush_interval_ms must be greater than zero");
-        }
         if (stream_buffer_size == 0) {
             throw std::invalid_argument("stream_buffer_size must be greater than zero");
+        }
+        if (fast_path_max_pending_bytes == 0) {
+            throw std::invalid_argument("fast_path_max_pending_bytes must be greater than zero");
         }
         if (write_behind == 0) {
             throw std::invalid_argument("write_behind must be greater than zero");
@@ -58,6 +89,20 @@ struct EngineConfig {
         }
         if (max_archived_files_per_shard == 0) {
             throw std::invalid_argument("max_archived_files_per_shard must be greater than zero");
+        }
+        if (is_fast_path()) {
+            if (!truncate_on_start) {
+                throw std::invalid_argument("fast path requires truncate_on_start=true");
+            }
+            if (checkpoint_enabled) {
+                throw std::invalid_argument("fast path does not support checkpoints");
+            }
+            if (archive_features_enabled()) {
+                throw std::invalid_argument("fast path does not support rotation or archive management");
+            }
+            if (structured_record_enabled()) {
+                throw std::invalid_argument("fast path only supports payload-only records");
+            }
         }
     }
 };
