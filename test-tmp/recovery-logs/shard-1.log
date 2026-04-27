@@ -1,3 +1,0 @@
-crc=04eb69bb	ts=2026-04-23 20:56:55.280537	shard=1	seq=0	level=INFO	payload=recovery-a
-crc=94c15a9d	ts=2026-04-23 20:56:55.280550	shard=1	seq=1	level=INFO	payload=recovery-b
-BROKEN_TAIL

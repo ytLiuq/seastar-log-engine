@@ -5,3 +5,4 @@
 /logs-glog/*.log*
 /logs-spdlog/
 /test-tmp/
+logs-glog/glog_bench.INFO
