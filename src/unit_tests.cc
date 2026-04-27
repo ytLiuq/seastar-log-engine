@@ -72,6 +72,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     const auto config_path = (fs::path(root_dir) / "engine-test.conf").string();
     {
         std::ofstream out(config_path, std::ios::trunc);
+        out << "mode=full\n";
         out << "log-dir=/tmp/demo-logs\n";
         out << "batch-size=17\n";
         out << "rotate-interval-seconds=9\n";
@@ -83,6 +84,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     const auto values = log_engine::load_config_file(config_path);
     boost::program_options::variables_map cli;
     auto config = log_engine::apply_engine_config_overrides(log_engine::EngineConfig{}, cli, values);
+    require(config.write_mode == log_engine::WriteMode::full, "config loader should override mode");
     require(config.log_dir == "/tmp/demo-logs", "config loader should override log_dir");
     require(config.batch_size == 17, "config loader should override batch_size");
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
@@ -160,6 +162,7 @@ seastar::future<> test_compat_unbound_drops_messages(const std::string& root_dir
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
+    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 1;
     config.stream_buffer_size = 512;
     config.write_behind = 1;
@@ -198,6 +201,7 @@ seastar::future<> test_time_rotation_and_archive_read(const std::string& root_di
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
+    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 1;
     config.flush_interval_ms = 1;
     config.rotate_size_bytes = 0;
@@ -249,6 +253,7 @@ seastar::future<> test_recovery_scan(const std::string& root_dir) {
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
+    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 2;
     config.checkpoint_enabled = true;
     config.record_sequence_enabled = false;

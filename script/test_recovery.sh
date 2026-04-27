@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 
 rm -f logs/* archive/*
 ./build/log_engine_demo \
+  --mode full \
   --log-dir "${ROOT_DIR}/logs" \
   --archive-dir "${ROOT_DIR}/archive" \
   --messages 20 \
@@ -19,6 +20,7 @@ rm -f logs/* archive/*
 printf 'BROKEN_TAIL' >> "${ROOT_DIR}/logs/shard-0.log"
 
 ./build/log_engine_demo \
+  --mode full \
   --log-dir "${ROOT_DIR}/logs" \
   --archive-dir "${ROOT_DIR}/archive" \
   --messages 4 \

@@ -61,7 +61,9 @@ std::optional<CheckpointState> read_checkpoint_file(const std::string& active_pa
 seastar::future<> LogManager::prepare(const EngineConfig& config) {
     return seastar::async([config] {
         std::filesystem::create_directories(config.log_dir);
-        std::filesystem::create_directories(config.archive_dir);
+        if (config.archive_features_enabled()) {
+            std::filesystem::create_directories(config.archive_dir);
+        }
     });
 }
 

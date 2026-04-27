@@ -42,21 +42,25 @@ run_log_engine() {
   local inflight="$4"
   local checkpoint_enabled="$5"
   local shard_count="${6:-2}"
+  local flush_ms="${7:-0}"
 
   rm -rf "${ROOT_DIR}/logs" "${ROOT_DIR}/archive"
   mkdir -p "${ROOT_DIR}/logs" "${ROOT_DIR}/archive"
 
   ./build/log_engine_bench \
+    --mode fast \
     --log-dir "${ROOT_DIR}/logs" \
     --archive-dir "${ROOT_DIR}/archive" \
     --messages "${messages}" \
     --payload-size "${payload_size}" \
     --batch-size "${batch_size}" \
+    --flush-ms "${flush_ms}" \
     --inflight "${inflight}" \
     --checkpoint-enabled "${checkpoint_enabled}" \
-    --rotate-size-bytes 1048576 \
+    --route-keys 0 \
+    --rotate-size-bytes 0 \
     -c "${shard_count}" 2>&1 | tee /tmp/log_engine_compare.out
-  grep 'messages=' /tmp/log_engine_compare.out | tail -n 1
+  grep -a 'messages=' /tmp/log_engine_compare.out | tail -n 1
 }
 
 run_glog() {
@@ -70,7 +74,7 @@ run_glog() {
     --log-dir "${ROOT_DIR}/logs-glog" \
     --messages "${messages}" \
     --payload-size "${payload_size}" 2>&1 | tee /tmp/glog_compare.out
-  grep 'messages=' /tmp/glog_compare.out | tail -n 1
+  grep -a 'messages=' /tmp/glog_compare.out | tail -n 1
 }
 
 run_spdlog() {
@@ -84,7 +88,7 @@ run_spdlog() {
     --log-dir "${ROOT_DIR}/logs-spdlog" \
     --messages "${messages}" \
     --payload-size "${payload_size}" 2>&1 | tee /tmp/spdlog_compare.out
-  grep 'messages=' /tmp/spdlog_compare.out | tail -n 1
+  grep -a 'messages=' /tmp/spdlog_compare.out | tail -n 1
 }
 
 emit_scan_row() {
@@ -119,7 +123,7 @@ run_default_compare() {
   local payload_size="${2:-128}"
 
   echo "[log_engine_bench]"
-  run_log_engine "${messages}" "${payload_size}" 256 64 1
+  run_log_engine "${messages}" "${payload_size}" 32 1 0 1 0
 
   if [[ -x "${ROOT_DIR}/build/glog_bench" ]]; then
     echo "[glog_bench]"
@@ -145,8 +149,8 @@ run_scan() {
     local payload messages line
     messages=50000
     for payload in 128 512; do
-      line="$(run_log_engine "${messages}" "${payload}" 256 64 1)"
-      emit_scan_row "payload-${payload}" "log_engine" "${messages}" "${payload}" 256 64 1 "${line}"
+      line="$(run_log_engine "${messages}" "${payload}" 32 1 0 1 0)"
+      emit_scan_row "payload-${payload}" "log_engine" "${messages}" "${payload}" 32 1 0 "${line}"
 
       if [[ -x "${ROOT_DIR}/build/glog_bench" ]]; then
         line="$(run_glog "${messages}" "${payload}")"
@@ -160,21 +164,21 @@ run_scan() {
     done
 
     local batch
-    for batch in 64 256 1024; do
-      line="$(run_log_engine "${messages}" 128 "${batch}" 64 1)"
-      emit_scan_row "batch-${batch}" "log_engine" "${messages}" 128 "${batch}" 64 1 "${line}"
+    for batch in 64 256 1024 8192; do
+      line="$(run_log_engine "${messages}" 128 "${batch}" 1 0 1 0)"
+      emit_scan_row "batch-${batch}" "log_engine" "${messages}" 128 "${batch}" 1 0 "${line}"
     done
 
     local inflight
-    for inflight in 16 64 256; do
-      line="$(run_log_engine "${messages}" 128 256 "${inflight}" 1)"
-      emit_scan_row "inflight-${inflight}" "log_engine" "${messages}" 128 256 "${inflight}" 1 "${line}"
+    for inflight in 1 4 16; do
+      line="$(run_log_engine "${messages}" 128 32 "${inflight}" 0 1 0)"
+      emit_scan_row "inflight-${inflight}" "log_engine" "${messages}" 128 32 "${inflight}" 0 "${line}"
     done
 
     local checkpoint
     for checkpoint in 0 1; do
-      line="$(run_log_engine "${messages}" 128 256 64 "${checkpoint}")"
-      emit_scan_row "checkpoint-${checkpoint}" "log_engine" "${messages}" 128 256 64 "${checkpoint}" "${line}"
+      line="$(run_log_engine "${messages}" 128 32 1 "${checkpoint}" 1 0)"
+      emit_scan_row "checkpoint-${checkpoint}" "log_engine" "${messages}" 128 32 1 "${checkpoint}" "${line}"
     done
   } >"${output_path}"
 

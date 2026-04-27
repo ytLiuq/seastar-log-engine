@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 
 rm -f logs/* archive/*
 ./build/log_engine_demo \
+  --mode full \
   --log-dir "${ROOT_DIR}/logs" \
   --archive-dir "${ROOT_DIR}/archive" \
   --messages 200 \
