@@ -110,7 +110,7 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
         shard_id);
 
     co_await open_file();
-    if (!_config.truncate_on_start) {
+    if (!use_buffered_io() && !_config.truncate_on_start) {
         co_await recover_from_checkpoint();
     } else if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
@@ -144,7 +144,11 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
     if (_stopping) {
         co_return;
     }
-    _pending.emplace_back(format_record(std::move(message)));
+    if (use_plain_payload_mode()) {
+        _pending.emplace_back(std::move(message.payload));
+    } else {
+        _pending.emplace_back(format_record(std::move(message)));
+    }
     if (_pending.size() >= _config.batch_size) {
         co_await flush_background();
     }
@@ -159,7 +163,7 @@ std::string AsyncWriter::shard_path() const {
 }
 
 seastar::future<> AsyncWriter::open_file() {
-    if (_file) {
+    if (_file || _stream) {
         co_return;
     }
 
@@ -172,8 +176,16 @@ seastar::future<> AsyncWriter::open_file() {
     }
     flags = seastar::open_flags::rw | (flags & seastar::open_flags::create) | (flags & seastar::open_flags::truncate) | (flags & seastar::open_flags::dsync);
 
-    _file.emplace(co_await seastar::open_file_dma(_file_path, flags));
-    _alignment = std::max<std::size_t>(_file->disk_write_dma_alignment(), 1);
+    auto file = co_await seastar::open_file_dma(_file_path, flags);
+    if (use_buffered_io()) {
+        seastar::file_output_stream_options options;
+        options.buffer_size = static_cast<unsigned>(_config.stream_buffer_size);
+        options.write_behind = static_cast<unsigned>(_config.write_behind);
+        _stream.emplace(co_await seastar::make_file_output_stream(file, options));
+    } else {
+        _alignment = std::max<std::size_t>(file.disk_write_dma_alignment(), 1);
+        _file.emplace(std::move(file));
+    }
     _active_file_opened_at = std::chrono::system_clock::now();
 }
 
@@ -189,36 +201,58 @@ seastar::future<> AsyncWriter::flush_once() {
     auto guard = seastar::defer([this] { _flush_in_progress = false; });
     co_await open_file();
 
-    std::deque<seastar::temporary_buffer<char>> batch;
+    std::deque<PendingEntry> batch;
     batch.swap(_pending);
 
     std::size_t bytes = 0;
     for (const auto& entry : batch) {
-        bytes += entry.size();
+        bytes += std::visit([](const auto& value) -> std::size_t {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, seastar::temporary_buffer<char>>) {
+                return value.size();
+            } else {
+                return value.size() + 1;
+            }
+        }, entry);
     }
     _logical_size += bytes;
 
     try {
-        if (!batch.empty()) {
+        if (!_stream) {
+            std::deque<seastar::temporary_buffer<char>> encoded_batch;
+            encoded_batch.resize(0);
+            for (auto& entry : batch) {
+                encoded_batch.emplace_back(std::get<seastar::temporary_buffer<char>>(std::move(entry)));
+            }
             const auto total_bytes = _tail_bytes + bytes;
             const auto writable_bytes = (total_bytes / _alignment) * _alignment;
             if (writable_bytes > 0) {
                 auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, writable_bytes);
                 char* out = buffer.get_write();
-                for_each_chunk_prefix(_tail_chunks, batch, writable_bytes, [&out](const char* data, std::size_t size) {
+                for_each_chunk_prefix(_tail_chunks, encoded_batch, writable_bytes, [&out](const char* data, std::size_t size) {
                     std::memcpy(out, data, size);
                     out += size;
                 });
                 co_await write_aligned_buffer(buffer, writable_bytes);
                 _write_offset += writable_bytes;
-                _tail_chunks = collect_remaining_chunks(std::move(_tail_chunks), std::move(batch), writable_bytes);
+                _tail_chunks = collect_remaining_chunks(std::move(_tail_chunks), std::move(encoded_batch), writable_bytes);
                 _tail_bytes = total_bytes - writable_bytes;
             } else {
-                while (!batch.empty()) {
-                    _tail_chunks.emplace_back(std::move(batch.front()));
-                    batch.pop_front();
+                while (!encoded_batch.empty()) {
+                    _tail_chunks.emplace_back(std::move(encoded_batch.front()));
+                    encoded_batch.pop_front();
                 }
                 _tail_bytes = total_bytes;
+            }
+        } else {
+            for (auto& entry : batch) {
+                if (auto* encoded = std::get_if<seastar::temporary_buffer<char>>(&entry)) {
+                    co_await _stream->write(encoded->get(), encoded->size());
+                } else {
+                    auto& payload = std::get<std::string>(entry);
+                    co_await _stream->write(payload.data(), payload.size());
+                    co_await _stream->write("\n", 1);
+                }
             }
         }
         co_await maybe_rotate();
@@ -245,15 +279,20 @@ seastar::future<> AsyncWriter::flush_background() {
 }
 
 seastar::future<> AsyncWriter::close_file() {
-    if (!_file) {
-        co_return;
+    if (_stream) {
+        co_await _stream->close();
+        _stream.reset();
     }
-    auto file = std::move(*_file);
-    _file.reset();
-    co_await file.close();
+    if (_file) {
+        co_await _file->close();
+        _file.reset();
+    }
 }
 
 seastar::future<> AsyncWriter::flush_tail(bool closing) {
+    if (_stream) {
+        co_return;
+    }
     if (!_file) {
         co_return;
     }
@@ -298,7 +337,9 @@ seastar::future<> AsyncWriter::maybe_rotate() {
         co_return;
     }
 
-    co_await flush_tail(true);
+    if (!_stream) {
+        co_await flush_tail(true);
+    }
     co_await close_file();
     ++_rotation_index;
     co_await _log_manager.rotate_active_file(
@@ -317,11 +358,12 @@ seastar::future<> AsyncWriter::maybe_rotate() {
 }
 
 seastar::temporary_buffer<char> AsyncWriter::format_record(LogMessage&& message) {
-    const auto timestamp = format_timestamp();
+    const auto sequence = _sequence++;
+    const auto timestamp = _config.record_timestamp_enabled ? format_timestamp() : TimestampBuffer{};
     return encode_record_buffer(
         _config,
         seastar::this_shard_id(),
-        _sequence++,
+        sequence,
         message.level,
         timestamp.view(),
         message.payload);
@@ -378,6 +420,19 @@ seastar::future<> AsyncWriter::recover_from_checkpoint() {
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
     }
+}
+
+bool AsyncWriter::use_buffered_io() const noexcept {
+    return _config.truncate_on_start && !_config.checkpoint_enabled;
+}
+
+bool AsyncWriter::use_plain_payload_mode() const noexcept {
+    return use_buffered_io() &&
+        !_config.record_crc_enabled &&
+        !_config.record_timestamp_enabled &&
+        !_config.record_shard_id_enabled &&
+        !_config.record_sequence_enabled &&
+        !_config.record_level_enabled;
 }
 
 seastar::future<> AsyncWriter::persist_checkpoint() {

@@ -5,8 +5,10 @@
 #include <optional>
 #include <string>
 #include <chrono>
+#include <variant>
 
 #include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
@@ -40,6 +42,8 @@ private:
     seastar::future<> persist_checkpoint();
     seastar::future<> write_aligned_buffer(const seastar::temporary_buffer<char>& buffer, std::size_t expected);
     seastar::temporary_buffer<char> format_record(LogMessage&& message);
+    [[nodiscard]] bool use_buffered_io() const noexcept;
+    [[nodiscard]] bool use_plain_payload_mode() const noexcept;
     struct TimestampBuffer {
         std::array<char, 64> data{};
         std::size_t size = 0;
@@ -56,7 +60,9 @@ private:
     seastar::timer<seastar::lowres_clock> _flush_timer;
     seastar::gate _gate;
     std::optional<seastar::file> _file;
-    std::deque<seastar::temporary_buffer<char>> _pending;
+    std::optional<seastar::output_stream<char>> _stream;
+    using PendingEntry = std::variant<seastar::temporary_buffer<char>, std::string>;
+    std::deque<PendingEntry> _pending;
     std::string _file_path;
     std::deque<seastar::temporary_buffer<char>> _tail_chunks;
     std::size_t _tail_bytes = 0;
