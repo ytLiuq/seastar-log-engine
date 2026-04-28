@@ -35,7 +35,7 @@ std::size_t batch_bytes(const std::deque<seastar::temporary_buffer<char>>& batch
 
 AsyncWriter::AsyncWriter()
     : _flush_timer([this] {
-          (void)flush_background().handle_exception([](std::exception_ptr ep) {
+          (void)flush_background(false, false).handle_exception([](std::exception_ptr ep) {
               applog.warn("background flush failed: {}", ep);
           });
       }) {
@@ -90,7 +90,7 @@ seastar::future<> AsyncWriter::stop() {
             if (pending_entries() == 0) {
                 return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
             }
-            return flush_once().then([] {
+            return flush_once(true, true).then([] {
                 return seastar::stop_iteration::no;
             });
         });
@@ -118,10 +118,16 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
     }
     if (pending_entries() >= _config.batch_size ||
         (use_fast_path() && _fast_pending_bytes >= fast_flush_bytes_limit())) {
-        if (use_fast_path()) {
-            schedule_fast_flush();
-        } else {
-            co_await flush_background();
+        switch (_config.ack_mode) {
+        case AckMode::memory_ack:
+            schedule_background_flush();
+            break;
+        case AckMode::write_ack:
+            co_await flush_background(false, true);
+            break;
+        case AckMode::sync_ack:
+            co_await flush_background(true, true);
+            break;
         }
     }
 }
@@ -134,7 +140,7 @@ std::string AsyncWriter::shard_path() const {
     return _file_path;
 }
 
-seastar::future<> AsyncWriter::flush_once() {
+seastar::future<> AsyncWriter::flush_once(bool sync_after_write, bool flush_partial_tail) {
     if (_flush_in_progress || pending_entries() == 0) {
         co_return;
     }
@@ -142,13 +148,13 @@ seastar::future<> AsyncWriter::flush_once() {
     _flush_in_progress = true;
     auto guard = seastar::defer([this] { _flush_in_progress = false; });
     if (use_fast_path()) {
-        co_await flush_fast_once();
+        co_await flush_fast_once(sync_after_write, flush_partial_tail);
     } else {
-        co_await flush_full_once();
+        co_await flush_full_once(sync_after_write, flush_partial_tail);
     }
 }
 
-seastar::future<> AsyncWriter::flush_fast_once() {
+seastar::future<> AsyncWriter::flush_fast_once(bool sync_after_write, bool flush_partial_tail) {
     flush_open_fast_block();
     std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_fast_pending);
@@ -158,7 +164,10 @@ seastar::future<> AsyncWriter::flush_fast_once() {
     _fast_pending_bytes = 0;
 
     try {
-        co_await _append_writer.append_batch(batch);
+        co_await _append_writer.append_batch(batch, sync_after_write);
+        if (flush_partial_tail) {
+            co_await _append_writer.force_flush(sync_after_write);
+        }
         ++_metric_flushed_batches;
         _metric_flushed_bytes += batch_byte_count;
     } catch (...) {
@@ -173,13 +182,16 @@ seastar::future<> AsyncWriter::flush_fast_once() {
     }
 }
 
-seastar::future<> AsyncWriter::flush_full_once() {
+seastar::future<> AsyncWriter::flush_full_once(bool sync_after_write, bool flush_partial_tail) {
     std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_full_pending);
     const auto batch_byte_count = batch_bytes(batch);
 
     try {
-        co_await _append_writer.append_batch(batch);
+        co_await _append_writer.append_batch(batch, sync_after_write);
+        if (flush_partial_tail) {
+            co_await _append_writer.force_flush(sync_after_write);
+        }
         ++_metric_flushed_batches;
         _metric_flushed_bytes += batch_byte_count;
         co_await maybe_rotate();
@@ -193,27 +205,27 @@ seastar::future<> AsyncWriter::flush_full_once() {
     }
 }
 
-seastar::future<> AsyncWriter::flush_background() {
+seastar::future<> AsyncWriter::flush_background(bool sync_after_write, bool flush_partial_tail) {
     if (_stopping || _flush_in_progress || pending_entries() == 0) {
         co_return;
     }
-    co_await seastar::with_gate(_gate, [this] {
-        return flush_once();
+    co_await seastar::with_gate(_gate, [this, sync_after_write, flush_partial_tail] {
+        return flush_once(sync_after_write, flush_partial_tail);
     });
 }
 
-void AsyncWriter::schedule_fast_flush() {
+void AsyncWriter::schedule_background_flush() {
     if (_stopping || _fast_flush_scheduled || pending_entries() == 0) {
         return;
     }
 
     _fast_flush_scheduled = true;
     (void)seastar::with_gate(_gate, [this] {
-        return flush_once();
+        return flush_once(false, false);
     }).finally([this] {
         _fast_flush_scheduled = false;
         if (!_stopping && pending_entries() > 0) {
-            schedule_fast_flush();
+            schedule_background_flush();
         }
     }).handle_exception([](std::exception_ptr ep) {
         applog.warn("scheduled fast flush failed: {}", ep);

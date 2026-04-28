@@ -13,6 +13,37 @@ enum class WriteMode {
     full,
 };
 
+enum class AckMode {
+    memory_ack,
+    write_ack,
+    sync_ack,
+};
+
+inline const char* ack_mode_to_string(AckMode mode) noexcept {
+    switch (mode) {
+    case AckMode::memory_ack:
+        return "memory_ack";
+    case AckMode::write_ack:
+        return "write_ack";
+    case AckMode::sync_ack:
+        return "sync_ack";
+    }
+    return "memory_ack";
+}
+
+inline AckMode parse_ack_mode(std::string_view value) {
+    if (value == "memory_ack" || value == "memory-ack" || value == "memory") {
+        return AckMode::memory_ack;
+    }
+    if (value == "write_ack" || value == "write-ack" || value == "write") {
+        return AckMode::write_ack;
+    }
+    if (value == "sync_ack" || value == "sync-ack" || value == "sync") {
+        return AckMode::sync_ack;
+    }
+    throw std::invalid_argument("ack_mode must be memory_ack, write_ack, or sync_ack");
+}
+
 enum class RoutingStrategy {
     hash_modulo,
     consistent_hashing,
@@ -43,6 +74,7 @@ struct EngineConfig {
     std::string archive_dir = "archive";
     std::string shard_file_prefix = "shard";
     WriteMode write_mode = WriteMode::fast;
+    AckMode ack_mode = AckMode::memory_ack;
     RoutingStrategy routing_strategy = RoutingStrategy::hash_modulo;
     std::size_t routing_virtual_nodes = 128;
     std::size_t batch_size = 32;

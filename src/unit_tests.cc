@@ -74,6 +74,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     {
         std::ofstream out(config_path, std::ios::trunc);
         out << "mode=full\n";
+        out << "ack-mode=sync_ack\n";
         out << "routing-strategy=consistent_hashing\n";
         out << "routing-virtual-nodes=33\n";
         out << "log-dir=/tmp/demo-logs\n";
@@ -88,6 +89,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     boost::program_options::variables_map cli;
     auto config = log_engine::apply_engine_config_overrides(log_engine::EngineConfig{}, cli, values);
     require(config.write_mode == log_engine::WriteMode::full, "config loader should override mode");
+    require(config.ack_mode == log_engine::AckMode::sync_ack, "config loader should override ack mode");
     require(config.routing_strategy == log_engine::RoutingStrategy::consistent_hashing, "config loader should override routing strategy");
     require(config.routing_virtual_nodes == 33, "config loader should override routing virtual nodes");
     require(config.log_dir == "/tmp/demo-logs", "config loader should override log_dir");

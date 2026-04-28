@@ -29,11 +29,11 @@ public:
     std::string shard_path() const;
 
 private:
-    seastar::future<> flush_once();
-    seastar::future<> flush_fast_once();
-    seastar::future<> flush_full_once();
-    seastar::future<> flush_background();
-    void schedule_fast_flush();
+    seastar::future<> flush_once(bool sync_after_write, bool flush_partial_tail);
+    seastar::future<> flush_fast_once(bool sync_after_write, bool flush_partial_tail);
+    seastar::future<> flush_full_once(bool sync_after_write, bool flush_partial_tail);
+    seastar::future<> flush_background(bool sync_after_write, bool flush_partial_tail);
+    void schedule_background_flush();
     seastar::future<> maybe_rotate();
     seastar::future<> recover_from_checkpoint();
     seastar::future<> persist_checkpoint();

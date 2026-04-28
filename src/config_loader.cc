@@ -49,6 +49,14 @@ WriteMode parse_write_mode(const std::string& value, const char* name) {
     throw std::invalid_argument(std::string("invalid mode for option ") + name + ": " + value);
 }
 
+AckMode parse_ack_mode_option(const std::string& value, const char* name) {
+    try {
+        return parse_ack_mode(value);
+    } catch (const std::invalid_argument&) {
+        throw std::invalid_argument(std::string("invalid ack mode for option ") + name + ": " + value);
+    }
+}
+
 RoutingStrategy parse_routing_strategy_option(const std::string& value, const char* name) {
     try {
         return parse_routing_strategy(value);
@@ -106,6 +114,7 @@ EngineConfig apply_engine_config_overrides(
     const boost::program_options::variables_map& cli,
     const ConfigMap& file_values) {
     base.write_mode = resolve_write_mode_option(cli, file_values, "mode", base.write_mode);
+    base.ack_mode = resolve_ack_mode_option(cli, file_values, "ack-mode", base.ack_mode);
     base.routing_strategy = resolve_routing_strategy_option(cli, file_values, "routing-strategy", base.routing_strategy);
     base.routing_virtual_nodes = resolve_size_option(cli, file_values, "routing-virtual-nodes", base.routing_virtual_nodes);
     base.log_dir = resolve_string_option(cli, file_values, "log-dir", base.log_dir);
@@ -187,6 +196,17 @@ WriteMode resolve_write_mode_option(
         return current_value;
     }
     return parse_write_mode(file_values.at(name), name.c_str());
+}
+
+AckMode resolve_ack_mode_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    AckMode current_value) {
+    if (!should_take_file_value(cli, name, file_values)) {
+        return current_value;
+    }
+    return parse_ack_mode_option(file_values.at(name), name.c_str());
 }
 
 RoutingStrategy resolve_routing_strategy_option(

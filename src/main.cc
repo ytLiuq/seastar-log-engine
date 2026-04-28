@@ -29,6 +29,10 @@ log_engine::RoutingStrategy parse_routing(std::string_view value) {
     return log_engine::parse_routing_strategy(value);
 }
 
+log_engine::AckMode parse_ack(std::string_view value) {
+    return log_engine::parse_ack_mode(value);
+}
+
 std::string make_payload(std::uint64_t index, std::size_t target_size) {
     std::string payload = "demo-log-" + std::to_string(index) + " ";
     if (payload.size() < target_size) {
@@ -49,6 +53,7 @@ int main(int argc, char** argv) {
         ("log-dir", bpo::value<std::string>()->default_value("logs"), "Directory for shard log files")
         ("archive-dir", bpo::value<std::string>()->default_value("archive"), "Directory for archived log files")
         ("shard-file-prefix", bpo::value<std::string>()->default_value("shard"), "Shard log file prefix")
+        ("ack-mode", bpo::value<std::string>()->default_value("memory_ack"), "Ack mode: memory_ack, write_ack, or sync_ack")
         ("routing-strategy", bpo::value<std::string>()->default_value("hash_modulo"), "Routing strategy: hash_modulo or consistent_hashing")
         ("routing-virtual-nodes", bpo::value<std::size_t>()->default_value(128), "Virtual nodes per shard for consistent hashing")
         ("batch-size", bpo::value<std::size_t>()->default_value(32), "Number of entries per flush batch")
@@ -79,6 +84,7 @@ int main(int argc, char** argv) {
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
         base.write_mode = parse_mode(app.configuration()["mode"].as<std::string>());
+        base.ack_mode = parse_ack(app.configuration()["ack-mode"].as<std::string>());
         base.routing_strategy = parse_routing(app.configuration()["routing-strategy"].as<std::string>());
         base.routing_virtual_nodes = app.configuration()["routing-virtual-nodes"].as<std::size_t>();
         base.log_dir = app.configuration()["log-dir"].as<std::string>();

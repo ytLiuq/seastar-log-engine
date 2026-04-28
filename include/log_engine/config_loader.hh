@@ -42,6 +42,11 @@ WriteMode resolve_write_mode_option(
     const ConfigMap& file_values,
     const std::string& name,
     WriteMode current_value);
+AckMode resolve_ack_mode_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    AckMode current_value);
 RoutingStrategy resolve_routing_strategy_option(
     const boost::program_options::variables_map& cli,
     const ConfigMap& file_values,
