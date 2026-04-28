@@ -185,6 +185,58 @@ seastar::future<> test_compat_unbound_drops_messages(const std::string& root_dir
     co_return;
 }
 
+seastar::future<> test_fast_path_large_payload_blocks(const std::string& root_dir) {
+    namespace fs = std::filesystem;
+    const auto log_dir = (fs::path(root_dir) / "fast-large-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "fast-large-archive").string();
+    fs::create_directories(log_dir);
+    fs::create_directories(archive_dir);
+    for (const auto& entry : fs::directory_iterator(log_dir)) {
+        fs::remove(entry.path());
+    }
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.write_mode = log_engine::WriteMode::fast;
+    config.batch_size = 16;
+    config.fast_path_max_pending_bytes = 4096;
+    config.stream_buffer_size = 4096;
+
+    const std::string payload_a(5000, 'x');
+    const std::string payload_b(5200, 'y');
+    const std::string payload_c(73, 'z');
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    co_await engine.info(payload_a, "route-fast");
+    co_await engine.info(payload_b, "route-fast");
+    co_await engine.info(payload_c, "route-fast");
+    co_await engine.stop();
+
+    std::optional<fs::path> shard_path;
+    for (const auto& entry : fs::directory_iterator(log_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".log") {
+            shard_path = entry.path();
+            break;
+        }
+    }
+    require(shard_path.has_value(), "fast path test should find a shard log");
+
+    std::ifstream in(*shard_path, std::ios::binary);
+    require(in.is_open(), "fast path shard log should be readable");
+
+    std::string line;
+    require(static_cast<bool>(std::getline(in, line)), "missing first fast path record");
+    require(line == payload_a, "first fast path record mismatch");
+    require(static_cast<bool>(std::getline(in, line)), "missing second fast path record");
+    require(line == payload_b, "second fast path record mismatch");
+    require(static_cast<bool>(std::getline(in, line)), "missing third fast path record");
+    require(line == payload_c, "third fast path record mismatch");
+    require(!static_cast<bool>(std::getline(in, line)), "fast path test should produce exactly three records");
+    co_return;
+}
+
 seastar::future<> test_time_rotation_and_archive_read(const std::string& root_dir) {
     namespace fs = std::filesystem;
     const auto log_dir = (fs::path(root_dir) / "time-logs").string();
@@ -308,6 +360,7 @@ int main(int argc, char** argv) {
         co_await test_config_loader(root_dir);
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);
+        co_await test_fast_path_large_payload_blocks(root_dir);
         co_await test_time_rotation_and_archive_read(root_dir);
         co_await test_recovery_scan(root_dir);
         co_return;
