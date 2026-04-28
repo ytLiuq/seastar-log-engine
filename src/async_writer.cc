@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <filesystem>
 #include <utility>
+#include <vector>
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/defer.hh>
@@ -20,6 +22,14 @@ namespace log_engine {
 namespace {
 
 seastar::logger applog("log-engine");
+
+std::size_t batch_bytes(const std::deque<seastar::temporary_buffer<char>>& batch) {
+    std::size_t bytes = 0;
+    for (const auto& entry : batch) {
+        bytes += entry.size();
+    }
+    return bytes;
+}
 
 }
 
@@ -43,10 +53,12 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
     _full_pending.clear();
     _sequence = 0;
     _rotation_index = 0;
+    reset_metrics();
     _stopping = false;
     _flush_in_progress = false;
     _fast_flush_scheduled = false;
     _started = true;
+    setup_metrics();
 
     auto shard_id = seastar::this_shard_id();
     std::filesystem::create_directories(_config.log_dir);
@@ -91,6 +103,7 @@ seastar::future<> AsyncWriter::stop() {
         }
     }
     co_await _append_writer.close();
+    _metrics.clear();
     _started = false;
 }
 
@@ -140,12 +153,16 @@ seastar::future<> AsyncWriter::flush_fast_once() {
     std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_fast_pending);
     const auto batch_entries = _fast_pending_entries;
+    const auto batch_byte_count = batch_bytes(batch);
     _fast_pending_entries = 0;
     _fast_pending_bytes = 0;
 
     try {
         co_await _append_writer.append_batch(batch);
+        ++_metric_flushed_batches;
+        _metric_flushed_bytes += batch_byte_count;
     } catch (...) {
+        ++_metric_flush_errors;
         _fast_pending_entries += batch_entries;
         while (!batch.empty()) {
             _fast_pending_bytes += batch.back().size();
@@ -159,11 +176,15 @@ seastar::future<> AsyncWriter::flush_fast_once() {
 seastar::future<> AsyncWriter::flush_full_once() {
     std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_full_pending);
+    const auto batch_byte_count = batch_bytes(batch);
 
     try {
         co_await _append_writer.append_batch(batch);
+        ++_metric_flushed_batches;
+        _metric_flushed_bytes += batch_byte_count;
         co_await maybe_rotate();
     } catch (...) {
+        ++_metric_flush_errors;
         while (!batch.empty()) {
             _full_pending.emplace_front(std::move(batch.back()));
             batch.pop_back();
@@ -239,12 +260,16 @@ seastar::temporary_buffer<char> AsyncWriter::format_record(LogMessage&& message)
 }
 
 void AsyncWriter::submit_fast(LogMessage&& message) {
+    ++_metric_submitted_messages;
     append_fast_payload_to_pending(message.payload);
     ++_fast_pending_entries;
 }
 
 void AsyncWriter::submit_full(LogMessage&& message) {
-    _full_pending.emplace_back(format_record(std::move(message)));
+    auto record = format_record(std::move(message));
+    ++_metric_submitted_messages;
+    _metric_submitted_bytes += record.size();
+    _full_pending.emplace_back(std::move(record));
 }
 
 void AsyncWriter::flush_open_fast_block() {
@@ -267,6 +292,7 @@ void AsyncWriter::append_fast_payload_to_pending(std::string_view payload) {
         auto buffer = seastar::temporary_buffer<char>(record_size);
         std::memcpy(buffer.get_write(), payload.data(), payload.size());
         buffer.get_write()[payload.size()] = '\n';
+        _metric_submitted_bytes += record_size;
         _fast_pending_bytes += record_size;
         _fast_pending.emplace_back(std::move(buffer));
         return;
@@ -281,6 +307,7 @@ void AsyncWriter::append_fast_payload_to_pending(std::string_view payload) {
     std::memcpy(out, payload.data(), payload.size());
     out[payload.size()] = '\n';
     _fast_open_block_used += record_size;
+    _metric_submitted_bytes += record_size;
     _fast_pending_bytes += record_size;
 }
 
@@ -290,6 +317,48 @@ std::size_t AsyncWriter::fast_flush_bytes_limit() const noexcept {
 
 std::size_t AsyncWriter::fast_block_size() const noexcept {
     return std::max<std::size_t>(_config.stream_buffer_size, 1024 * 1024);
+}
+
+void AsyncWriter::setup_metrics() {
+    namespace sm = seastar::metrics;
+    static const sm::label mode_label("mode");
+    const auto mode = mode_label(use_fast_path() ? "fast" : "full");
+    _metrics.clear();
+    std::vector<sm::metric_definition> definitions;
+    definitions.reserve(8);
+    definitions.push_back(sm::make_counter("submitted_messages", sm::description("Total submitted log messages"), [this] {
+            return _metric_submitted_messages;
+        })(mode));
+    definitions.push_back(sm::make_total_bytes("submitted_bytes", [this] {
+            return _metric_submitted_bytes;
+        }, sm::description("Total submitted log bytes"))(mode));
+    definitions.push_back(sm::make_counter("flushed_batches", sm::description("Total flushed write batches"), [this] {
+            return _metric_flushed_batches;
+        })(mode));
+    definitions.push_back(sm::make_total_bytes("flushed_bytes", [this] {
+            return _metric_flushed_bytes;
+        }, sm::description("Total flushed log bytes"))(mode));
+    definitions.push_back(sm::make_counter("flush_errors", sm::description("Total failed flush attempts"), [this] {
+            return _metric_flush_errors;
+        })(mode));
+    definitions.push_back(sm::make_queue_length("pending_entries", [this] {
+            return pending_entries();
+        }, sm::description("Current queued log entries"))(mode));
+    definitions.push_back(sm::make_current_bytes("pending_bytes", [this] {
+            return use_fast_path() ? _fast_pending_bytes : batch_bytes(_full_pending);
+        }, sm::description("Current queued log bytes"))(mode));
+    definitions.push_back(sm::make_current_bytes("logical_size_bytes", [this] {
+            return _append_writer.logical_size();
+        }, sm::description("Current logical log size"))(mode));
+    _metrics.add_group("log_engine_writer", definitions);
+}
+
+void AsyncWriter::reset_metrics() {
+    _metric_submitted_messages = 0;
+    _metric_submitted_bytes = 0;
+    _metric_flushed_batches = 0;
+    _metric_flushed_bytes = 0;
+    _metric_flush_errors = 0;
 }
 
 AsyncWriter::TimestampBuffer AsyncWriter::format_timestamp() {

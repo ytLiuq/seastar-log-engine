@@ -7,6 +7,7 @@
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/timer.hh>
 
@@ -39,6 +40,8 @@ private:
     seastar::temporary_buffer<char> format_record(LogMessage&& message);
     void flush_open_fast_block();
     void append_fast_payload_to_pending(std::string_view payload);
+    void setup_metrics();
+    void reset_metrics();
     [[nodiscard]] std::size_t fast_block_size() const noexcept;
     [[nodiscard]] std::size_t fast_flush_bytes_limit() const noexcept;
     void submit_fast(LogMessage&& message);
@@ -70,6 +73,12 @@ private:
     std::uint64_t _rotation_index = 0;
     AppendWriter _append_writer;
     LogManager _log_manager;
+    seastar::metrics::metric_groups _metrics;
+    std::uint64_t _metric_submitted_messages = 0;
+    std::uint64_t _metric_submitted_bytes = 0;
+    std::uint64_t _metric_flushed_batches = 0;
+    std::uint64_t _metric_flushed_bytes = 0;
+    std::uint64_t _metric_flush_errors = 0;
     bool _started = false;
     bool _stopping = false;
     bool _flush_in_progress = false;
