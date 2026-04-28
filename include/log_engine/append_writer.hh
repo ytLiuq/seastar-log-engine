@@ -7,6 +7,7 @@
 
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
 
 #include "log_engine/config.hh"
@@ -30,6 +31,19 @@ public:
 
 private:
     seastar::future<> open_file();
+    seastar::future<> append_fast_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes);
+    seastar::future<> append_full_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes);
+    seastar::future<> write_stream_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes);
+    [[nodiscard]] std::size_t fast_stream_buffer_size() const noexcept;
+    seastar::future<> flush_chunks_prefix(
+        const std::deque<seastar::temporary_buffer<char>>& first,
+        const std::deque<seastar::temporary_buffer<char>>& second,
+        std::size_t bytes,
+        bool chunked);
+    seastar::future<> write_chunked_buffer_prefix(
+        const std::deque<seastar::temporary_buffer<char>>& first,
+        const std::deque<seastar::temporary_buffer<char>>& second,
+        std::size_t bytes);
     seastar::future<> write_aligned_buffer(const seastar::temporary_buffer<char>& buffer, std::size_t expected);
     static std::size_t align_up(std::size_t value, std::size_t alignment) noexcept;
 
@@ -37,7 +51,8 @@ private:
     EngineConfig _config;
     std::string _file_path;
     bool _buffered = false;
-    std::optional<seastar::file> _file;
+    seastar::file _file;
+    bool _file_open = false;
     std::optional<seastar::output_stream<char>> _stream;
     std::deque<seastar::temporary_buffer<char>> _tail_chunks;
     std::size_t _tail_bytes = 0;
