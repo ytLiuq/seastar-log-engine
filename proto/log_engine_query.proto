@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package logengine.query.v1;
+
+message Empty {}
+
+message StatusReply {
+  string routing_strategy = 1;
+  uint32 routing_shards = 2;
+  uint64 routing_virtual_nodes = 3;
+  uint64 ring_size = 4;
+  string log_dir = 5;
+  string archive_dir = 6;
+  string shard_file_prefix = 7;
+}
+
+message RouteRequest {
+  string route_key = 1;
+}
+
+message RouteReply {
+  uint32 shard = 1;
+  uint64 hash = 2;
+  uint64 token = 3;
+  bool used_local_fallback = 4;
+}
+
+message QueryRecordsRequest {
+  optional uint32 shard = 1;
+  optional uint64 seq_from = 2;
+  optional uint64 seq_to = 3;
+  optional string time_from = 4;
+  optional string time_to = 5;
+  uint64 limit = 6;
+  bool include_archive = 7;
+}
+
+message QueryRecord {
+  uint32 crc = 1;
+  string timestamp = 2;
+  uint32 shard = 3;
+  bool has_sequence = 4;
+  uint64 sequence = 5;
+  string level = 6;
+  string payload = 7;
+  string raw_line = 8;
+}
+
+message QueryRecordsReply {
+  repeated QueryRecord records = 1;
+}
+
+service QueryService {
+  rpc GetStatus(Empty) returns (StatusReply);
+  rpc Route(RouteRequest) returns (RouteReply);
+  rpc QueryRecords(QueryRecordsRequest) returns (QueryRecordsReply);
+}
