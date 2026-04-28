@@ -18,6 +18,7 @@ seastar::future<> LogEngine::start(EngineConfig config) {
     co_await _writers.invoke_on_all([cfg = _config](AsyncWriter& writer) mutable {
         return writer.start(std::move(cfg));
     });
+    _router.configure(_config.routing_strategy, _config.routing_virtual_nodes, seastar::smp::count);
     _started = true;
 }
 
@@ -54,14 +55,7 @@ seastar::future<> LogEngine::error(std::string payload, std::string route_key) {
 }
 
 unsigned LogEngine::route_to_shard(std::string_view route_key) noexcept {
-    const auto shard_count = seastar::smp::count;
-    if (shard_count == 0) {
-        return 0;
-    }
-    if (!route_key.empty()) {
-        return static_cast<unsigned>(std::hash<std::string_view>{}(route_key) % shard_count);
-    }
-    return seastar::this_shard_id();
+    return _router.route(route_key, seastar::this_shard_id()).shard;
 }
 
 }  // namespace log_engine

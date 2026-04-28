@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace log_engine {
 
@@ -12,11 +13,38 @@ enum class WriteMode {
     full,
 };
 
+enum class RoutingStrategy {
+    hash_modulo,
+    consistent_hashing,
+};
+
+inline const char* routing_strategy_to_string(RoutingStrategy strategy) noexcept {
+    switch (strategy) {
+    case RoutingStrategy::hash_modulo:
+        return "hash_modulo";
+    case RoutingStrategy::consistent_hashing:
+        return "consistent_hashing";
+    }
+    return "hash_modulo";
+}
+
+inline RoutingStrategy parse_routing_strategy(std::string_view value) {
+    if (value == "hash_modulo" || value == "hash-modulo" || value == "modulo") {
+        return RoutingStrategy::hash_modulo;
+    }
+    if (value == "consistent_hashing" || value == "consistent-hashing" || value == "consistent") {
+        return RoutingStrategy::consistent_hashing;
+    }
+    throw std::invalid_argument("routing_strategy must be hash_modulo or consistent_hashing");
+}
+
 struct EngineConfig {
     std::string log_dir = "logs";
     std::string archive_dir = "archive";
     std::string shard_file_prefix = "shard";
     WriteMode write_mode = WriteMode::fast;
+    RoutingStrategy routing_strategy = RoutingStrategy::hash_modulo;
+    std::size_t routing_virtual_nodes = 128;
     std::size_t batch_size = 32;
     std::size_t flush_interval_ms = 0;
     std::size_t fast_path_max_pending_bytes = 16 * 1024;
@@ -74,6 +102,9 @@ struct EngineConfig {
         }
         if (batch_size == 0) {
             throw std::invalid_argument("batch_size must be greater than zero");
+        }
+        if (routing_virtual_nodes == 0) {
+            throw std::invalid_argument("routing_virtual_nodes must be greater than zero");
         }
         if (stream_buffer_size == 0) {
             throw std::invalid_argument("stream_buffer_size must be greater than zero");

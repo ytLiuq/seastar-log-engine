@@ -8,6 +8,7 @@
 
 #include "log_engine/async_writer.hh"
 #include "log_engine/config.hh"
+#include "log_engine/routing.hh"
 
 namespace log_engine {
 
@@ -27,6 +28,7 @@ private:
 private:
     EngineConfig _config;
     seastar::sharded<AsyncWriter> _writers;
+    ShardRouter _router;
     std::atomic<std::uint64_t> _rr_counter{0};
     bool _started = false;
 };
