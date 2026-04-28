@@ -18,6 +18,7 @@
 - 基于 `seastar::metrics` 的 writer 指标
 - 日志读取 / 回溯 CLI
 - HTTP / gRPC 查询接口
+- `memory_ack / write_ack / sync_ack` 三档确认语义
 - 稳定的绑定式 glog 风格兼容头
 - `demo` / `bench` / `verify` / `read` / `query_server` / `query_client` 六个可执行程序
 - 独立的 `verify` 校验工具
@@ -71,7 +72,7 @@
 运行 benchmark：
 
 ```bash
-./build/log_engine_bench --mode fast --log-dir ./logs --archive-dir ./archive --messages 200000 --payload-size 256 --batch-size 8192 --flush-ms 0 --inflight 1 --checkpoint-enabled 0
+./build/log_engine_bench --mode fast --ack-mode memory_ack --log-dir ./logs --archive-dir ./archive --messages 200000 --payload-size 256 --batch-size 8192 --flush-ms 0 --inflight 1 --checkpoint-enabled 0
 ```
 
 校验日志文件：
@@ -129,6 +130,17 @@ Writer metrics：
 - 分组名：`log_engine_writer`
 - 当前暴露的核心指标：`submitted_messages`、`submitted_bytes`、`flushed_batches`、`flushed_bytes`、`flush_errors`、`pending_entries`、`pending_bytes`、`logical_size_bytes`
 
+Ack 语义：
+
+- `memory_ack`：消息进入 shard 本地队列后即可返回，由后台刷写负责落盘
+- `write_ack`：当前待写 batch/tail 已提交到底层写入路径后返回，但不额外执行显式 flush
+- `sync_ack`：当前待写 batch/tail 写入后额外执行 flush，再向调用方确认
+
+Benchmark 输出：
+
+- `log_engine_bench` 当前会输出 `avg_submit_us`、`p50_submit_us`、`p95_submit_us`、`p99_submit_us`
+- 可配合 `script/parse_results.py` 或 `script/compare_bench.sh --scan` 生成结构化摘要
+
 恢复模式启动：
 
 ```bash
@@ -140,6 +152,7 @@ Writer metrics：
 ```bash
 ./script/test_rotation.sh
 ./script/test_recovery.sh
+./script/test_fault_injection.sh
 ./script/test_read.sh
 ./script/test_unit.sh
 ```
@@ -158,4 +171,14 @@ Writer metrics：
 ```bash
 ./script/compare_bench.sh 50000 128
 ./script/compare_bench.sh --scan
+./script/bench_regression.sh --messages 100000 --repeats 3 --shards 1
+./script/bench_soak.sh --target log_engine --duration-seconds 300 --messages 50000 --payload-size 2048 --batch-size 8192 --inflight 1 --shards 1 --ack-mode memory_ack
 ```
+
+长稳 / 回归 benchmark：
+
+- `script/bench_regression.sh`
+  固定回归矩阵，默认覆盖 `128/512/2048B`、`memory_ack/write_ack/sync_ack`、不同 batch / inflight 组合，并在已构建时顺带对比 `spdlog/glog`
+- `script/bench_soak.sh`
+  连续循环压测，按时长收集多轮结果，用来观察吞吐波动和 `P95/P99` 漂移
+- 两个脚本都会把原始结果写到 `doc/*.tsv`，把摘要写到 `doc/*.md`
