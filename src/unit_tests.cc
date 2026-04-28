@@ -13,6 +13,7 @@
 #include "log_engine/log_manager.hh"
 #include "log_engine/log_reader.hh"
 #include "log_engine/record_codec.hh"
+#include "log_engine/routing.hh"
 
 namespace {
 
@@ -73,6 +74,8 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     {
         std::ofstream out(config_path, std::ios::trunc);
         out << "mode=full\n";
+        out << "routing-strategy=consistent_hashing\n";
+        out << "routing-virtual-nodes=33\n";
         out << "log-dir=/tmp/demo-logs\n";
         out << "batch-size=17\n";
         out << "rotate-interval-seconds=9\n";
@@ -85,12 +88,36 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     boost::program_options::variables_map cli;
     auto config = log_engine::apply_engine_config_overrides(log_engine::EngineConfig{}, cli, values);
     require(config.write_mode == log_engine::WriteMode::full, "config loader should override mode");
+    require(config.routing_strategy == log_engine::RoutingStrategy::consistent_hashing, "config loader should override routing strategy");
+    require(config.routing_virtual_nodes == 33, "config loader should override routing virtual nodes");
     require(config.log_dir == "/tmp/demo-logs", "config loader should override log_dir");
     require(config.batch_size == 17, "config loader should override batch_size");
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
     require(config.compress_archives == false, "config loader should override compress_archives");
     require(config.record_crc_enabled == false, "config loader should override record_crc_enabled");
     require(config.record_sequence_enabled == true, "config loader should override record_sequence_enabled");
+    co_return;
+}
+
+seastar::future<> test_consistent_hash_routing() {
+    log_engine::ShardRouter modulo_router;
+    modulo_router.configure(log_engine::RoutingStrategy::hash_modulo, 128, 4);
+    const auto modulo_a = modulo_router.route("route-a", 0);
+    const auto modulo_b = modulo_router.route("route-a", 3);
+    require(modulo_a.shard == modulo_b.shard, "hash modulo routing should be independent of local shard for non-empty keys");
+    require(!modulo_a.used_local_fallback, "non-empty route key should not use fallback");
+
+    log_engine::ShardRouter consistent_router;
+    consistent_router.configure(log_engine::RoutingStrategy::consistent_hashing, 64, 4);
+    const auto consistent_a = consistent_router.route("route-a", 0);
+    const auto consistent_b = consistent_router.route("route-a", 2);
+    require(consistent_router.ring_size() == 256, "consistent routing should build shard_count * virtual_nodes ring");
+    require(consistent_a.shard == consistent_b.shard, "consistent hashing should be stable for the same key");
+    require(consistent_a.token != 0, "consistent hashing should return the selected token");
+
+    const auto fallback = consistent_router.route("", 3);
+    require(fallback.shard == 3, "empty route key should fall back to local shard");
+    require(fallback.used_local_fallback, "empty route key should mark local fallback");
     co_return;
 }
 
@@ -358,6 +385,7 @@ int main(int argc, char** argv) {
         const auto root_dir = app.configuration()["root-dir"].as<std::string>();
         co_await test_record_codec();
         co_await test_config_loader(root_dir);
+        co_await test_consistent_hash_routing();
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);
         co_await test_fast_path_large_payload_blocks(root_dir);

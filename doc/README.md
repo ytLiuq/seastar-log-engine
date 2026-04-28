@@ -5,7 +5,7 @@
 - 基于 `seastar::sharded` 的 per-shard writer
 - 按批量阈值或定时器触发刷盘
 - 每个 shard 独立顺序写入自己的日志文件
-- 简单的按 route key 分片路由
+- 按 route key 分片路由，支持 `hash_modulo` 和 consistent hashing + virtual nodes
 - 按文件大小滚动 active log
 - 归档目录维护与旧归档自动清理
 - 记录级 CRC32 校验
@@ -15,9 +15,11 @@
 - 按大小和按时间的滚动触发
 - gzip 归档与按数量/时间清理
 - 配置文件加载
+- 基于 `seastar::metrics` 的 writer 指标
 - 日志读取 / 回溯 CLI
+- HTTP / gRPC 查询接口
 - 稳定的绑定式 glog 风格兼容头
-- `demo` / `bench` / `verify` / `read` 四个可执行程序
+- `demo` / `bench` / `verify` / `read` / `query_server` / `query_client` 六个可执行程序
 - 独立的 `verify` 校验工具
 - `glog` 对比 benchmark
 - `spdlog` 对比 benchmark（当本机安装 `spdlog` 并成功被 CMake 发现时）
@@ -32,6 +34,7 @@
 
 - `include/log_engine`: 头文件
 - `src`: 核心实现和 demo 入口
+- `proto`: gRPC proto 定义
 - `script/build.sh`: 本地构建脚本
 - `logs`: 默认日志目录
 
@@ -62,7 +65,7 @@
 运行 demo：
 
 ```bash
-./build/log_engine_demo --mode full --log-dir ./logs --archive-dir ./archive --messages 100000 --batch-size 1024 --flush-ms 1 --rotate-size-bytes 1048576 --rotate-interval-seconds 0 --compress-archives 1 --checkpoint-enabled 1 --truncate-on-start 1
+./build/log_engine_demo --mode full --routing-strategy consistent_hashing --routing-virtual-nodes 256 --log-dir ./logs --archive-dir ./archive --messages 100000 --batch-size 1024 --flush-ms 1 --rotate-size-bytes 1048576 --rotate-interval-seconds 0 --compress-archives 1 --checkpoint-enabled 1 --truncate-on-start 1
 ```
 
 运行 benchmark：
@@ -83,6 +86,49 @@
 ./build/log_engine_read --log-dir ./logs --archive-dir ./archive --include-archive 1 --seq-from 100 --seq-to 200 --limit 50
 ```
 
+启动查询服务：
+
+```bash
+./build/log_engine_query_server \
+  --config ./config/engine.conf \
+  --routing-strategy consistent_hashing \
+  --routing-virtual-nodes 256 \
+  --http-address 0.0.0.0 \
+  --http-port 18080 \
+  --grpc-address 0.0.0.0 \
+  --grpc-port 19090 \
+  --metrics-address 0.0.0.0 \
+  --metrics-port 19181
+```
+
+HTTP 查询接口：
+
+```bash
+curl 'http://127.0.0.1:18080/v1/status'
+curl 'http://127.0.0.1:18080/v1/route?key=route-a'
+curl 'http://127.0.0.1:18080/v1/records?shard=0&limit=10&include_archive=true'
+curl 'http://127.0.0.1:19181/metrics'
+```
+
+gRPC 查询接口：
+
+```bash
+./build/log_engine_query_client --target 127.0.0.1:19090 --method status
+./build/log_engine_query_client --target 127.0.0.1:19090 --method route --route-key route-a
+./build/log_engine_query_client --target 127.0.0.1:19090 --method records --limit 10 --include-archive true
+```
+
+路由参数：
+
+- `--routing-strategy hash_modulo|consistent_hashing`
+- `--routing-virtual-nodes <n>`
+- 空 `route_key` 仍然回退到当前 shard，本地无 key 写入不会被强制重路由
+
+Writer metrics：
+
+- 分组名：`log_engine_writer`
+- 当前暴露的核心指标：`submitted_messages`、`submitted_bytes`、`flushed_batches`、`flushed_bytes`、`flush_errors`、`pending_entries`、`pending_bytes`、`logical_size_bytes`
+
 恢复模式启动：
 
 ```bash
@@ -102,6 +148,7 @@
 
 - 记录编解码与 CRC 校验
 - 配置文件加载与参数覆盖
+- consistent hashing 路由与 virtual nodes 基本行为
 - 绑定式 `compat_glog` 写日志与 flush
 - 按时间滚动后的 gzip 归档读取
 - active log 追加损坏尾部后的恢复扫描
