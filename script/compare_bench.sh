@@ -101,11 +101,14 @@ emit_scan_row() {
   local checkpoint_enabled="$7"
   local raw_line="$8"
 
-  local elapsed_us throughput avg_submit_us
+  local elapsed_us throughput avg_submit_us p50_submit_us p95_submit_us p99_submit_us
   elapsed_us="$(extract_metric "${raw_line}" "elapsed_us")"
   throughput="$(extract_metric "${raw_line}" "throughput_msg_per_sec")"
   avg_submit_us="$(extract_metric "${raw_line}" "avg_submit_us")"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  p50_submit_us="$(extract_metric "${raw_line}" "p50_submit_us")"
+  p95_submit_us="$(extract_metric "${raw_line}" "p95_submit_us")"
+  p99_submit_us="$(extract_metric "${raw_line}" "p99_submit_us")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${scenario}" \
     "${target}" \
     "${messages}" \
@@ -115,7 +118,10 @@ emit_scan_row() {
     "${checkpoint_enabled}" \
     "${elapsed_us:-}" \
     "${throughput:-}" \
-    "${avg_submit_us:-}"
+    "${avg_submit_us:-}" \
+    "${p50_submit_us:-}" \
+    "${p95_submit_us:-}" \
+    "${p99_submit_us:-}"
 }
 
 run_default_compare() {
@@ -144,7 +150,7 @@ run_scan() {
   local output_path="${1:-${ROOT_DIR}/doc/benchmark-scan-$(date +%F).tsv}"
 
   {
-    printf 'scenario\ttarget\tmessages\tpayload_size\tbatch_size\tinflight\tcheckpoint_enabled\telapsed_us\tthroughput_msg_per_sec\tavg_submit_us\n'
+    printf 'scenario\ttarget\tmessages\tpayload_size\tbatch_size\tinflight\tcheckpoint_enabled\telapsed_us\tthroughput_msg_per_sec\tavg_submit_us\tp50_submit_us\tp95_submit_us\tp99_submit_us\n'
 
     local payload messages line
     messages=50000
