@@ -32,11 +32,15 @@ private:
     seastar::future<> flush_fast_once();
     seastar::future<> flush_full_once();
     seastar::future<> flush_background();
+    void schedule_fast_flush();
     seastar::future<> maybe_rotate();
     seastar::future<> recover_from_checkpoint();
     seastar::future<> persist_checkpoint();
     seastar::temporary_buffer<char> format_record(LogMessage&& message);
-    seastar::temporary_buffer<char> format_fast_payload(LogMessage&& message);
+    void flush_open_fast_block();
+    void append_fast_payload_to_pending(std::string_view payload);
+    [[nodiscard]] std::size_t fast_block_size() const noexcept;
+    [[nodiscard]] std::size_t fast_flush_bytes_limit() const noexcept;
     void submit_fast(LogMessage&& message);
     void submit_full(LogMessage&& message);
     [[nodiscard]] bool use_fast_path() const noexcept;
@@ -56,6 +60,9 @@ private:
     seastar::timer<seastar::lowres_clock> _flush_timer;
     seastar::gate _gate;
     std::deque<seastar::temporary_buffer<char>> _fast_pending;
+    seastar::temporary_buffer<char> _fast_open_block;
+    std::size_t _fast_open_block_used = 0;
+    std::size_t _fast_pending_entries = 0;
     std::size_t _fast_pending_bytes = 0;
     std::deque<seastar::temporary_buffer<char>> _full_pending;
     std::string _file_path;
@@ -66,6 +73,7 @@ private:
     bool _started = false;
     bool _stopping = false;
     bool _flush_in_progress = false;
+    bool _fast_flush_scheduled = false;
 };
 
 }  // namespace log_engine

@@ -1,6 +1,7 @@
 #include "log_engine/async_writer.hh"
 
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <utility>
@@ -35,12 +36,16 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
     _config.validate();
     co_await _log_manager.prepare(_config);
     _fast_pending.clear();
+    _fast_open_block = seastar::temporary_buffer<char>();
+    _fast_open_block_used = 0;
+    _fast_pending_entries = 0;
     _fast_pending_bytes = 0;
     _full_pending.clear();
     _sequence = 0;
     _rotation_index = 0;
     _stopping = false;
     _flush_in_progress = false;
+    _fast_flush_scheduled = false;
     _started = true;
 
     auto shard_id = seastar::this_shard_id();
@@ -99,13 +104,17 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
         submit_full(std::move(message));
     }
     if (pending_entries() >= _config.batch_size ||
-        (use_fast_path() && _fast_pending_bytes >= _config.fast_path_max_pending_bytes)) {
-        co_await flush_background();
+        (use_fast_path() && _fast_pending_bytes >= fast_flush_bytes_limit())) {
+        if (use_fast_path()) {
+            schedule_fast_flush();
+        } else {
+            co_await flush_background();
+        }
     }
 }
 
 std::size_t AsyncWriter::pending_entries() const noexcept {
-    return use_fast_path() ? _fast_pending.size() : _full_pending.size();
+    return use_fast_path() ? _fast_pending_entries : _full_pending.size();
 }
 
 std::string AsyncWriter::shard_path() const {
@@ -127,13 +136,17 @@ seastar::future<> AsyncWriter::flush_once() {
 }
 
 seastar::future<> AsyncWriter::flush_fast_once() {
+    flush_open_fast_block();
     std::deque<seastar::temporary_buffer<char>> batch;
     batch.swap(_fast_pending);
+    const auto batch_entries = _fast_pending_entries;
+    _fast_pending_entries = 0;
     _fast_pending_bytes = 0;
 
     try {
         co_await _append_writer.append_batch(batch);
     } catch (...) {
+        _fast_pending_entries += batch_entries;
         while (!batch.empty()) {
             _fast_pending_bytes += batch.back().size();
             _fast_pending.emplace_front(std::move(batch.back()));
@@ -165,6 +178,24 @@ seastar::future<> AsyncWriter::flush_background() {
     }
     co_await seastar::with_gate(_gate, [this] {
         return flush_once();
+    });
+}
+
+void AsyncWriter::schedule_fast_flush() {
+    if (_stopping || _fast_flush_scheduled || pending_entries() == 0) {
+        return;
+    }
+
+    _fast_flush_scheduled = true;
+    (void)seastar::with_gate(_gate, [this] {
+        return flush_once();
+    }).finally([this] {
+        _fast_flush_scheduled = false;
+        if (!_stopping && pending_entries() > 0) {
+            schedule_fast_flush();
+        }
+    }).handle_exception([](std::exception_ptr ep) {
+        applog.warn("scheduled fast flush failed: {}", ep);
     });
 }
 
@@ -207,21 +238,58 @@ seastar::temporary_buffer<char> AsyncWriter::format_record(LogMessage&& message)
         message.payload);
 }
 
-seastar::temporary_buffer<char> AsyncWriter::format_fast_payload(LogMessage&& message) {
-    auto buffer = seastar::temporary_buffer<char>(message.payload.size() + 1);
-    std::memcpy(buffer.get_write(), message.payload.data(), message.payload.size());
-    buffer.get_write()[message.payload.size()] = '\n';
-    return buffer;
-}
-
 void AsyncWriter::submit_fast(LogMessage&& message) {
-    auto payload = format_fast_payload(std::move(message));
-    _fast_pending_bytes += payload.size();
-    _fast_pending.emplace_back(std::move(payload));
+    append_fast_payload_to_pending(message.payload);
+    ++_fast_pending_entries;
 }
 
 void AsyncWriter::submit_full(LogMessage&& message) {
     _full_pending.emplace_back(format_record(std::move(message)));
+}
+
+void AsyncWriter::flush_open_fast_block() {
+    if (_fast_open_block_used == 0) {
+        return;
+    }
+
+    _fast_open_block.trim(_fast_open_block_used);
+    _fast_pending.emplace_back(std::move(_fast_open_block));
+    _fast_open_block = seastar::temporary_buffer<char>();
+    _fast_open_block_used = 0;
+}
+
+void AsyncWriter::append_fast_payload_to_pending(std::string_view payload) {
+    const auto record_size = payload.size() + 1;
+    const auto block_size = fast_block_size();
+
+    if (record_size >= block_size) {
+        flush_open_fast_block();
+        auto buffer = seastar::temporary_buffer<char>(record_size);
+        std::memcpy(buffer.get_write(), payload.data(), payload.size());
+        buffer.get_write()[payload.size()] = '\n';
+        _fast_pending_bytes += record_size;
+        _fast_pending.emplace_back(std::move(buffer));
+        return;
+    }
+
+    if (!_fast_open_block || _fast_open_block.size() - _fast_open_block_used < record_size) {
+        flush_open_fast_block();
+        _fast_open_block = seastar::temporary_buffer<char>(block_size);
+    }
+
+    char* out = _fast_open_block.get_write() + _fast_open_block_used;
+    std::memcpy(out, payload.data(), payload.size());
+    out[payload.size()] = '\n';
+    _fast_open_block_used += record_size;
+    _fast_pending_bytes += record_size;
+}
+
+std::size_t AsyncWriter::fast_flush_bytes_limit() const noexcept {
+    return std::max<std::size_t>(_config.fast_path_max_pending_bytes, fast_block_size() * 4);
+}
+
+std::size_t AsyncWriter::fast_block_size() const noexcept {
+    return std::max<std::size_t>(_config.stream_buffer_size, 1024 * 1024);
 }
 
 AsyncWriter::TimestampBuffer AsyncWriter::format_timestamp() {
