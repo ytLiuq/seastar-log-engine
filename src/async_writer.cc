@@ -15,6 +15,7 @@
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
+#include "log_engine/log_layout.hh"
 #include "log_engine/record_codec.hh"
 
 namespace log_engine {
@@ -57,11 +58,8 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
 
     auto shard_id = seastar::this_shard_id();
     std::filesystem::create_directories(_config.log_dir);
-    _file_path = seastar::format(
-        "{}/{}-{}.log",
-        _config.log_dir,
-        _config.shard_file_prefix,
-        shard_id);
+    _file_path = layout::active_log_path(_config, shard_id);
+    _active_segment = layout::active_segment(_config, shard_id);
 
     co_await _append_writer.start(_config, _file_path);
     if (!_config.truncate_on_start) {
@@ -180,8 +178,7 @@ seastar::future<> AsyncWriter::maybe_rotate() {
     ++_rotation_index;
     co_await _log_manager.rotate_active_file(
         _config,
-        _file_path,
-        seastar::this_shard_id(),
+        _active_segment,
         _rotation_index);
     _append_writer.reset_after_rotation();
     co_await _append_writer.start(_config, _file_path);
@@ -289,7 +286,7 @@ std::size_t AsyncWriter::align_up(std::size_t value, std::size_t alignment) noex
 }
 
 seastar::future<> AsyncWriter::recover_from_checkpoint() {
-    const auto recovery = co_await _log_manager.recover_active_file(_file_path, _append_writer.alignment());
+    const auto recovery = co_await _log_manager.recover_active_file(_active_segment, _append_writer.alignment());
     _sequence = recovery.sequence;
     _rotation_index = recovery.rotation_index;
     co_await _append_writer.truncate_to(recovery.logical_size, recovery.tail_buffer);
@@ -300,7 +297,7 @@ seastar::future<> AsyncWriter::recover_from_checkpoint() {
 
 seastar::future<> AsyncWriter::persist_checkpoint() {
     co_await _log_manager.store_checkpoint(
-        _file_path,
+        _active_segment,
         CheckpointState{
             .logical_size = _append_writer.logical_size(),
             .sequence = _sequence,

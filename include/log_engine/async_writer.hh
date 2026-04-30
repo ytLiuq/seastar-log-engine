@@ -13,6 +13,7 @@
 
 #include "log_engine/append_writer.hh"
 #include "log_engine/config.hh"
+#include "log_engine/log_layout.hh"
 #include "log_engine/log_manager.hh"
 
 namespace log_engine {
@@ -55,6 +56,7 @@ private:
     seastar::gate _gate;
     std::deque<seastar::temporary_buffer<char>> _pending;
     std::size_t _pending_bytes = 0;
+    layout::SegmentDescriptor _active_segment;
     std::string _file_path;
     std::uint64_t _sequence = 0;
     std::uint64_t _rotation_index = 0;

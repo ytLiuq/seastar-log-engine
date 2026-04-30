@@ -10,6 +10,7 @@
 
 #include "log_engine/compat_glog.hh"
 #include "log_engine/config_loader.hh"
+#include "log_engine/log_layout.hh"
 #include "log_engine/log_manager.hh"
 #include "log_engine/log_reader.hh"
 #include "log_engine/record_codec.hh"
@@ -361,7 +362,9 @@ seastar::future<> test_recovery_scan(const std::string& root_dir) {
     }
 
     log_engine::LogManager manager;
-    const auto recovery = co_await manager.recover_active_file(shard_path->string(), 4096);
+    const auto active_segment = log_engine::layout::describe_path(config, shard_path->string());
+    require(active_segment.has_value(), "recovery test should describe active shard log");
+    const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
     require(recovery.sequence == 2, "recovery should preserve next sequence");
     require(recovery.logical_size > 0, "recovery should preserve valid_size");
     require(recovery.logical_size < static_cast<std::uint64_t>(fs::file_size(*shard_path)), "recovery should cut broken tail");

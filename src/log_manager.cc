@@ -14,14 +14,15 @@
 
 #include <seastar/core/thread.hh>
 
+#include "log_engine/log_layout.hh"
 #include "log_engine/record_codec.hh"
 
 namespace log_engine {
 
 namespace {
 
-std::optional<CheckpointState> read_checkpoint_file(const std::string& active_path) {
-    const auto path = active_path + ".checkpoint";
+std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescriptor& active_segment) {
+    const auto path = layout::checkpoint_path(active_segment);
     if (!std::filesystem::exists(path)) {
         return std::nullopt;
     }
@@ -69,29 +70,29 @@ seastar::future<> LogManager::prepare(const EngineConfig& config) {
 
 seastar::future<> LogManager::rotate_active_file(
     const EngineConfig& config,
-    const std::string& active_path,
-    unsigned shard_id,
+    const layout::SegmentDescriptor& active_segment,
     std::uint64_t rotation_index) {
-    return seastar::async([config, active_path, shard_id, rotation_index] {
+    return seastar::async([config, active_segment, rotation_index] {
         namespace fs = std::filesystem;
-        const fs::path active(active_path);
+        const fs::path active(active_segment.path);
         if (!fs::exists(active)) {
             return;
         }
 
-        auto archive_path = make_archive_path(config, active_path, shard_id, rotation_index);
+        const auto now = std::chrono::system_clock::now();
+        const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        auto archive_path = layout::archive_log_path(config, active_segment.shard_id, epoch_ms, rotation_index, false);
         fs::rename(active, archive_path);
         if (config.compress_archives) {
             gzip_file(archive_path);
-            archive_path += ".gz";
         }
-        cleanup_archives(config, shard_id);
+        cleanup_archives(config, active_segment.shard_id);
     });
 }
 
-seastar::future<> LogManager::store_checkpoint(const std::string& active_path, const CheckpointState& checkpoint) {
-    return seastar::async([active_path, checkpoint] {
-        const auto final_path = checkpoint_path(active_path);
+seastar::future<> LogManager::store_checkpoint(const layout::SegmentDescriptor& active_segment, const CheckpointState& checkpoint) {
+    return seastar::async([active_segment, checkpoint] {
+        const auto final_path = layout::checkpoint_path(active_segment);
         const auto tmp_path = final_path + ".tmp";
         {
             std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
@@ -107,21 +108,21 @@ seastar::future<> LogManager::store_checkpoint(const std::string& active_path, c
     });
 }
 
-seastar::future<std::optional<CheckpointState>> LogManager::load_checkpoint(const std::string& active_path) {
-    return seastar::async([active_path] () -> std::optional<CheckpointState> {
-        return read_checkpoint_file(active_path);
+seastar::future<std::optional<CheckpointState>> LogManager::load_checkpoint(const layout::SegmentDescriptor& active_segment) {
+    return seastar::async([active_segment] () -> std::optional<CheckpointState> {
+        return read_checkpoint_file(active_segment);
     });
 }
 
-seastar::future<RecoveryState> LogManager::recover_active_file(const std::string& active_path, std::size_t alignment) {
-    return seastar::async([this, active_path, alignment] {
+seastar::future<RecoveryState> LogManager::recover_active_file(const layout::SegmentDescriptor& active_segment, std::size_t alignment) {
+    return seastar::async([active_segment, alignment] {
         namespace fs = std::filesystem;
         RecoveryState recovery;
-        if (!fs::exists(active_path)) {
+        if (!fs::exists(active_segment.path)) {
             return recovery;
         }
 
-        std::ifstream in(active_path, std::ios::binary);
+        std::ifstream in(active_segment.path, std::ios::binary);
         std::stringstream buffer;
         buffer << in.rdbuf();
         const auto content = buffer.str();
@@ -130,7 +131,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const std::string
         auto sequence = verified.next_sequence;
         auto rotation_index = std::uint64_t{0};
 
-        const auto checkpoint = read_checkpoint_file(active_path);
+        const auto checkpoint = read_checkpoint_file(active_segment);
         if (checkpoint) {
             valid_size = std::min(valid_size, checkpoint->logical_size);
             if (checkpoint->logical_size <= verified.valid_size) {
@@ -155,55 +156,30 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const std::string
     });
 }
 
-std::string LogManager::make_archive_path(
-    const EngineConfig& config,
-    const std::string& active_path,
-    unsigned shard_id,
-    std::uint64_t rotation_index) {
-    namespace fs = std::filesystem;
-    const auto now = std::chrono::system_clock::now();
-    const auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    const auto extension = fs::path(active_path).extension().string();
-    const auto filename = config.shard_file_prefix + "-" + std::to_string(shard_id)
-        + "." + std::to_string(epoch_ms)
-        + "." + std::to_string(rotation_index)
-        + extension;
-    return (fs::path(config.archive_dir) / filename).string();
-}
-
-std::string LogManager::checkpoint_path(const std::string& active_path) {
-    return active_path + ".checkpoint";
-}
-
 void LogManager::cleanup_archives(const EngineConfig& config, unsigned shard_id) {
     namespace fs = std::filesystem;
-    std::vector<fs::directory_entry> archived;
-    const auto prefix = config.shard_file_prefix + "-" + std::to_string(shard_id) + ".";
     const auto now = fs::file_time_type::clock::now();
-    for (const auto& entry : fs::directory_iterator(config.archive_dir)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        const auto name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) {
-            continue;
-        }
+    auto archived = layout::collect_archive_segments(config, shard_id);
+    archived.erase(std::remove_if(archived.begin(), archived.end(), [&] (const auto& segment) {
         if (config.archive_retention_seconds > 0) {
-            const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - entry.last_write_time()).count();
+            const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - fs::last_write_time(segment.path)).count();
             if (age > static_cast<long long>(config.archive_retention_seconds)) {
-                fs::remove(entry.path());
-                continue;
+                fs::remove(segment.path);
+                return true;
             }
         }
-        archived.push_back(entry);
-    }
+        return false;
+    }), archived.end());
 
     std::sort(archived.begin(), archived.end(), [] (const auto& lhs, const auto& rhs) {
-        return lhs.last_write_time() > rhs.last_write_time();
+        if (lhs.timestamp_ms != rhs.timestamp_ms) {
+            return lhs.timestamp_ms > rhs.timestamp_ms;
+        }
+        return lhs.rotation_index > rhs.rotation_index;
     });
 
     for (std::size_t i = config.max_archived_files_per_shard; i < archived.size(); ++i) {
-        fs::remove(archived[i].path());
+        fs::remove(archived[i].path);
     }
 }
 

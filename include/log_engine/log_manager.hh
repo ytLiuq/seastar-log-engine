@@ -8,6 +8,7 @@
 #include <seastar/core/future.hh>
 
 #include "log_engine/config.hh"
+#include "log_engine/log_layout.hh"
 
 namespace log_engine {
 
@@ -29,20 +30,13 @@ public:
     seastar::future<> prepare(const EngineConfig& config);
     seastar::future<> rotate_active_file(
         const EngineConfig& config,
-        const std::string& active_path,
-        unsigned shard_id,
+        const layout::SegmentDescriptor& active_segment,
         std::uint64_t rotation_index);
-    seastar::future<> store_checkpoint(const std::string& active_path, const CheckpointState& checkpoint);
-    seastar::future<std::optional<CheckpointState>> load_checkpoint(const std::string& active_path);
-    seastar::future<RecoveryState> recover_active_file(const std::string& active_path, std::size_t alignment);
+    seastar::future<> store_checkpoint(const layout::SegmentDescriptor& active_segment, const CheckpointState& checkpoint);
+    seastar::future<std::optional<CheckpointState>> load_checkpoint(const layout::SegmentDescriptor& active_segment);
+    seastar::future<RecoveryState> recover_active_file(const layout::SegmentDescriptor& active_segment, std::size_t alignment);
 
 private:
-    static std::string make_archive_path(
-        const EngineConfig& config,
-        const std::string& active_path,
-        unsigned shard_id,
-        std::uint64_t rotation_index);
-    static std::string checkpoint_path(const std::string& active_path);
     static void cleanup_archives(const EngineConfig& config, unsigned shard_id);
     static void gzip_file(const std::string& path);
 };
