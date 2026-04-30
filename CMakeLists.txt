@@ -23,6 +23,7 @@ pkg_check_modules(GRPCPP REQUIRED IMPORTED_TARGET grpc++)
 pkg_check_modules(PROTOBUF REQUIRED IMPORTED_TARGET protobuf)
 find_program(PROTOC_EXECUTABLE protoc HINTS /usr/local/bin /usr/bin REQUIRED)
 find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
+set(FMT_LOCAL_STATIC_LIBRARY "/usr/local/lib/libfmt.a")
 find_library(SYSTEM_FMT_LIBRARY fmt PATHS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu NO_DEFAULT_PATH)
 find_library(FMT_LIBRARY fmt)
 find_library(GLOG_LIBRARY glog)
@@ -55,6 +56,7 @@ add_library(log_engine_core
     src/async_writer.cc
     src/compat_glog.cc
     src/config_loader.cc
+    src/log_layout.cc
     src/log_manager.cc
     src/log_reader.cc
     src/log_engine.cc
@@ -69,6 +71,16 @@ target_link_libraries(log_engine_core
     PUBLIC
         Seastar::seastar
         ZLIB::ZLIB)
+
+if (EXISTS "${FMT_LOCAL_STATIC_LIBRARY}")
+    target_link_libraries(log_engine_core PUBLIC "${FMT_LOCAL_STATIC_LIBRARY}")
+elseif (TARGET fmt::fmt)
+    target_link_libraries(log_engine_core PUBLIC fmt::fmt)
+elseif (FMT_LIBRARY)
+    target_link_libraries(log_engine_core PUBLIC ${FMT_LIBRARY})
+elseif (SYSTEM_FMT_LIBRARY)
+    target_link_libraries(log_engine_core PUBLIC ${SYSTEM_FMT_LIBRARY})
+endif ()
 
 add_executable(log_engine_demo
     src/main.cc)
@@ -126,14 +138,6 @@ target_link_libraries(log_engine_query_client
         PkgConfig::PROTOBUF
         PkgConfig::GRPCPP)
 
-if (TARGET fmt::fmt)
-    target_link_libraries(log_engine_query_client PRIVATE fmt::fmt)
-elseif (FMT_LIBRARY)
-    target_link_libraries(log_engine_query_client PRIVATE ${FMT_LIBRARY})
-elseif (SYSTEM_FMT_LIBRARY)
-    target_link_libraries(log_engine_query_client PRIVATE ${SYSTEM_FMT_LIBRARY})
-endif ()
-
 add_executable(log_engine_unit_tests
     src/unit_tests.cc)
 
@@ -164,10 +168,10 @@ if (spdlog_FOUND)
             PRIVATE
                 spdlog::spdlog_header_only)
     endif ()
-    if (SYSTEM_FMT_LIBRARY)
+    if (EXISTS "${FMT_LOCAL_STATIC_LIBRARY}")
         target_link_libraries(spdlog_bench
             PRIVATE
-                ${SYSTEM_FMT_LIBRARY})
+                "${FMT_LOCAL_STATIC_LIBRARY}")
     elseif (TARGET fmt::fmt)
         target_link_libraries(spdlog_bench
             PRIVATE
@@ -176,5 +180,9 @@ if (spdlog_FOUND)
         target_link_libraries(spdlog_bench
             PRIVATE
                 ${FMT_LIBRARY})
+    elseif (SYSTEM_FMT_LIBRARY)
+        target_link_libraries(spdlog_bench
+            PRIVATE
+                ${SYSTEM_FMT_LIBRARY})
     endif ()
 endif ()
