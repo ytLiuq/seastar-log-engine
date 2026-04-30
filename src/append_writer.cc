@@ -64,10 +64,9 @@ const std::deque<seastar::temporary_buffer<char>> kEmptyChunks;
 
 }  // namespace
 
-seastar::future<> AppendWriter::start(const EngineConfig& config, std::string file_path, bool buffered) {
+seastar::future<> AppendWriter::start(const EngineConfig& config, std::string file_path) {
     _config = config;
     _file_path = std::move(file_path);
-    _buffered = buffered;
     _tail_chunks.clear();
     _tail_bytes = 0;
     _write_offset = 0;
@@ -78,7 +77,7 @@ seastar::future<> AppendWriter::start(const EngineConfig& config, std::string fi
 }
 
 seastar::future<> AppendWriter::open_file() {
-    if (_file_open || _stream) {
+    if (_file_open) {
         co_return;
     }
 
@@ -91,19 +90,10 @@ seastar::future<> AppendWriter::open_file() {
     }
     flags = seastar::open_flags::rw | (flags & seastar::open_flags::create) | (flags & seastar::open_flags::truncate) | (flags & seastar::open_flags::dsync);
 
-    if (_buffered) {
-        auto file = co_await seastar::open_file_dma(_file_path, flags);
-        _alignment = std::max<std::size_t>(file.disk_write_dma_alignment(), 1);
-        seastar::file_output_stream_options stream_options;
-        stream_options.buffer_size = static_cast<unsigned>(align_up(fast_stream_buffer_size(), _alignment));
-        stream_options.write_behind = static_cast<unsigned>(_config.write_behind);
-        _stream.emplace(co_await seastar::make_file_output_stream(file, stream_options));
-    } else {
-        auto file = co_await seastar::open_file_dma(_file_path, flags);
-        _alignment = std::max<std::size_t>(file.disk_write_dma_alignment(), 1);
-        _file = std::move(file);
-        _file_open = true;
-    }
+    auto file = co_await seastar::open_file_dma(_file_path, flags);
+    _alignment = std::max<std::size_t>(file.disk_write_dma_alignment(), 1);
+    _file = std::move(file);
+    _file_open = true;
     _opened_at = std::chrono::system_clock::now();
 }
 
@@ -115,33 +105,18 @@ seastar::future<> AppendWriter::append_batch(std::deque<seastar::temporary_buffe
     _logical_size += bytes;
 
     try {
-        if (_buffered) {
-            co_await append_fast_batch(batch, bytes, sync_after_write);
-        } else {
-            co_await append_full_batch(batch, bytes, sync_after_write);
-        }
+        co_await append_pending_batch(batch, bytes, sync_after_write);
     } catch (...) {
         _logical_size -= bytes;
         throw;
     }
 }
 
-seastar::future<> AppendWriter::append_fast_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes, bool sync_after_write) {
-    co_await write_stream_batch(batch, bytes);
-    if (sync_after_write) {
-        co_await _stream->flush();
-    }
-    batch.clear();
-}
-
-seastar::future<> AppendWriter::append_full_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes, bool sync_after_write) {
+seastar::future<> AppendWriter::append_pending_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes, bool sync_after_write) {
     const auto total_bytes = _tail_bytes + bytes;
     const auto writable_bytes = (total_bytes / _alignment) * _alignment;
     if (writable_bytes > 0) {
-        co_await flush_chunks_prefix(_tail_chunks, batch, writable_bytes, false);
-        if (sync_after_write) {
-            co_await _file.flush();
-        }
+        co_await flush_chunks_prefix(_tail_chunks, batch, writable_bytes, false, sync_after_write);
         _tail_chunks = collect_remaining_chunks(std::move(_tail_chunks), std::move(batch), writable_bytes);
         _tail_bytes = total_bytes - writable_bytes;
         co_return;
@@ -155,12 +130,6 @@ seastar::future<> AppendWriter::append_full_batch(std::deque<seastar::temporary_
 }
 
 seastar::future<> AppendWriter::force_flush(bool sync_after_write) {
-    if (_buffered) {
-        if (_stream && sync_after_write) {
-            co_await _stream->flush();
-        }
-        co_return;
-    }
     if (!_file_open) {
         co_return;
     }
@@ -185,7 +154,7 @@ seastar::future<> AppendWriter::force_flush(bool sync_after_write) {
 }
 
 seastar::future<> AppendWriter::flush_tail(bool closing) {
-    if (_buffered || !_file_open) {
+    if (!_file_open) {
         co_return;
     }
 
@@ -198,12 +167,18 @@ seastar::future<> AppendWriter::flush_tail(bool closing) {
         co_return;
     }
 
-    co_await flush_chunks_prefix(_tail_chunks, kEmptyChunks, _tail_bytes, closing && writable_bytes >= std::max<std::size_t>(align_up(_config.stream_buffer_size, _alignment) * 2, _alignment));
+    co_await flush_chunks_prefix(
+        _tail_chunks,
+        kEmptyChunks,
+        _tail_bytes,
+        closing && writable_bytes >= std::max<std::size_t>(align_up(_config.stream_buffer_size, _alignment) * 2, _alignment),
+        closing);
     _tail_chunks.clear();
     _tail_bytes = 0;
 
     if (closing) {
         co_await _file.truncate(_logical_size);
+        co_await _file.flush();
     }
 }
 
@@ -221,11 +196,6 @@ seastar::future<> AppendWriter::truncate_to(std::uint64_t logical_size, std::str
 }
 
 seastar::future<> AppendWriter::close() {
-    if (_stream) {
-        co_await _stream->flush();
-        co_await _stream->close();
-        _stream.reset();
-    }
     if (_file_open) {
         co_await flush_tail(true);
         co_await _file.close();
@@ -300,40 +270,19 @@ seastar::future<> AppendWriter::write_aligned_buffer(const seastar::temporary_bu
     std::rethrow_exception(last_error);
 }
 
-seastar::future<> AppendWriter::write_stream_batch(std::deque<seastar::temporary_buffer<char>>& batch, std::size_t bytes) {
-    const auto chunk_limit = fast_stream_buffer_size();
-    if (bytes < chunk_limit || batch.size() <= 1) {
-        for (const auto& payload : batch) {
-            co_await _stream->write(payload.get(), payload.size());
-        }
-        co_return;
-    }
-
-    auto buffer = seastar::temporary_buffer<char>(bytes);
-    char* out = buffer.get_write();
-    for (const auto& payload : batch) {
-        std::memcpy(out, payload.get(), payload.size());
-        out += payload.size();
-    }
-    co_await _stream->write(buffer.get(), bytes);
-}
-
-std::size_t AppendWriter::fast_stream_buffer_size() const noexcept {
-    return std::max<std::size_t>(_config.stream_buffer_size, 1024 * 1024);
-}
-
 seastar::future<> AppendWriter::flush_chunks_prefix(
     const std::deque<seastar::temporary_buffer<char>>& first,
     const std::deque<seastar::temporary_buffer<char>>& second,
     std::size_t bytes,
-    bool chunked) {
+    bool chunked,
+    bool sync_after_write) {
     const auto writable_bytes = align_up(bytes, _alignment);
     if (writable_bytes == 0) {
         co_return;
     }
 
     if (chunked) {
-        co_await write_chunked_buffer_prefix(first, second, bytes);
+        co_await write_chunked_buffer_prefix(first, second, bytes, sync_after_write);
         co_return;
     }
 
@@ -344,19 +293,20 @@ seastar::future<> AppendWriter::flush_chunks_prefix(
         std::memcpy(out, data, size);
         out += size;
     });
-    co_await write_aligned_buffer(buffer, writable_bytes, true);
+    co_await write_aligned_buffer(buffer, writable_bytes, sync_after_write);
     _write_offset += writable_bytes;
 }
 
 seastar::future<> AppendWriter::write_chunked_buffer_prefix(
     const std::deque<seastar::temporary_buffer<char>>& first,
     const std::deque<seastar::temporary_buffer<char>>& second,
-    std::size_t bytes) {
+    std::size_t bytes,
+    bool sync_after_write) {
     const auto chunk_limit = std::max<std::size_t>(align_up(_config.stream_buffer_size, _alignment), _alignment);
     auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, chunk_limit);
     std::size_t chunk_bytes = 0;
 
-    auto flush_chunk = [this, &buffer, &chunk_bytes] () -> seastar::future<> {
+    auto flush_chunk = [this, &buffer, &chunk_bytes] (bool flush_now) -> seastar::future<> {
         if (chunk_bytes == 0) {
             co_return;
         }
@@ -366,7 +316,7 @@ seastar::future<> AppendWriter::write_chunked_buffer_prefix(
         }
         auto slice = seastar::temporary_buffer<char>::aligned(_alignment, padded);
         std::memcpy(slice.get_write(), buffer.get(), padded);
-        co_await write_aligned_buffer(slice, padded, true);
+        co_await write_aligned_buffer(slice, padded, flush_now);
         _write_offset += padded;
         chunk_bytes = 0;
     };
@@ -380,7 +330,7 @@ seastar::future<> AppendWriter::write_chunked_buffer_prefix(
             auto available = std::min<std::size_t>(remaining, chunk.size());
             while (available > 0) {
                 if (chunk_bytes == chunk_limit) {
-                    co_await flush_chunk();
+                    co_await flush_chunk(false);
                 }
                 const auto copy_bytes = std::min(chunk_limit - chunk_bytes, available);
                 std::memcpy(buffer.get_write() + chunk_bytes, input, copy_bytes);
@@ -395,7 +345,7 @@ seastar::future<> AppendWriter::write_chunked_buffer_prefix(
     auto remaining = bytes;
     co_await visit(first, remaining);
     co_await visit(second, remaining);
-    co_await flush_chunk();
+    co_await flush_chunk(sync_after_write);
 }
 
 }  // namespace log_engine

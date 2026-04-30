@@ -68,7 +68,7 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
         _config.shard_file_prefix,
         shard_id);
 
-    co_await _append_writer.start(_config, _file_path, use_fast_path());
+    co_await _append_writer.start(_config, _file_path);
     if (_config.is_full_path() && !_config.truncate_on_start) {
         co_await recover_from_checkpoint();
     } else if (_config.checkpoint_enabled) {
