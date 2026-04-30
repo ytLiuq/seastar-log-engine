@@ -17,16 +17,6 @@
 
 namespace {
 
-log_engine::WriteMode parse_mode(std::string_view value) {
-    if (value == "fast") {
-        return log_engine::WriteMode::fast;
-    }
-    if (value == "full") {
-        return log_engine::WriteMode::full;
-    }
-    throw std::invalid_argument("mode must be fast or full");
-}
-
 log_engine::RoutingStrategy parse_routing(std::string_view value) {
     return log_engine::parse_routing_strategy(value);
 }
@@ -59,12 +49,11 @@ int main(int argc, char** argv) {
     namespace bpo = boost::program_options;
 
     app.add_options()
-        ("mode", bpo::value<std::string>()->default_value("fast"), "Write path mode: fast or full")
         ("config", bpo::value<std::string>()->default_value(""), "Path to key=value config file")
         ("log-dir", bpo::value<std::string>()->default_value("logs"), "Directory for shard log files")
         ("archive-dir", bpo::value<std::string>()->default_value("archive"), "Directory for archived log files")
         ("shard-file-prefix", bpo::value<std::string>()->default_value("shard"), "Shard log file prefix")
-        ("ack-mode", bpo::value<std::string>()->default_value("memory_ack"), "Ack mode: memory_ack, write_ack, or sync_ack")
+        ("ack-mode", bpo::value<std::string>()->default_value("write_ack"), "Ack mode: write_ack or sync_ack")
         ("routing-strategy", bpo::value<std::string>()->default_value("hash_modulo"), "Routing strategy: hash_modulo or consistent_hashing")
         ("routing-virtual-nodes", bpo::value<std::size_t>()->default_value(128), "Virtual nodes per shard for consistent hashing")
         ("messages", bpo::value<std::uint64_t>()->default_value(200000), "Number of messages to write")
@@ -72,7 +61,6 @@ int main(int argc, char** argv) {
         ("route-keys", bpo::value<std::size_t>()->default_value(0), "Distinct route keys used for shard distribution, 0 keeps writes on the current shard")
         ("batch-size", bpo::value<std::size_t>()->default_value(32), "Number of entries per flush batch")
         ("flush-ms", bpo::value<std::size_t>()->default_value(0), "Periodic flush interval in milliseconds, 0 disables timer-based flush")
-        ("fast-path-max-pending-bytes", bpo::value<std::size_t>()->default_value(16384), "Fast path flush threshold in bytes")
         ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
         ("write-behind", bpo::value<std::size_t>()->default_value(8), "Output stream write-behind depth")
         ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
@@ -92,7 +80,6 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app] () -> seastar::future<> {
         log_engine::EngineConfig base;
-        base.write_mode = parse_mode(app.configuration()["mode"].as<std::string>());
         base.ack_mode = parse_ack(app.configuration()["ack-mode"].as<std::string>());
         base.routing_strategy = parse_routing(app.configuration()["routing-strategy"].as<std::string>());
         base.routing_virtual_nodes = app.configuration()["routing-virtual-nodes"].as<std::size_t>();
@@ -101,7 +88,6 @@ int main(int argc, char** argv) {
         base.shard_file_prefix = app.configuration()["shard-file-prefix"].as<std::string>();
         base.batch_size = app.configuration()["batch-size"].as<std::size_t>();
         base.flush_interval_ms = app.configuration()["flush-ms"].as<std::size_t>();
-        base.fast_path_max_pending_bytes = app.configuration()["fast-path-max-pending-bytes"].as<std::size_t>();
         base.stream_buffer_size = app.configuration()["stream-buffer-size"].as<std::size_t>();
         base.write_behind = app.configuration()["write-behind"].as<std::size_t>();
         base.rotate_size_bytes = app.configuration()["rotate-size-bytes"].as<std::uint64_t>();

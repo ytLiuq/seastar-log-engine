@@ -53,8 +53,8 @@ int main(int argc, char** argv) {
         query.limit = log_engine::resolve_size_option(app.configuration(), file_values, "limit", app.configuration()["limit"].as<std::size_t>());
         query.include_archive = log_engine::resolve_bool_option(app.configuration(), file_values, "include-archive", app.configuration()["include-archive"].as<bool>());
 
-        const auto files = log_engine::collect_log_files(config, query);
-        const auto records = log_engine::read_records(files, query);
+        const auto segments = log_engine::collect_segments(config, query);
+        const auto records = log_engine::read_records(segments, query);
         for (const auto& record : records) {
             fmt::print("{}\n", record.raw_line);
         }

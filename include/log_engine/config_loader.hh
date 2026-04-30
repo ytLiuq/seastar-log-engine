@@ -37,11 +37,6 @@ bool resolve_bool_option(
     const ConfigMap& file_values,
     const std::string& name,
     bool current_value);
-WriteMode resolve_write_mode_option(
-    const boost::program_options::variables_map& cli,
-    const ConfigMap& file_values,
-    const std::string& name,
-    WriteMode current_value);
 AckMode resolve_ack_mode_option(
     const boost::program_options::variables_map& cli,
     const ConfigMap& file_values,

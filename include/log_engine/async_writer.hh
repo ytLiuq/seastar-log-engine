@@ -30,23 +30,14 @@ public:
 
 private:
     seastar::future<> flush_once(bool sync_after_write, bool flush_partial_tail);
-    seastar::future<> flush_fast_once(bool sync_after_write, bool flush_partial_tail);
-    seastar::future<> flush_full_once(bool sync_after_write, bool flush_partial_tail);
     seastar::future<> flush_background(bool sync_after_write, bool flush_partial_tail);
-    void schedule_background_flush();
     seastar::future<> maybe_rotate();
     seastar::future<> recover_from_checkpoint();
     seastar::future<> persist_checkpoint();
     seastar::temporary_buffer<char> format_record(LogMessage&& message);
-    void flush_open_fast_block();
-    void append_fast_payload_to_pending(std::string_view payload);
+    void submit_record(LogMessage&& message);
     void setup_metrics();
     void reset_metrics();
-    [[nodiscard]] std::size_t fast_block_size() const noexcept;
-    [[nodiscard]] std::size_t fast_flush_bytes_limit() const noexcept;
-    void submit_fast(LogMessage&& message);
-    void submit_full(LogMessage&& message);
-    [[nodiscard]] bool use_fast_path() const noexcept;
     struct TimestampBuffer {
         std::array<char, 64> data{};
         std::size_t size = 0;
@@ -62,12 +53,8 @@ private:
     EngineConfig _config;
     seastar::timer<seastar::lowres_clock> _flush_timer;
     seastar::gate _gate;
-    std::deque<seastar::temporary_buffer<char>> _fast_pending;
-    seastar::temporary_buffer<char> _fast_open_block;
-    std::size_t _fast_open_block_used = 0;
-    std::size_t _fast_pending_entries = 0;
-    std::size_t _fast_pending_bytes = 0;
-    std::deque<seastar::temporary_buffer<char>> _full_pending;
+    std::deque<seastar::temporary_buffer<char>> _pending;
+    std::size_t _pending_bytes = 0;
     std::string _file_path;
     std::uint64_t _sequence = 0;
     std::uint64_t _rotation_index = 0;
@@ -82,7 +69,6 @@ private:
     bool _started = false;
     bool _stopping = false;
     bool _flush_in_progress = false;
-    bool _fast_flush_scheduled = false;
 };
 
 }  // namespace log_engine

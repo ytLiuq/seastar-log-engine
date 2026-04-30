@@ -73,7 +73,6 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     const auto config_path = (fs::path(root_dir) / "engine-test.conf").string();
     {
         std::ofstream out(config_path, std::ios::trunc);
-        out << "mode=full\n";
         out << "ack-mode=sync_ack\n";
         out << "routing-strategy=consistent_hashing\n";
         out << "routing-virtual-nodes=33\n";
@@ -88,7 +87,6 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     const auto values = log_engine::load_config_file(config_path);
     boost::program_options::variables_map cli;
     auto config = log_engine::apply_engine_config_overrides(log_engine::EngineConfig{}, cli, values);
-    require(config.write_mode == log_engine::WriteMode::full, "config loader should override mode");
     require(config.ack_mode == log_engine::AckMode::sync_ack, "config loader should override ack mode");
     require(config.routing_strategy == log_engine::RoutingStrategy::consistent_hashing, "config loader should override routing strategy");
     require(config.routing_virtual_nodes == 33, "config loader should override routing virtual nodes");
@@ -154,8 +152,8 @@ seastar::future<> test_compat_logging(const std::string& root_dir) {
     log_engine::ReadQuery query;
     query.include_archive = false;
     query.limit = 10;
-    const auto files = log_engine::collect_log_files(config, query);
-    const auto records = log_engine::read_records(files, query);
+    const auto segments = log_engine::collect_segments(config, query);
+    const auto records = log_engine::read_records(segments, query);
     require(records.size() >= 2, "compat logging should emit at least 2 records");
 
     bool found_info = false;
@@ -191,7 +189,6 @@ seastar::future<> test_compat_unbound_drops_messages(const std::string& root_dir
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
-    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 1;
     config.stream_buffer_size = 512;
     config.write_behind = 1;
@@ -207,14 +204,14 @@ seastar::future<> test_compat_unbound_drops_messages(const std::string& root_dir
     log_engine::ReadQuery query;
     query.include_archive = false;
     query.limit = 10;
-    const auto files = log_engine::collect_log_files(config, query);
-    const auto records = log_engine::read_records(files, query);
+    const auto segments = log_engine::collect_segments(config, query);
+    const auto records = log_engine::read_records(segments, query);
     require(records.size() == 1, "unbound compat logging should not leak into later flushes");
     require(records.front().payload == "bound-message", "expected only explicitly bound log message");
     co_return;
 }
 
-seastar::future<> test_fast_path_large_payload_blocks(const std::string& root_dir) {
+seastar::future<> test_unified_large_payload_blocks(const std::string& root_dir) {
     namespace fs = std::filesystem;
     const auto log_dir = (fs::path(root_dir) / "fast-large-logs").string();
     const auto archive_dir = (fs::path(root_dir) / "fast-large-archive").string();
@@ -227,9 +224,7 @@ seastar::future<> test_fast_path_large_payload_blocks(const std::string& root_di
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
-    config.write_mode = log_engine::WriteMode::fast;
     config.batch_size = 16;
-    config.fast_path_max_pending_bytes = 4096;
     config.stream_buffer_size = 4096;
 
     const std::string payload_a(5000, 'x');
@@ -250,19 +245,19 @@ seastar::future<> test_fast_path_large_payload_blocks(const std::string& root_di
             break;
         }
     }
-    require(shard_path.has_value(), "fast path test should find a shard log");
+    require(shard_path.has_value(), "unified writer test should find a shard log");
 
     std::ifstream in(*shard_path, std::ios::binary);
-    require(in.is_open(), "fast path shard log should be readable");
+    require(in.is_open(), "unified writer shard log should be readable");
 
     std::string line;
-    require(static_cast<bool>(std::getline(in, line)), "missing first fast path record");
-    require(line == payload_a, "first fast path record mismatch");
-    require(static_cast<bool>(std::getline(in, line)), "missing second fast path record");
-    require(line == payload_b, "second fast path record mismatch");
-    require(static_cast<bool>(std::getline(in, line)), "missing third fast path record");
-    require(line == payload_c, "third fast path record mismatch");
-    require(!static_cast<bool>(std::getline(in, line)), "fast path test should produce exactly three records");
+    require(static_cast<bool>(std::getline(in, line)), "missing first unified writer record");
+    require(line.find("route-fast") != std::string::npos, "first unified writer record should contain route key");
+    require(static_cast<bool>(std::getline(in, line)), "missing second unified writer record");
+    require(line.find("route-fast") != std::string::npos, "second unified writer record should contain route key");
+    require(static_cast<bool>(std::getline(in, line)), "missing third unified writer record");
+    require(line.find("route-fast") != std::string::npos, "third unified writer record should contain route key");
+    require(!static_cast<bool>(std::getline(in, line)), "unified writer test should produce exactly three records");
     co_return;
 }
 
@@ -282,7 +277,6 @@ seastar::future<> test_time_rotation_and_archive_read(const std::string& root_di
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
-    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 1;
     config.flush_interval_ms = 1;
     config.rotate_size_bytes = 0;
@@ -308,8 +302,8 @@ seastar::future<> test_time_rotation_and_archive_read(const std::string& root_di
     log_engine::ReadQuery query;
     query.include_archive = true;
     query.limit = 20;
-    const auto files = log_engine::collect_log_files(config, query);
-    const auto records = log_engine::read_records(files, query);
+    const auto segments = log_engine::collect_segments(config, query);
+    const auto records = log_engine::read_records(segments, query);
     bool found_first = false;
     bool found_second = false;
     for (const auto& record : records) {
@@ -334,7 +328,6 @@ seastar::future<> test_recovery_scan(const std::string& root_dir) {
     log_engine::EngineConfig config;
     config.log_dir = log_dir;
     config.archive_dir = archive_dir;
-    config.write_mode = log_engine::WriteMode::full;
     config.batch_size = 2;
     config.checkpoint_enabled = true;
     config.record_sequence_enabled = false;
@@ -390,7 +383,7 @@ int main(int argc, char** argv) {
         co_await test_consistent_hash_routing();
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);
-        co_await test_fast_path_large_payload_blocks(root_dir);
+        co_await test_unified_large_payload_blocks(root_dir);
         co_await test_time_rotation_and_archive_read(root_dir);
         co_await test_recovery_scan(root_dir);
         co_return;

@@ -8,40 +8,29 @@
 
 namespace log_engine {
 
-enum class WriteMode {
-    fast,
-    full,
-};
-
 enum class AckMode {
-    memory_ack,
     write_ack,
     sync_ack,
 };
 
 inline const char* ack_mode_to_string(AckMode mode) noexcept {
     switch (mode) {
-    case AckMode::memory_ack:
-        return "memory_ack";
     case AckMode::write_ack:
         return "write_ack";
     case AckMode::sync_ack:
         return "sync_ack";
     }
-    return "memory_ack";
+    return "write_ack";
 }
 
 inline AckMode parse_ack_mode(std::string_view value) {
-    if (value == "memory_ack" || value == "memory-ack" || value == "memory") {
-        return AckMode::memory_ack;
-    }
     if (value == "write_ack" || value == "write-ack" || value == "write") {
         return AckMode::write_ack;
     }
     if (value == "sync_ack" || value == "sync-ack" || value == "sync") {
         return AckMode::sync_ack;
     }
-    throw std::invalid_argument("ack_mode must be memory_ack, write_ack, or sync_ack");
+    throw std::invalid_argument("ack_mode must be write_ack or sync_ack");
 }
 
 enum class RoutingStrategy {
@@ -73,13 +62,11 @@ struct EngineConfig {
     std::string log_dir = "logs";
     std::string archive_dir = "archive";
     std::string shard_file_prefix = "shard";
-    WriteMode write_mode = WriteMode::fast;
-    AckMode ack_mode = AckMode::memory_ack;
+    AckMode ack_mode = AckMode::write_ack;
     RoutingStrategy routing_strategy = RoutingStrategy::hash_modulo;
     std::size_t routing_virtual_nodes = 128;
     std::size_t batch_size = 32;
     std::size_t flush_interval_ms = 0;
-    std::size_t fast_path_max_pending_bytes = 16 * 1024;
     std::size_t stream_buffer_size = 64 * 1024;
     std::size_t write_behind = 8;
     std::size_t write_retry_count = 3;
@@ -114,14 +101,6 @@ struct EngineConfig {
             record_sequence_enabled;
     }
 
-    [[nodiscard]] bool is_fast_path() const noexcept {
-        return write_mode == WriteMode::fast;
-    }
-
-    [[nodiscard]] bool is_full_path() const noexcept {
-        return write_mode == WriteMode::full;
-    }
-
     void validate() const {
         if (log_dir.empty()) {
             throw std::invalid_argument("log_dir must not be empty");
@@ -141,9 +120,6 @@ struct EngineConfig {
         if (stream_buffer_size == 0) {
             throw std::invalid_argument("stream_buffer_size must be greater than zero");
         }
-        if (fast_path_max_pending_bytes == 0) {
-            throw std::invalid_argument("fast_path_max_pending_bytes must be greater than zero");
-        }
         if (write_behind == 0) {
             throw std::invalid_argument("write_behind must be greater than zero");
         }
@@ -152,20 +128,6 @@ struct EngineConfig {
         }
         if (max_archived_files_per_shard == 0) {
             throw std::invalid_argument("max_archived_files_per_shard must be greater than zero");
-        }
-        if (is_fast_path()) {
-            if (!truncate_on_start) {
-                throw std::invalid_argument("fast path requires truncate_on_start=true");
-            }
-            if (checkpoint_enabled) {
-                throw std::invalid_argument("fast path does not support checkpoints");
-            }
-            if (archive_features_enabled()) {
-                throw std::invalid_argument("fast path does not support rotation or archive management");
-            }
-            if (structured_record_enabled()) {
-                throw std::invalid_argument("fast path only supports payload-only records");
-            }
         }
     }
 };

@@ -1,106 +1,117 @@
 #include "log_engine/log_reader.hh"
 
-#include <algorithm>
 #include <array>
-#include <filesystem>
+#include <cstring>
 #include <fstream>
-#include <sstream>
+#include <utility>
 
 #include <zlib.h>
 
 namespace log_engine {
 
-std::vector<std::string> collect_log_files(const EngineConfig& config, const ReadQuery& query) {
-    namespace fs = std::filesystem;
-    std::vector<std::string> files;
+namespace {
 
-    const auto maybe_push = [&](const fs::path& path) {
-        if (!path.has_filename()) {
-            return;
-        }
-        const auto name = path.filename().string();
-        if (query.shard) {
-            const auto shard_prefix = config.shard_file_prefix + "-" + std::to_string(*query.shard);
-            if (name.rfind(shard_prefix, 0) != 0) {
-                return;
-            }
-        }
-        files.push_back(path.string());
-    };
-
-    if (fs::exists(config.archive_dir) && query.include_archive) {
-        for (const auto& entry : fs::directory_iterator(config.archive_dir)) {
-            if (entry.is_regular_file()) {
-                maybe_push(entry.path());
-            }
-        }
+bool matches_record_query(const ParsedRecord& record, const ReadQuery& query) {
+    if (query.seq_from && (!record.has_sequence || record.sequence < *query.seq_from)) {
+        return false;
     }
-    if (fs::exists(config.log_dir)) {
-        for (const auto& entry : fs::directory_iterator(config.log_dir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".log") {
-                maybe_push(entry.path());
-            }
-        }
+    if (query.seq_to && (!record.has_sequence || record.sequence > *query.seq_to)) {
+        return false;
     }
-
-    std::sort(files.begin(), files.end());
-    return files;
+    if (query.time_from && (record.timestamp.empty() || record.timestamp < *query.time_from)) {
+        return false;
+    }
+    if (query.time_to && (record.timestamp.empty() || record.timestamp > *query.time_to)) {
+        return false;
+    }
+    return true;
 }
 
-std::vector<ParsedRecord> read_records(const std::vector<std::string>& files, const ReadQuery& query) {
+template <typename Consumer>
+bool stream_plain_lines(const std::string& path, Consumer&& consume_line) {
+    std::ifstream in(path, std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!consume_line(line)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Consumer>
+bool stream_gzip_lines(const std::string& path, Consumer&& consume_line) {
+    gzFile in = gzopen(path.c_str(), "rb");
+    if (!in) {
+        return true;
+    }
+
+    std::array<char, 4096> buffer{};
+    std::string line;
+    while (gzgets(in, buffer.data(), static_cast<int>(buffer.size())) != Z_NULL) {
+        const auto chunk_size = std::strlen(buffer.data());
+        const bool ended_with_newline = chunk_size > 0 && buffer[chunk_size - 1] == '\n';
+        line.append(buffer.data(), chunk_size);
+        if (!ended_with_newline) {
+            continue;
+        }
+
+        line.pop_back();
+        if (!consume_line(line)) {
+            gzclose(in);
+            return false;
+        }
+        line.clear();
+    }
+
+    if (!line.empty() && !consume_line(line)) {
+        gzclose(in);
+        return false;
+    }
+
+    gzclose(in);
+    return true;
+}
+
+template <typename Consumer>
+bool stream_segment_lines(const layout::SegmentDescriptor& segment, Consumer&& consume_line) {
+    if (segment.compressed) {
+        return stream_gzip_lines(segment.path, std::forward<Consumer>(consume_line));
+    }
+    return stream_plain_lines(segment.path, std::forward<Consumer>(consume_line));
+}
+
+std::vector<ParsedRecord> read_records_from_segments(
+    const std::vector<layout::SegmentDescriptor>& segments,
+    const ReadQuery& query) {
     std::vector<ParsedRecord> records;
     records.reserve(query.limit);
 
-    for (const auto& path : files) {
-        std::vector<std::string> lines;
-        if (path.size() >= 3 && path.substr(path.size() - 3) == ".gz") {
-            gzFile in = gzopen(path.c_str(), "rb");
-            if (!in) {
-                continue;
-            }
-            std::string line;
-            std::array<char, 4096> buffer{};
-            while (gzgets(in, buffer.data(), static_cast<int>(buffer.size())) != Z_NULL) {
-                line.assign(buffer.data());
-                if (!line.empty() && line.back() == '\n') {
-                    line.pop_back();
-                }
-                lines.push_back(line);
-            }
-            gzclose(in);
-        } else {
-            std::ifstream in(path, std::ios::binary);
-            std::string line;
-            while (std::getline(in, line)) {
-                lines.push_back(line);
-            }
-        }
-
-        for (const auto& line : lines) {
+    for (const auto& segment : segments) {
+        const bool should_continue = stream_segment_lines(segment, [&] (std::string_view line) {
             const auto parsed = parse_record_line(line);
-            if (!parsed) {
-                continue;
-            }
-            if (query.seq_from && (!parsed->has_sequence || parsed->sequence < *query.seq_from)) {
-                continue;
-            }
-            if (query.seq_to && (!parsed->has_sequence || parsed->sequence > *query.seq_to)) {
-                continue;
-            }
-            if (query.time_from && (parsed->timestamp.empty() || parsed->timestamp < *query.time_from)) {
-                continue;
-            }
-            if (query.time_to && (parsed->timestamp.empty() || parsed->timestamp > *query.time_to)) {
-                continue;
+            if (!parsed || !matches_record_query(*parsed, query)) {
+                return true;
             }
             records.push_back(*parsed);
-            if (records.size() >= query.limit) {
-                return records;
-            }
+            return records.size() < query.limit;
+        });
+        if (!should_continue) {
+            break;
         }
     }
 
     return records;
+}
+
+}  // namespace
+
+std::vector<layout::SegmentDescriptor> collect_segments(const EngineConfig& config, const ReadQuery& query) {
+    return layout::collect_query_segments(config, query.shard, query.include_archive);
+}
+
+std::vector<ParsedRecord> read_records(const std::vector<layout::SegmentDescriptor>& segments, const ReadQuery& query) {
+    return read_records_from_segments(segments, query);
 }
 
 }  // namespace log_engine

@@ -102,8 +102,8 @@ struct QueryContext {
     }
 
     std::vector<log_engine::ParsedRecord> query_records(const log_engine::ReadQuery& query) const {
-        const auto files = log_engine::collect_log_files(config, query);
-        return log_engine::read_records(files, query);
+        const auto segments = log_engine::collect_segments(config, query);
+        return log_engine::read_records(segments, query);
     }
 
     std::string render_status_json() const {

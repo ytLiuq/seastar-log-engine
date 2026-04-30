@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "log_engine/config.hh"
+#include "log_engine/log_layout.hh"
 #include "log_engine/record_codec.hh"
 
 namespace log_engine {
@@ -20,7 +21,7 @@ struct ReadQuery {
     bool include_archive = true;
 };
 
-std::vector<std::string> collect_log_files(const EngineConfig& config, const ReadQuery& query);
-std::vector<ParsedRecord> read_records(const std::vector<std::string>& files, const ReadQuery& query);
+std::vector<layout::SegmentDescriptor> collect_segments(const EngineConfig& config, const ReadQuery& query);
+std::vector<ParsedRecord> read_records(const std::vector<layout::SegmentDescriptor>& segments, const ReadQuery& query);
 
 }  // namespace log_engine

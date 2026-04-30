@@ -45,18 +45,13 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
     _config = std::move(config);
     _config.validate();
     co_await _log_manager.prepare(_config);
-    _fast_pending.clear();
-    _fast_open_block = seastar::temporary_buffer<char>();
-    _fast_open_block_used = 0;
-    _fast_pending_entries = 0;
-    _fast_pending_bytes = 0;
-    _full_pending.clear();
+    _pending.clear();
+    _pending_bytes = 0;
     _sequence = 0;
     _rotation_index = 0;
     reset_metrics();
     _stopping = false;
     _flush_in_progress = false;
-    _fast_flush_scheduled = false;
     _started = true;
     setup_metrics();
 
@@ -69,7 +64,7 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
         shard_id);
 
     co_await _append_writer.start(_config, _file_path);
-    if (_config.is_full_path() && !_config.truncate_on_start) {
+    if (!_config.truncate_on_start) {
         co_await recover_from_checkpoint();
     } else if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
@@ -96,11 +91,9 @@ seastar::future<> AsyncWriter::stop() {
         });
     });
     co_await _gate.close();
-    if (_config.is_full_path()) {
-        co_await _append_writer.flush_tail(true);
-        if (_config.checkpoint_enabled) {
-            co_await persist_checkpoint();
-        }
+    co_await _append_writer.flush_tail(true);
+    if (_config.checkpoint_enabled) {
+        co_await persist_checkpoint();
     }
     co_await _append_writer.close();
     _metrics.clear();
@@ -111,17 +104,9 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
     if (_stopping) {
         co_return;
     }
-    if (use_fast_path()) {
-        submit_fast(std::move(message));
-    } else {
-        submit_full(std::move(message));
-    }
-    if (pending_entries() >= _config.batch_size ||
-        (use_fast_path() && _fast_pending_bytes >= fast_flush_bytes_limit())) {
+    submit_record(std::move(message));
+    if (pending_entries() >= _config.batch_size) {
         switch (_config.ack_mode) {
-        case AckMode::memory_ack:
-            schedule_background_flush();
-            break;
         case AckMode::write_ack:
             co_await flush_background(false, true);
             break;
@@ -133,7 +118,7 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
 }
 
 std::size_t AsyncWriter::pending_entries() const noexcept {
-    return use_fast_path() ? _fast_pending_entries : _full_pending.size();
+    return _pending.size();
 }
 
 std::string AsyncWriter::shard_path() const {
@@ -147,45 +132,11 @@ seastar::future<> AsyncWriter::flush_once(bool sync_after_write, bool flush_part
 
     _flush_in_progress = true;
     auto guard = seastar::defer([this] { _flush_in_progress = false; });
-    if (use_fast_path()) {
-        co_await flush_fast_once(sync_after_write, flush_partial_tail);
-    } else {
-        co_await flush_full_once(sync_after_write, flush_partial_tail);
-    }
-}
 
-seastar::future<> AsyncWriter::flush_fast_once(bool sync_after_write, bool flush_partial_tail) {
-    flush_open_fast_block();
     std::deque<seastar::temporary_buffer<char>> batch;
-    batch.swap(_fast_pending);
-    const auto batch_entries = _fast_pending_entries;
+    batch.swap(_pending);
     const auto batch_byte_count = batch_bytes(batch);
-    _fast_pending_entries = 0;
-    _fast_pending_bytes = 0;
-
-    try {
-        co_await _append_writer.append_batch(batch, sync_after_write);
-        if (flush_partial_tail) {
-            co_await _append_writer.force_flush(sync_after_write);
-        }
-        ++_metric_flushed_batches;
-        _metric_flushed_bytes += batch_byte_count;
-    } catch (...) {
-        ++_metric_flush_errors;
-        _fast_pending_entries += batch_entries;
-        while (!batch.empty()) {
-            _fast_pending_bytes += batch.back().size();
-            _fast_pending.emplace_front(std::move(batch.back()));
-            batch.pop_back();
-        }
-        throw;
-    }
-}
-
-seastar::future<> AsyncWriter::flush_full_once(bool sync_after_write, bool flush_partial_tail) {
-    std::deque<seastar::temporary_buffer<char>> batch;
-    batch.swap(_full_pending);
-    const auto batch_byte_count = batch_bytes(batch);
+    _pending_bytes = 0;
 
     try {
         co_await _append_writer.append_batch(batch, sync_after_write);
@@ -198,7 +149,8 @@ seastar::future<> AsyncWriter::flush_full_once(bool sync_after_write, bool flush
     } catch (...) {
         ++_metric_flush_errors;
         while (!batch.empty()) {
-            _full_pending.emplace_front(std::move(batch.back()));
+            _pending_bytes += batch.back().size();
+            _pending.emplace_front(std::move(batch.back()));
             batch.pop_back();
         }
         throw;
@@ -214,28 +166,7 @@ seastar::future<> AsyncWriter::flush_background(bool sync_after_write, bool flus
     });
 }
 
-void AsyncWriter::schedule_background_flush() {
-    if (_stopping || _fast_flush_scheduled || pending_entries() == 0) {
-        return;
-    }
-
-    _fast_flush_scheduled = true;
-    (void)seastar::with_gate(_gate, [this] {
-        return flush_once(false, false);
-    }).finally([this] {
-        _fast_flush_scheduled = false;
-        if (!_stopping && pending_entries() > 0) {
-            schedule_background_flush();
-        }
-    }).handle_exception([](std::exception_ptr ep) {
-        applog.warn("scheduled fast flush failed: {}", ep);
-    });
-}
-
 seastar::future<> AsyncWriter::maybe_rotate() {
-    if (_config.is_fast_path()) {
-        co_return;
-    }
     const auto size_ready = _config.rotate_size_bytes > 0 && _append_writer.logical_size() >= _config.rotate_size_bytes;
     const auto time_ready = _config.rotate_interval_seconds > 0 &&
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - _append_writer.opened_at()).count() >=
@@ -253,7 +184,7 @@ seastar::future<> AsyncWriter::maybe_rotate() {
         seastar::this_shard_id(),
         _rotation_index);
     _append_writer.reset_after_rotation();
-    co_await _append_writer.start(_config, _file_path, false);
+    co_await _append_writer.start(_config, _file_path);
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
     }
@@ -271,70 +202,18 @@ seastar::temporary_buffer<char> AsyncWriter::format_record(LogMessage&& message)
         message.payload);
 }
 
-void AsyncWriter::submit_fast(LogMessage&& message) {
-    ++_metric_submitted_messages;
-    append_fast_payload_to_pending(message.payload);
-    ++_fast_pending_entries;
-}
-
-void AsyncWriter::submit_full(LogMessage&& message) {
+void AsyncWriter::submit_record(LogMessage&& message) {
     auto record = format_record(std::move(message));
     ++_metric_submitted_messages;
     _metric_submitted_bytes += record.size();
-    _full_pending.emplace_back(std::move(record));
-}
-
-void AsyncWriter::flush_open_fast_block() {
-    if (_fast_open_block_used == 0) {
-        return;
-    }
-
-    _fast_open_block.trim(_fast_open_block_used);
-    _fast_pending.emplace_back(std::move(_fast_open_block));
-    _fast_open_block = seastar::temporary_buffer<char>();
-    _fast_open_block_used = 0;
-}
-
-void AsyncWriter::append_fast_payload_to_pending(std::string_view payload) {
-    const auto record_size = payload.size() + 1;
-    const auto block_size = fast_block_size();
-
-    if (record_size >= block_size) {
-        flush_open_fast_block();
-        auto buffer = seastar::temporary_buffer<char>(record_size);
-        std::memcpy(buffer.get_write(), payload.data(), payload.size());
-        buffer.get_write()[payload.size()] = '\n';
-        _metric_submitted_bytes += record_size;
-        _fast_pending_bytes += record_size;
-        _fast_pending.emplace_back(std::move(buffer));
-        return;
-    }
-
-    if (!_fast_open_block || _fast_open_block.size() - _fast_open_block_used < record_size) {
-        flush_open_fast_block();
-        _fast_open_block = seastar::temporary_buffer<char>(block_size);
-    }
-
-    char* out = _fast_open_block.get_write() + _fast_open_block_used;
-    std::memcpy(out, payload.data(), payload.size());
-    out[payload.size()] = '\n';
-    _fast_open_block_used += record_size;
-    _metric_submitted_bytes += record_size;
-    _fast_pending_bytes += record_size;
-}
-
-std::size_t AsyncWriter::fast_flush_bytes_limit() const noexcept {
-    return std::max<std::size_t>(_config.fast_path_max_pending_bytes, fast_block_size() * 4);
-}
-
-std::size_t AsyncWriter::fast_block_size() const noexcept {
-    return std::max<std::size_t>(_config.stream_buffer_size, 1024 * 1024);
+    _pending_bytes += record.size();
+    _pending.emplace_back(std::move(record));
 }
 
 void AsyncWriter::setup_metrics() {
     namespace sm = seastar::metrics;
     static const sm::label mode_label("mode");
-    const auto mode = mode_label(use_fast_path() ? "fast" : "full");
+    const auto mode = mode_label("unified");
     _metrics.clear();
     std::vector<sm::metric_definition> definitions;
     definitions.reserve(8);
@@ -357,7 +236,7 @@ void AsyncWriter::setup_metrics() {
             return pending_entries();
         }, sm::description("Current queued log entries"))(mode));
     definitions.push_back(sm::make_current_bytes("pending_bytes", [this] {
-            return use_fast_path() ? _fast_pending_bytes : batch_bytes(_full_pending);
+            return _pending_bytes;
         }, sm::description("Current queued log bytes"))(mode));
     definitions.push_back(sm::make_current_bytes("logical_size_bytes", [this] {
             return _append_writer.logical_size();
@@ -417,10 +296,6 @@ seastar::future<> AsyncWriter::recover_from_checkpoint() {
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
     }
-}
-
-bool AsyncWriter::use_fast_path() const noexcept {
-    return _config.is_fast_path();
 }
 
 seastar::future<> AsyncWriter::persist_checkpoint() {
