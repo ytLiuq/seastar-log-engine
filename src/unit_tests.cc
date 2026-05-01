@@ -79,6 +79,8 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
         out << "routing-virtual-nodes=33\n";
         out << "log-dir=/tmp/demo-logs\n";
         out << "batch-size=17\n";
+        out << "max-pending-bytes=8192\n";
+        out << "pending-bytes-low-watermark=2048\n";
         out << "rotate-interval-seconds=9\n";
         out << "compress-archives=false\n";
         out << "record-crc-enabled=false\n";
@@ -93,10 +95,31 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     require(config.routing_virtual_nodes == 33, "config loader should override routing virtual nodes");
     require(config.log_dir == "/tmp/demo-logs", "config loader should override log_dir");
     require(config.batch_size == 17, "config loader should override batch_size");
+    require(config.max_pending_bytes == 8192, "config loader should override max_pending_bytes");
+    require(config.pending_bytes_low_watermark == 2048, "config loader should override pending_bytes_low_watermark");
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
     require(config.compress_archives == false, "config loader should override compress_archives");
     require(config.record_crc_enabled == false, "config loader should override record_crc_enabled");
     require(config.record_sequence_enabled == true, "config loader should override record_sequence_enabled");
+    co_return;
+}
+
+seastar::future<> test_config_validation() {
+    log_engine::EngineConfig valid;
+    valid.max_pending_bytes = 4096;
+    valid.pending_bytes_low_watermark = 2048;
+    valid.validate();
+
+    log_engine::EngineConfig invalid;
+    invalid.max_pending_bytes = 4096;
+    invalid.pending_bytes_low_watermark = 8192;
+    bool threw = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "config validation should reject pending_bytes_low_watermark above max_pending_bytes");
     co_return;
 }
 
@@ -239,26 +262,26 @@ seastar::future<> test_unified_large_payload_blocks(const std::string& root_dir)
     co_await engine.info(payload_c, "route-fast");
     co_await engine.stop();
 
-    std::optional<fs::path> shard_path;
+    std::size_t non_empty_logs = 0;
     for (const auto& entry : fs::directory_iterator(log_dir)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".log") {
-            shard_path = entry.path();
-            break;
+        if (!entry.is_regular_file() || entry.path().extension() != ".log") {
+            continue;
+        }
+        if (fs::file_size(entry.path()) > 0) {
+            ++non_empty_logs;
         }
     }
-    require(shard_path.has_value(), "unified writer test should find a shard log");
+    require(non_empty_logs == 1, "same route key should route large payloads to exactly one non-empty shard log");
 
-    std::ifstream in(*shard_path, std::ios::binary);
-    require(in.is_open(), "unified writer shard log should be readable");
-
-    std::string line;
-    require(static_cast<bool>(std::getline(in, line)), "missing first unified writer record");
-    require(line.find("route-fast") != std::string::npos, "first unified writer record should contain route key");
-    require(static_cast<bool>(std::getline(in, line)), "missing second unified writer record");
-    require(line.find("route-fast") != std::string::npos, "second unified writer record should contain route key");
-    require(static_cast<bool>(std::getline(in, line)), "missing third unified writer record");
-    require(line.find("route-fast") != std::string::npos, "third unified writer record should contain route key");
-    require(!static_cast<bool>(std::getline(in, line)), "unified writer test should produce exactly three records");
+    log_engine::ReadQuery query;
+    query.include_archive = false;
+    query.limit = 10;
+    const auto segments = log_engine::collect_segments(config, query);
+    const auto records = log_engine::read_records(segments, query);
+    require(records.size() == 3, "unified writer test should read back exactly three records");
+    require(records[0].payload == payload_a, "first unified writer record payload mismatch");
+    require(records[1].payload == payload_b, "second unified writer record payload mismatch");
+    require(records[2].payload == payload_c, "third unified writer record payload mismatch");
     co_return;
 }
 
@@ -383,6 +406,7 @@ int main(int argc, char** argv) {
         const auto root_dir = app.configuration()["root-dir"].as<std::string>();
         co_await test_record_codec();
         co_await test_config_loader(root_dir);
+        co_await test_config_validation();
         co_await test_consistent_hash_routing();
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);

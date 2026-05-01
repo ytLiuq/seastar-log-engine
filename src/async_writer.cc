@@ -32,6 +32,13 @@ std::size_t batch_bytes(const std::deque<seastar::temporary_buffer<char>>& batch
     return bytes;
 }
 
+void write_fixed_width_decimal(char* out, std::uint32_t value, std::size_t width) noexcept {
+    for (std::size_t i = 0; i < width; ++i) {
+        out[width - 1 - i] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    }
+}
+
 }
 
 AsyncWriter::AsyncWriter()
@@ -58,10 +65,9 @@ seastar::future<> AsyncWriter::start(EngineConfig config) {
 
     auto shard_id = seastar::this_shard_id();
     std::filesystem::create_directories(_config.log_dir);
-    _file_path = layout::active_log_path(_config, shard_id);
     _active_segment = layout::active_segment(_config, shard_id);
 
-    co_await _append_writer.start(_config, _file_path);
+    co_await _append_writer.start(_config, _active_segment.path);
     if (!_config.truncate_on_start) {
         co_await recover_from_checkpoint();
     } else if (_config.checkpoint_enabled) {
@@ -78,6 +84,7 @@ seastar::future<> AsyncWriter::stop() {
     }
     _stopping = true;
     _flush_timer.cancel();
+    notify_backpressure_waiters();
     co_await seastar::with_gate(_gate, [this] {
         return seastar::repeat([this] {
             if (pending_entries() == 0) {
@@ -103,7 +110,7 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
         co_return;
     }
     submit_record(std::move(message));
-    if (pending_entries() >= _config.batch_size) {
+    if (pending_entries() >= _config.batch_size || above_backpressure_limit()) {
         switch (_config.ack_mode) {
         case AckMode::write_ack:
             co_await flush_background(false, true);
@@ -113,6 +120,7 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
             break;
         }
     }
+    co_await maybe_wait_for_backpressure();
 }
 
 std::size_t AsyncWriter::pending_entries() const noexcept {
@@ -120,7 +128,7 @@ std::size_t AsyncWriter::pending_entries() const noexcept {
 }
 
 std::string AsyncWriter::shard_path() const {
-    return _file_path;
+    return _active_segment.path;
 }
 
 seastar::future<> AsyncWriter::flush_once(bool sync_after_write, bool flush_partial_tail) {
@@ -144,6 +152,7 @@ seastar::future<> AsyncWriter::flush_once(bool sync_after_write, bool flush_part
         ++_metric_flushed_batches;
         _metric_flushed_bytes += batch_byte_count;
         co_await maybe_rotate();
+        notify_backpressure_waiters();
     } catch (...) {
         ++_metric_flush_errors;
         while (!batch.empty()) {
@@ -151,6 +160,7 @@ seastar::future<> AsyncWriter::flush_once(bool sync_after_write, bool flush_part
             _pending.emplace_front(std::move(batch.back()));
             batch.pop_back();
         }
+        notify_backpressure_waiters();
         throw;
     }
 }
@@ -181,7 +191,7 @@ seastar::future<> AsyncWriter::maybe_rotate() {
         _active_segment,
         _rotation_index);
     _append_writer.reset_after_rotation();
-    co_await _append_writer.start(_config, _file_path);
+    co_await _append_writer.start(_config, _active_segment.path);
     if (_config.checkpoint_enabled) {
         co_await persist_checkpoint();
     }
@@ -207,13 +217,55 @@ void AsyncWriter::submit_record(LogMessage&& message) {
     _pending.emplace_back(std::move(record));
 }
 
+seastar::future<> AsyncWriter::maybe_wait_for_backpressure() {
+    if (!backpressure_enabled() || !above_backpressure_limit() || _stopping) {
+        co_return;
+    }
+    ++_metric_backpressure_waits;
+    ++_waiting_submitters;
+    auto guard = seastar::defer([this] {
+        --_waiting_submitters;
+    });
+    co_await _backpressure.wait([this] {
+        return _stopping || below_backpressure_resume_threshold();
+    });
+}
+
+void AsyncWriter::notify_backpressure_waiters() {
+    if (_waiting_submitters > 0 && (_stopping || below_backpressure_resume_threshold())) {
+        _backpressure.broadcast();
+    }
+}
+
+bool AsyncWriter::backpressure_enabled() const noexcept {
+    return _config.max_pending_bytes > 0;
+}
+
+bool AsyncWriter::above_backpressure_limit() const noexcept {
+    return backpressure_enabled() && _pending_bytes >= _config.max_pending_bytes;
+}
+
+bool AsyncWriter::below_backpressure_resume_threshold() const noexcept {
+    return !backpressure_enabled() || _pending_bytes <= backpressure_resume_threshold();
+}
+
+std::size_t AsyncWriter::backpressure_resume_threshold() const noexcept {
+    if (!backpressure_enabled()) {
+        return 0;
+    }
+    if (_config.pending_bytes_low_watermark > 0) {
+        return _config.pending_bytes_low_watermark;
+    }
+    return _config.max_pending_bytes / 2;
+}
+
 void AsyncWriter::setup_metrics() {
     namespace sm = seastar::metrics;
     static const sm::label mode_label("mode");
     const auto mode = mode_label("unified");
     _metrics.clear();
     std::vector<sm::metric_definition> definitions;
-    definitions.reserve(8);
+    definitions.reserve(10);
     definitions.push_back(sm::make_counter("submitted_messages", sm::description("Total submitted log messages"), [this] {
             return _metric_submitted_messages;
         })(mode));
@@ -229,12 +281,18 @@ void AsyncWriter::setup_metrics() {
     definitions.push_back(sm::make_counter("flush_errors", sm::description("Total failed flush attempts"), [this] {
             return _metric_flush_errors;
         })(mode));
+    definitions.push_back(sm::make_counter("backpressure_waits", sm::description("Total waits caused by pending queue backpressure"), [this] {
+            return _metric_backpressure_waits;
+        })(mode));
     definitions.push_back(sm::make_queue_length("pending_entries", [this] {
             return pending_entries();
         }, sm::description("Current queued log entries"))(mode));
     definitions.push_back(sm::make_current_bytes("pending_bytes", [this] {
             return _pending_bytes;
         }, sm::description("Current queued log bytes"))(mode));
+    definitions.push_back(sm::make_queue_length("waiting_submitters", [this] {
+            return _waiting_submitters;
+        }, sm::description("Current submitters waiting on pending queue backpressure"))(mode));
     definitions.push_back(sm::make_current_bytes("logical_size_bytes", [this] {
             return _append_writer.logical_size();
         }, sm::description("Current logical log size"))(mode));
@@ -247,33 +305,46 @@ void AsyncWriter::reset_metrics() {
     _metric_flushed_batches = 0;
     _metric_flushed_bytes = 0;
     _metric_flush_errors = 0;
+    _metric_backpressure_waits = 0;
 }
 
 AsyncWriter::TimestampBuffer AsyncWriter::format_timestamp() {
     using clock = std::chrono::system_clock;
-    const auto now = clock::now();
-    const auto time = clock::to_time_t(now);
-    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now.time_since_epoch())
-                            .count() %
-        1000000;
+    const auto epoch_micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        clock::now().time_since_epoch()).count();
+    const auto current_second = static_cast<std::time_t>(epoch_micros / 1000000);
+    const auto micros = static_cast<std::uint32_t>(epoch_micros % 1000000);
 
-    std::tm tm{};
-    localtime_r(&time, &tm);
+    struct TimestampCache {
+        std::time_t second = 0;
+        std::array<char, 21> prefix{};
+        bool initialized = false;
+    };
+    thread_local TimestampCache cache;
+
+    if (!cache.initialized || cache.second != current_second) {
+        std::tm tm{};
+        const auto time = current_second;
+        localtime_r(&time, &tm);
+        const auto written = std::snprintf(
+            cache.prefix.data(),
+            cache.prefix.size(),
+            "%04d-%02d-%02d %02d:%02d:%02d.",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec);
+        cache.second = current_second;
+        cache.initialized = written > 0;
+    }
 
     TimestampBuffer buffer;
-    const auto written = std::snprintf(
-        buffer.data.data(),
-        buffer.data.size(),
-        "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-        static_cast<long long>(micros));
-    buffer.size = written > 0 ? static_cast<std::size_t>(written) : 0;
+    constexpr std::size_t prefix_size = 20;
+    std::memcpy(buffer.data.data(), cache.prefix.data(), prefix_size);
+    write_fixed_width_decimal(buffer.data.data() + prefix_size, micros, 6);
+    buffer.size = prefix_size + 6;
     return buffer;
 }
 

@@ -23,6 +23,17 @@ constexpr std::array<std::uint32_t, 256> make_crc32_table() {
 constexpr auto crc32_table = make_crc32_table();
 constexpr char hex_digits[] = "0123456789abcdef";
 
+std::uint32_t crc32_update(std::uint32_t value, std::string_view data) noexcept {
+    for (const auto ch : data) {
+        value = crc32_table[(value ^ static_cast<unsigned char>(ch)) & 0xffU] ^ (value >> 8U);
+    }
+    return value;
+}
+
+std::uint32_t crc32_update_byte(std::uint32_t value, char ch) noexcept {
+    return crc32_table[(value ^ static_cast<unsigned char>(ch)) & 0xffU] ^ (value >> 8U);
+}
+
 std::optional<std::uint32_t> parse_crc_hex(std::string_view input) {
     std::uint32_t value = 0;
     const auto* begin = input.data();
@@ -67,22 +78,40 @@ char* append_literal(char* out, std::string_view value) noexcept {
     return out;
 }
 
-char* append_sanitized_payload(char* out, std::string_view payload) noexcept {
+char* append_literal(char* out, std::string_view value, std::uint32_t* crc) noexcept {
+    if (!crc) {
+        return append_literal(out, value);
+    }
+    for (const auto ch : value) {
+        *out++ = ch;
+        *crc = crc32_update_byte(*crc, ch);
+    }
+    return out;
+}
+
+char* append_sanitized_payload(char* out, std::string_view payload, std::uint32_t* crc) noexcept {
     const auto first_special = payload.find_first_of("\n\r\t");
     if (first_special == std::string_view::npos) {
-        return append_literal(out, payload);
+        return append_literal(out, payload, crc);
     }
 
     if (first_special > 0) {
-        std::memcpy(out, payload.data(), first_special);
-        out += first_special;
+        out = append_literal(out, payload.substr(0, first_special), crc);
     }
 
     for (std::size_t i = first_special; i < payload.size(); ++i) {
         const char ch = payload[i];
-        *out++ = (ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
+        const char sanitized = (ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
+        *out++ = sanitized;
+        if (crc) {
+            *crc = crc32_update_byte(*crc, sanitized);
+        }
     }
     return out;
+}
+
+char* append_sanitized_payload(char* out, std::string_view payload) noexcept {
+    return append_sanitized_payload(out, payload, nullptr);
 }
 
 char* append_decimal(char* out, std::uint64_t value) {
@@ -90,13 +119,25 @@ char* append_decimal(char* out, std::uint64_t value) {
     return result.ptr;
 }
 
-char* append_field_prefix(char* out, bool& first, std::string_view key) noexcept {
+char* append_decimal(char* out, std::uint64_t value, std::uint32_t* crc) {
+    auto* begin = out;
+    auto result = std::to_chars(out, out + 32, value, 10);
+    if (crc) {
+        *crc = crc32_update(*crc, std::string_view(begin, static_cast<std::size_t>(result.ptr - begin)));
+    }
+    return result.ptr;
+}
+
+char* append_field_prefix(char* out, bool& first, std::string_view key, std::uint32_t* crc = nullptr) noexcept {
     if (!first) {
         *out++ = '\t';
+        if (crc) {
+            *crc = crc32_update(*crc, "\t");
+        }
     } else {
         first = false;
     }
-    return append_literal(out, key);
+    return append_literal(out, key, crc);
 }
 
 void write_crc_prefix(char* out, std::uint32_t crc) noexcept {
@@ -156,32 +197,34 @@ seastar::temporary_buffer<char> encode_record_buffer(
     char* body = base + prefix_size;
     char* out = body;
     bool first = true;
+    std::uint32_t crc = 0xffffffffU;
+    auto* crc_ptr = config.record_crc_enabled ? &crc : nullptr;
 
     if (config.record_timestamp_enabled) {
-        out = append_field_prefix(out, first, "ts=");
-        out = append_literal(out, timestamp);
+        out = append_field_prefix(out, first, "ts=", crc_ptr);
+        out = append_literal(out, timestamp, crc_ptr);
     }
     if (config.record_shard_id_enabled) {
-        out = append_field_prefix(out, first, "shard=");
-        out = append_decimal(out, shard_id);
+        out = append_field_prefix(out, first, "shard=", crc_ptr);
+        out = append_decimal(out, shard_id, crc_ptr);
     }
 
     if (config.record_sequence_enabled) {
-        out = append_field_prefix(out, first, "seq=");
-        out = append_decimal(out, sequence);
+        out = append_field_prefix(out, first, "seq=", crc_ptr);
+        out = append_decimal(out, sequence, crc_ptr);
     }
 
     if (config.record_level_enabled) {
-        out = append_field_prefix(out, first, "level=");
-        out = append_literal(out, level_value);
+        out = append_field_prefix(out, first, "level=", crc_ptr);
+        out = append_literal(out, level_value, crc_ptr);
     }
 
-    out = append_field_prefix(out, first, "payload=");
-    out = append_sanitized_payload(out, payload);
+    out = append_field_prefix(out, first, "payload=", crc_ptr);
+    out = append_sanitized_payload(out, payload, crc_ptr);
 
     const auto body_size = static_cast<std::size_t>(out - body);
     if (config.record_crc_enabled) {
-        write_crc_prefix(base, crc32(std::string_view(body, body_size)));
+        write_crc_prefix(base, crc ^ 0xffffffffU);
     }
     *out++ = '\n';
     buffer.trim(static_cast<std::size_t>(out - base));
@@ -356,11 +399,7 @@ const char* level_to_string(LogLevel level) noexcept {
 }
 
 std::uint32_t crc32(std::string_view data) noexcept {
-    std::uint32_t value = 0xffffffffU;
-    for (const auto ch : data) {
-        value = crc32_table[(value ^ static_cast<unsigned char>(ch)) & 0xffU] ^ (value >> 8U);
-    }
-    return value ^ 0xffffffffU;
+    return crc32_update(0xffffffffU, data) ^ 0xffffffffU;
 }
 
 }  // namespace log_engine

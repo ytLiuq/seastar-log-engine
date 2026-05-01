@@ -115,6 +115,8 @@ EngineConfig apply_engine_config_overrides(
     base.write_behind = resolve_size_option(cli, file_values, "write-behind", base.write_behind);
     base.write_retry_count = resolve_size_option(cli, file_values, "write-retry-count", base.write_retry_count);
     base.write_retry_backoff_ms = resolve_size_option(cli, file_values, "write-retry-backoff-ms", base.write_retry_backoff_ms);
+    base.max_pending_bytes = resolve_size_option(cli, file_values, "max-pending-bytes", base.max_pending_bytes);
+    base.pending_bytes_low_watermark = resolve_size_option(cli, file_values, "pending-bytes-low-watermark", base.pending_bytes_low_watermark);
     base.rotate_size_bytes = resolve_u64_option(cli, file_values, "rotate-size-bytes", base.rotate_size_bytes);
     base.rotate_interval_seconds = resolve_u64_option(cli, file_values, "rotate-interval-seconds", base.rotate_interval_seconds);
     base.archive_retention_seconds = resolve_u64_option(cli, file_values, "archive-retention-seconds", base.archive_retention_seconds);

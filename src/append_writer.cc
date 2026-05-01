@@ -136,16 +136,13 @@ seastar::future<> AppendWriter::force_flush(bool sync_after_write) {
     if (_tail_bytes > 0) {
         const auto writable_bytes = align_up(_tail_bytes, _alignment);
         auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, writable_bytes);
-        std::memset(buffer.get_write(), 0, writable_bytes);
         char* out = buffer.get_write();
         for_each_chunk_prefix(_tail_chunks, kEmptyChunks, _tail_bytes, [&out](const char* data, std::size_t size) {
             std::memcpy(out, data, size);
             out += size;
         });
+        std::memset(out, 0, writable_bytes - _tail_bytes);
         co_await write_aligned_buffer(buffer, writable_bytes, sync_after_write);
-        _write_offset += writable_bytes;
-        _tail_chunks.clear();
-        _tail_bytes = 0;
         co_return;
     }
     if (sync_after_write) {
@@ -287,12 +284,12 @@ seastar::future<> AppendWriter::flush_chunks_prefix(
     }
 
     auto buffer = seastar::temporary_buffer<char>::aligned(_alignment, writable_bytes);
-    std::memset(buffer.get_write(), 0, writable_bytes);
     char* out = buffer.get_write();
     for_each_chunk_prefix(first, second, bytes, [&out](const char* data, std::size_t size) {
         std::memcpy(out, data, size);
         out += size;
     });
+    std::memset(out, 0, writable_bytes - bytes);
     co_await write_aligned_buffer(buffer, writable_bytes, sync_after_write);
     _write_offset += writable_bytes;
 }
@@ -314,9 +311,7 @@ seastar::future<> AppendWriter::write_chunked_buffer_prefix(
         if (padded > chunk_bytes) {
             std::memset(buffer.get_write() + chunk_bytes, 0, padded - chunk_bytes);
         }
-        auto slice = seastar::temporary_buffer<char>::aligned(_alignment, padded);
-        std::memcpy(slice.get_write(), buffer.get(), padded);
-        co_await write_aligned_buffer(slice, padded, flush_now);
+        co_await write_aligned_buffer(buffer, padded, flush_now);
         _write_offset += padded;
         chunk_bytes = 0;
     };

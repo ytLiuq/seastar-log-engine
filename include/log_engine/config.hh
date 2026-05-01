@@ -71,6 +71,8 @@ struct EngineConfig {
     std::size_t write_behind = 8;
     std::size_t write_retry_count = 3;
     std::size_t write_retry_backoff_ms = 2;
+    std::size_t max_pending_bytes = 0;
+    std::size_t pending_bytes_low_watermark = 0;
     std::uint64_t rotate_size_bytes = 0;
     std::uint64_t rotate_interval_seconds = 0;
     std::uint64_t archive_retention_seconds = 0;
@@ -125,6 +127,9 @@ struct EngineConfig {
         }
         if (write_retry_count == 0) {
             throw std::invalid_argument("write_retry_count must be greater than zero");
+        }
+        if (max_pending_bytes > 0 && pending_bytes_low_watermark > max_pending_bytes) {
+            throw std::invalid_argument("pending_bytes_low_watermark must not exceed max_pending_bytes");
         }
         if (max_archived_files_per_shard == 0) {
             throw std::invalid_argument("max_archived_files_per_shard must be greater than zero");

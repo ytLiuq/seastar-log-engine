@@ -6,6 +6,7 @@
 #include <chrono>
 
 #include <seastar/core/gate.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/sstring.hh>
@@ -37,6 +38,12 @@ private:
     seastar::future<> persist_checkpoint();
     seastar::temporary_buffer<char> format_record(LogMessage&& message);
     void submit_record(LogMessage&& message);
+    seastar::future<> maybe_wait_for_backpressure();
+    void notify_backpressure_waiters();
+    [[nodiscard]] bool backpressure_enabled() const noexcept;
+    [[nodiscard]] bool above_backpressure_limit() const noexcept;
+    [[nodiscard]] bool below_backpressure_resume_threshold() const noexcept;
+    [[nodiscard]] std::size_t backpressure_resume_threshold() const noexcept;
     void setup_metrics();
     void reset_metrics();
     struct TimestampBuffer {
@@ -54,10 +61,10 @@ private:
     EngineConfig _config;
     seastar::timer<seastar::lowres_clock> _flush_timer;
     seastar::gate _gate;
+    seastar::condition_variable _backpressure;
     std::deque<seastar::temporary_buffer<char>> _pending;
     std::size_t _pending_bytes = 0;
     layout::SegmentDescriptor _active_segment;
-    std::string _file_path;
     std::uint64_t _sequence = 0;
     std::uint64_t _rotation_index = 0;
     AppendWriter _append_writer;
@@ -68,6 +75,8 @@ private:
     std::uint64_t _metric_flushed_batches = 0;
     std::uint64_t _metric_flushed_bytes = 0;
     std::uint64_t _metric_flush_errors = 0;
+    std::uint64_t _metric_backpressure_waits = 0;
+    std::uint64_t _waiting_submitters = 0;
     bool _started = false;
     bool _stopping = false;
     bool _flush_in_progress = false;

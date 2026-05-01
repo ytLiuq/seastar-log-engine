@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
         ("write-behind", bpo::value<std::size_t>()->default_value(8), "Output stream write-behind depth")
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
+        ("max-pending-bytes", bpo::value<std::size_t>()->default_value(0), "Maximum queued log bytes per shard before submit backpressure, 0 disables")
+        ("pending-bytes-low-watermark", bpo::value<std::size_t>()->default_value(0), "Resume threshold for queued log bytes after backpressure, 0 uses max-pending-bytes/2")
         ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
         ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
         ("rotate-interval-seconds", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after this many seconds, 0 disables time rotation")
@@ -83,6 +85,8 @@ int main(int argc, char** argv) {
         base.write_behind = app.configuration()["write-behind"].as<std::size_t>();
         base.write_retry_count = app.configuration()["write-retry-count"].as<std::size_t>();
         base.write_retry_backoff_ms = app.configuration()["write-retry-backoff-ms"].as<std::size_t>();
+        base.max_pending_bytes = app.configuration()["max-pending-bytes"].as<std::size_t>();
+        base.pending_bytes_low_watermark = app.configuration()["pending-bytes-low-watermark"].as<std::size_t>();
         base.rotate_size_bytes = app.configuration()["rotate-size-bytes"].as<std::uint64_t>();
         base.rotate_interval_seconds = app.configuration()["rotate-interval-seconds"].as<std::uint64_t>();
         base.archive_retention_seconds = app.configuration()["archive-retention-seconds"].as<std::uint64_t>();

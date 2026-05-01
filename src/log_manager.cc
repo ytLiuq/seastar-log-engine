@@ -6,7 +6,6 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -55,6 +54,27 @@ std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescrip
         }
     }
     return checkpoint;
+}
+
+std::string read_file_to_string(const std::string& path) {
+    namespace fs = std::filesystem;
+    const auto file_size = fs::file_size(path);
+    if (file_size == 0) {
+        return {};
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        throw std::runtime_error("failed to open active log for recovery: " + path);
+    }
+
+    std::string content(static_cast<std::size_t>(file_size), '\0');
+    in.read(content.data(), static_cast<std::streamsize>(content.size()));
+    const auto bytes_read = static_cast<std::size_t>(in.gcount());
+    if (bytes_read != content.size()) {
+        throw std::runtime_error("failed to read active log for recovery: " + path);
+    }
+    return content;
 }
 
 }
@@ -122,10 +142,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
             return recovery;
         }
 
-        std::ifstream in(active_segment.path, std::ios::binary);
-        std::stringstream buffer;
-        buffer << in.rdbuf();
-        const auto content = buffer.str();
+        const auto content = read_file_to_string(active_segment.path);
         const auto verified = scan_log_content(content);
         auto valid_size = verified.valid_size;
         auto sequence = verified.next_sequence;

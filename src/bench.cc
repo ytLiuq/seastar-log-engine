@@ -63,6 +63,8 @@ int main(int argc, char** argv) {
         ("flush-ms", bpo::value<std::size_t>()->default_value(0), "Periodic flush interval in milliseconds, 0 disables timer-based flush")
         ("stream-buffer-size", bpo::value<std::size_t>()->default_value(65536), "Output stream buffer size")
         ("write-behind", bpo::value<std::size_t>()->default_value(8), "Output stream write-behind depth")
+        ("max-pending-bytes", bpo::value<std::size_t>()->default_value(0), "Maximum queued log bytes per shard before submit backpressure, 0 disables")
+        ("pending-bytes-low-watermark", bpo::value<std::size_t>()->default_value(0), "Resume threshold for queued log bytes after backpressure, 0 uses max-pending-bytes/2")
         ("rotate-size-bytes", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after reaching this size")
         ("rotate-interval-seconds", bpo::value<std::uint64_t>()->default_value(0), "Rotate active file after this many seconds, 0 disables time rotation")
         ("archive-retention-seconds", bpo::value<std::uint64_t>()->default_value(0), "Delete archived files older than this many seconds, 0 disables age cleanup")
@@ -90,6 +92,8 @@ int main(int argc, char** argv) {
         base.flush_interval_ms = app.configuration()["flush-ms"].as<std::size_t>();
         base.stream_buffer_size = app.configuration()["stream-buffer-size"].as<std::size_t>();
         base.write_behind = app.configuration()["write-behind"].as<std::size_t>();
+        base.max_pending_bytes = app.configuration()["max-pending-bytes"].as<std::size_t>();
+        base.pending_bytes_low_watermark = app.configuration()["pending-bytes-low-watermark"].as<std::size_t>();
         base.rotate_size_bytes = app.configuration()["rotate-size-bytes"].as<std::uint64_t>();
         base.rotate_interval_seconds = app.configuration()["rotate-interval-seconds"].as<std::uint64_t>();
         base.archive_retention_seconds = app.configuration()["archive-retention-seconds"].as<std::uint64_t>();
