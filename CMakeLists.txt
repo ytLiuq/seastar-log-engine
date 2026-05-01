@@ -138,6 +138,24 @@ target_link_libraries(log_engine_query_client
         PkgConfig::PROTOBUF
         PkgConfig::GRPCPP)
 
+if (EXISTS "${FMT_LOCAL_STATIC_LIBRARY}")
+    target_link_libraries(log_engine_query_client
+        PRIVATE
+            "${FMT_LOCAL_STATIC_LIBRARY}")
+elseif (TARGET fmt::fmt)
+    target_link_libraries(log_engine_query_client
+        PRIVATE
+            fmt::fmt)
+elseif (FMT_LIBRARY)
+    target_link_libraries(log_engine_query_client
+        PRIVATE
+            ${FMT_LIBRARY})
+elseif (SYSTEM_FMT_LIBRARY)
+    target_link_libraries(log_engine_query_client
+        PRIVATE
+            ${SYSTEM_FMT_LIBRARY})
+endif ()
+
 add_executable(log_engine_unit_tests
     src/unit_tests.cc)
 
