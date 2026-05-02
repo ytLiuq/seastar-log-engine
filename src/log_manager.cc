@@ -16,6 +16,7 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/thread.hh>
 
+#include "log_engine/health_monitor.hh"
 #include "log_engine/log_layout.hh"
 #include "log_engine/record_codec.hh"
 
@@ -130,6 +131,7 @@ seastar::future<> LogManager::rotate_active_file(
                 ++g_gzip_archive_successes;
             } catch (...) {
                 ++g_gzip_archive_failures;
+                record_gzip_archive_failure();
                 throw;
             }
         }
@@ -157,6 +159,7 @@ seastar::future<> LogManager::store_checkpoint(const layout::SegmentDescriptor& 
             ++g_checkpoint_write_successes;
         } catch (...) {
             ++g_checkpoint_write_failures;
+            record_checkpoint_write_failure();
             throw;
         }
     });
@@ -190,6 +193,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
             rotation_index = checkpoint->rotation_index;
         } else if (checkpoint_file_exists) {
             ++g_recovery_fallbacks;
+            record_recovery_fallback();
         }
 
         recovery.logical_size = valid_size;

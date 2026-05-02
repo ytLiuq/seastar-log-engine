@@ -26,6 +26,12 @@ message StatusReply {
   uint64 log_manager_recovery_fallbacks = 19;
   uint64 log_manager_gzip_archive_successes = 20;
   uint64 log_manager_gzip_archive_failures = 21;
+  uint64 health_reader_corrupted_segments_recent = 22;
+  uint64 health_reader_corrupted_lines_recent = 23;
+  uint64 health_reader_gzip_read_errors_recent = 24;
+  uint64 health_checkpoint_failures_recent = 25;
+  uint64 health_gzip_failures_recent = 26;
+  uint64 health_recovery_fallbacks_recent = 27;
 }
 
 message RouteRequest {

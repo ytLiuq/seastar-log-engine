@@ -56,6 +56,7 @@ add_library(log_engine_core
     src/async_writer.cc
     src/compat_glog.cc
     src/config_loader.cc
+    src/health_monitor.cc
     src/log_layout.cc
     src/log_manager.cc
     src/log_reader.cc
