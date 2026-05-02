@@ -1,0 +1,464 @@
+{
+  "dashboard": {
+    "title": "Seastar Log Engine",
+    "uid": "seastar-log-engine",
+    "tags": ["seastar", "logging"],
+    "timezone": "browser",
+    "refresh": "30s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "type": "stat",
+        "title": "Health Status",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_reader_corrupted_segments_recent) + sum(log_engine_health_reader_corrupted_lines_recent) + sum(log_engine_health_reader_gzip_read_errors_recent) + sum(log_engine_health_checkpoint_write_failures_recent) + sum(log_engine_health_gzip_archive_failures_recent) + sum(log_engine_health_recovery_fallbacks_recent)",
+            "legendFormat": "total recent errors"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+          "textMode": "value_and_name",
+          "colorMode": "background",
+          "thresholds": [
+            {"value": 0, "color": "green"},
+            {"value": 1, "color": "orange"},
+            {"value": 10, "color": "red"}
+          ]
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"type": "range", "from": 0, "to": 0, "text": "ok"},
+              {"type": "range", "from": 1, "to": 10, "text": "degraded"},
+              {"type": "range", "from": 10, "to": 999999, "text": "unhealthy"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 2,
+        "type": "stat",
+        "title": "Throughput (msg/s)",
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_submitted_messages[1m]))",
+            "legendFormat": "messages/s"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "reqps"}
+        }
+      },
+      {
+        "id": 3,
+        "type": "stat",
+        "title": "Write Throughput (B/s)",
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_flushed_bytes[1m]))",
+            "legendFormat": "bytes/s"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "Bps"}
+        }
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Pending Queue",
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(log_engine_writer_pending_bytes)",
+            "legendFormat": "pending bytes"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"values": false, "calcs": ["lastNotNull"]},
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {"unit": "decbytes"}
+        }
+      },
+      {
+        "id": 10,
+        "type": "timeseries",
+        "title": "Submitted Messages Rate",
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_submitted_messages[1m]))",
+            "legendFormat": "messages/s"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "reqps"}
+        }
+      },
+      {
+        "id": 11,
+        "type": "timeseries",
+        "title": "Flushed Bytes Rate",
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_flushed_bytes[1m]))",
+            "legendFormat": "bytes/s"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "Bps"}
+        }
+      },
+      {
+        "id": 20,
+        "type": "timeseries",
+        "title": "Pending Queue Depth",
+        "gridPos": {"x": 0, "y": 12, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_writer_pending_entries)",
+            "legendFormat": "entries"
+          },
+          {
+            "expr": "sum(log_engine_writer_pending_bytes)",
+            "legendFormat": "bytes"
+          }
+        ]
+      },
+      {
+        "id": 21,
+        "type": "timeseries",
+        "title": "Waiting Submitters (Backpressure)",
+        "gridPos": {"x": 8, "y": 12, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_writer_waiting_submitters)",
+            "legendFormat": "waiting"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 22,
+        "type": "timeseries",
+        "title": "Backpressure Waits (Cumulative)",
+        "gridPos": {"x": 16, "y": 12, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_backpressure_waits[1m]))",
+            "legendFormat": "waits/s"
+          }
+        ]
+      },
+      {
+        "id": 30,
+        "type": "timeseries",
+        "title": "Flush Errors",
+        "gridPos": {"x": 0, "y": 18, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_flush_errors[1m]))",
+            "legendFormat": "errors/s"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 0.01, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 31,
+        "type": "timeseries",
+        "title": "Active File Logical Size",
+        "gridPos": {"x": 8, "y": 18, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_writer_logical_size_bytes)",
+            "legendFormat": "bytes"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "decbytes"}
+        }
+      },
+      {
+        "id": 32,
+        "type": "timeseries",
+        "title": "Flushed Batches Rate",
+        "gridPos": {"x": 16, "y": 18, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_writer_flushed_batches[1m]))",
+            "legendFormat": "batches/s"
+          }
+        ]
+      },
+      {
+        "id": 40,
+        "type": "row",
+        "title": "Reader & Query Metrics",
+        "gridPos": {"x": 0, "y": 24, "w": 24, "h": 1}
+      },
+      {
+        "id": 41,
+        "type": "timeseries",
+        "title": "Segments Read Rate",
+        "gridPos": {"x": 0, "y": 25, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_reader_segments_read[5m]))",
+            "legendFormat": "segments/s"
+          }
+        ]
+      },
+      {
+        "id": 42,
+        "type": "timeseries",
+        "title": "Records Returned Rate",
+        "gridPos": {"x": 8, "y": 25, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_reader_records_returned[5m]))",
+            "legendFormat": "records/s"
+          }
+        ]
+      },
+      {
+        "id": 43,
+        "type": "timeseries",
+        "title": "Archive vs Active Segments Read",
+        "gridPos": {"x": 16, "y": 25, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_reader_archive_segments_read[5m]))",
+            "legendFormat": "archive/s"
+          },
+          {
+            "expr": "sum(rate(log_engine_reader_active_segments_read[5m]))",
+            "legendFormat": "active/s"
+          }
+        ]
+      },
+      {
+        "id": 50,
+        "type": "timeseries",
+        "title": "Corrupted Segments (Recent 5m Window)",
+        "gridPos": {"x": 0, "y": 31, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_reader_corrupted_segments_recent)",
+            "legendFormat": "recent corrupted segments"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 51,
+        "type": "timeseries",
+        "title": "Corrupted Lines (Recent 5m Window)",
+        "gridPos": {"x": 8, "y": 31, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_reader_corrupted_lines_recent)",
+            "legendFormat": "recent corrupted lines"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 52,
+        "type": "timeseries",
+        "title": "Gzip Read Errors (Recent 5m Window)",
+        "gridPos": {"x": 16, "y": 31, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_reader_gzip_read_errors_recent)",
+            "legendFormat": "recent gzip errors"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 60,
+        "type": "row",
+        "title": "Log Manager Operations",
+        "gridPos": {"x": 0, "y": 37, "w": 24, "h": 1}
+      },
+      {
+        "id": 61,
+        "type": "timeseries",
+        "title": "Rotate Operations",
+        "gridPos": {"x": 0, "y": 38, "w": 6, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_log_manager_rotate_operations[1m]))",
+            "legendFormat": "rotations/s"
+          }
+        ]
+      },
+      {
+        "id": 62,
+        "type": "timeseries",
+        "title": "Checkpoint Writes",
+        "gridPos": {"x": 6, "y": 38, "w": 6, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_log_manager_checkpoint_write_successes[1m]))",
+            "legendFormat": "successes/s"
+          },
+          {
+            "expr": "sum(rate(log_engine_log_manager_checkpoint_write_failures[1m]))",
+            "legendFormat": "failures/s"
+          }
+        ]
+      },
+      {
+        "id": 63,
+        "type": "timeseries",
+        "title": "Recovery Fallbacks",
+        "gridPos": {"x": 12, "y": 38, "w": 6, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_recovery_fallbacks_recent)",
+            "legendFormat": "recent fallbacks"
+          },
+          {
+            "expr": "sum(rate(log_engine_log_manager_recovery_fallbacks[5m]))",
+            "legendFormat": "lifetime rate"
+          }
+        ]
+      },
+      {
+        "id": 64,
+        "type": "timeseries",
+        "title": "Gzip Archive Operations",
+        "gridPos": {"x": 18, "y": 38, "w": 6, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(log_engine_log_manager_gzip_archive_successes[1m]))",
+            "legendFormat": "successes/s"
+          },
+          {
+            "expr": "sum(rate(log_engine_log_manager_gzip_archive_failures[1m]))",
+            "legendFormat": "failures/s"
+          }
+        ]
+      },
+      {
+        "id": 70,
+        "type": "timeseries",
+        "title": "Checkpoint Failures (Recent 5m Window)",
+        "gridPos": {"x": 0, "y": 44, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_checkpoint_write_failures_recent)",
+            "legendFormat": "recent failures"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 71,
+        "type": "timeseries",
+        "title": "Gzip Failures (Recent 5m Window)",
+        "gridPos": {"x": 8, "y": 44, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_health_gzip_archive_failures_recent)",
+            "legendFormat": "recent failures"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "orange"},
+              {"value": 10, "color": "red"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 72,
+        "type": "timeseries",
+        "title": "Recovery Fallback Reasons (Lifetime)",
+        "gridPos": {"x": 16, "y": 44, "w": 8, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(log_engine_log_manager_recovery_fallback_incomplete_checkpoint)",
+            "legendFormat": "incomplete checkpoint"
+          },
+          {
+            "expr": "sum(log_engine_log_manager_recovery_fallback_stale_checkpoint)",
+            "legendFormat": "stale checkpoint"
+          }
+        ]
+      }
+    ],
+    "schemaVersion": 36,
+    "version": 1
+  }
+}

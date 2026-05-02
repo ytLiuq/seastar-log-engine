@@ -1,0 +1,131 @@
+# Example Prometheus alerting rules for seastar-log-engine.
+#
+# These rules reference metrics exported by the log_engine_query_server
+# Prometheus endpoint (default: http://<host>:19181/metrics).
+#
+# The metrics are prefixed with "log_engine_" and grouped by component:
+#   - log_engine_writer_*     (per-shard writer metrics)
+#   - log_engine_reader_*     (query reader metrics)
+#   - log_engine_log_manager_* (rotate/checkpoint/gzip/recovery metrics)
+#   - log_engine_health_*     (sliding-window health counters)
+
+groups:
+  - name: log_engine_alerts
+    rules:
+
+      # --- Health: recent error spikes ---
+
+      - alert: LogEngineReaderCorruptedSegments
+        expr: log_engine_health_reader_corrupted_segments_recent > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine query reader detected corrupted segments"
+          description: "{{ $value }} corrupted segment(s) in the last 5 minutes. Corrupted lines or gzip read errors may also be present."
+
+      - alert: LogEngineReaderGzipErrors
+        expr: log_engine_health_reader_gzip_read_errors_recent > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine query reader gzip read errors"
+          description: "{{ $value }} gzip archive read error(s) in the last 5 minutes. Check archive directory for truncated or incomplete .gz files."
+
+      - alert: LogEngineCheckpointWriteFailures
+        expr: log_engine_health_checkpoint_write_failures_recent > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine checkpoint write failures"
+          description: "{{ $value }} checkpoint write failure(s) in the last 5 minutes. Check disk space and permissions on the log directory."
+
+      - alert: LogEngineGzipArchiveFailures
+        expr: log_engine_health_gzip_archive_failures_recent > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine gzip archive compression failures"
+          description: "{{ $value }} gzip archive failure(s) in the last 5 minutes. Check disk space on the archive directory."
+
+      - alert: LogEngineRecoveryFallbacks
+        expr: log_engine_health_recovery_fallbacks_recent > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine recovery fallback events"
+          description: "{{ $value }} recovery fallback(s) in the last 5 minutes. This indicates checkpoint files are unusable and fallback recovery was used. Check log-manager warnings for details."
+
+      # --- Health: sustained unhealthy state ---
+
+      - alert: LogEngineUnhealthy
+        expr: |
+          log_engine_health_reader_corrupted_segments_recent > 10
+          or log_engine_health_reader_corrupted_lines_recent > 10
+          or log_engine_health_reader_gzip_read_errors_recent > 10
+          or log_engine_health_checkpoint_write_failures_recent > 10
+          or log_engine_health_gzip_archive_failures_recent > 10
+          or log_engine_health_recovery_fallbacks_recent > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Log engine is unhealthy"
+          description: "One or more health counters have exceeded the unhealthy threshold (10) in the last 5 minutes. Investigate logs and disk health immediately."
+
+      # --- Writer: flush errors ---
+
+      - alert: LogEngineFlushErrors
+        expr: rate(log_engine_writer_flush_errors[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Log engine flush errors detected"
+          description: "Flush errors are occurring at {{ $value }}/s. This may indicate disk failure or filesystem issues."
+
+      # --- Writer: backpressure sustained ---
+
+      - alert: LogEngineBackpressureSustained
+        expr: log_engine_writer_waiting_submitters > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine sustained backpressure"
+          description: "{{ $value }} submitter(s) have been waiting on backpressure for more than 15 minutes. Consider increasing max_pending_bytes or reducing write load."
+
+      # --- Log manager: rotation and checkpoint ---
+
+      - alert: LogEngineNoRecentRotation
+        expr: rate(log_engine_log_manager_rotate_operations[1h]) == 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Log engine no rotation in the last hour"
+          description: "No log rotation has occurred in the last hour. If rotation is configured, check whether rotate_size_bytes / rotate_interval_seconds thresholds are being met."
+
+      # --- Lifetime counters trending up (detect degradation over time) ---
+
+      - alert: LogEngineCheckpointFailureTrend
+        expr: rate(log_engine_log_manager_checkpoint_write_failures[1h]) > 0.01
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine checkpoint failures are trending up"
+          description: "Checkpoint write failures are accumulating at {{ $value }}/s over the last hour."
+
+      - alert: LogEngineRecoveryFallbackTrend
+        expr: rate(log_engine_log_manager_recovery_fallbacks[1h]) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log engine recovery fallbacks are recurring"
+          description: "Recovery fallbacks are occurring at {{ $value }}/s over the last hour. This suggests persistent checkpoint corruption."
