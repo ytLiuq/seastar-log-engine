@@ -228,11 +228,15 @@ void LogManager::cleanup_archives(const EngineConfig& config, unsigned shard_id)
     namespace fs = std::filesystem;
     const auto now = fs::file_time_type::clock::now();
     auto archived = layout::collect_archive_segments(config, shard_id);
+
+    std::size_t retention_deleted = 0;
     archived.erase(std::remove_if(archived.begin(), archived.end(), [&] (const auto& segment) {
         if (config.archive_retention_seconds > 0) {
             const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - fs::last_write_time(segment.path)).count();
             if (age > static_cast<long long>(config.archive_retention_seconds)) {
+                mgrlog.info("archive cleanup (retention): removing aged-out segment shard={} path={} age={}s", shard_id, segment.path, age);
                 fs::remove(segment.path);
+                ++retention_deleted;
                 return true;
             }
         }
@@ -246,8 +250,14 @@ void LogManager::cleanup_archives(const EngineConfig& config, unsigned shard_id)
         return lhs.rotation_index > rhs.rotation_index;
     });
 
+    std::size_t count_deleted = 0;
     for (std::size_t i = config.max_archived_files_per_shard; i < archived.size(); ++i) {
+        mgrlog.info("archive cleanup (count): removing excess segment shard={} path={}", shard_id, archived[i].path);
         fs::remove(archived[i].path);
+        ++count_deleted;
+    }
+    if (retention_deleted > 0 || count_deleted > 0) {
+        mgrlog.info("archive cleanup shard={}: removed {} retention + {} count-excess segments, {} remaining", shard_id, retention_deleted, count_deleted, archived.size() - count_deleted);
     }
 }
 

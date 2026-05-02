@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <utility>
@@ -13,6 +14,34 @@
 #include <zlib.h>
 
 #include "log_engine/health_monitor.hh"
+
+//
+// Damage handling strategy (query read path):
+//
+//   Damage type              | Strategy
+//   -------------------------+------------------------------------------
+//   Corrupt line in segment  | Truncate at first bad line, keep prefix.
+//                            | Increment corrupted_lines + corrupted_segments.
+//                            | Warn. Continue to next segment.
+//   Gzip read error          | Skip entire gzip segment.
+//                            | Increment gzip_read_errors + corrupted_segments.
+//                            | Warn. Continue to next segment.
+//   File missing mid-read    | Skip (likely concurrent archive cleanup).
+//                            | Warn. Do NOT count as corrupted.
+//                            | Continue to next segment.
+//   Unparseable filename     | Silently skip during segment enumeration.
+//
+// Recovery path (log_manager.cc):
+//   Incomplete checkpoint    | Ignore checkpoint, fall back to active log
+//                            | verified scan. Increment recovery_fallbacks +
+//                            | recovery_fallback_incomplete_checkpoint. Warn.
+//   Stale checkpoint         | Ignore checkpoint, fall back to active log
+//                            | verified scan. Increment recovery_fallbacks +
+//                            | recovery_fallback_stale_checkpoint. Warn.
+//
+// The guiding principle: never fail a query due to one bad segment.
+// Accumulate what's readable, warn about what's not.
+//
 
 namespace log_engine {
 
@@ -32,6 +61,7 @@ std::unique_ptr<seastar::metrics::metric_groups> g_reader_metrics;
 struct StreamResult {
     bool stopped_early = false;
     bool read_error = false;
+    bool file_missing = false;
 };
 
 bool matches_record_query(const ParsedRecord& record, const ReadQuery& query) {
@@ -52,6 +82,10 @@ bool matches_record_query(const ParsedRecord& record, const ReadQuery& query) {
 
 template <typename Consumer>
 StreamResult stream_plain_lines(const std::string& path, Consumer&& consume_line) {
+    if (!std::filesystem::exists(path)) {
+        readerlog.warn("segment file disappeared (likely cleaned up concurrently): {}", path);
+        return StreamResult{.stopped_early = false, .read_error = true, .file_missing = true};
+    }
     std::ifstream in(path, std::ios::binary);
     std::string line;
     while (std::getline(in, line)) {
@@ -67,6 +101,10 @@ StreamResult stream_plain_lines(const std::string& path, Consumer&& consume_line
 
 template <typename Consumer>
 StreamResult stream_gzip_lines(const std::string& path, Consumer&& consume_line) {
+    if (!std::filesystem::exists(path)) {
+        readerlog.warn("gzip segment file disappeared (likely cleaned up concurrently): {}", path);
+        return StreamResult{.stopped_early = false, .read_error = true, .file_missing = true};
+    }
     gzFile in = gzopen(path.c_str(), "rb");
     if (!in) {
         ++g_gzip_read_errors;
@@ -151,6 +189,12 @@ std::vector<ParsedRecord> read_records_from_segments(
             ++g_records_returned;
             return records.size() < query.limit;
         });
+        if (result.file_missing) {
+            readerlog.warn(
+                "skipping segment that disappeared (likely concurrent archive cleanup): path={}",
+                segment.path);
+            continue;
+        }
         if (segment_corrupted || result.read_error) {
             ++g_corrupted_segments;
             record_reader_corrupted_segment();
