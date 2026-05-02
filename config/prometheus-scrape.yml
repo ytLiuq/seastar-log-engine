@@ -1,0 +1,57 @@
+# Example Prometheus scrape configuration for seastar-log-engine.
+#
+# Add this to your prometheus.yml scrape_configs section:
+
+scrape_configs:
+  - job_name: 'log-engine'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - 'log-engine-host-1:19181'
+          - 'log-engine-host-2:19181'
+        labels:
+          cluster: 'production'
+          component: 'log-engine-query'
+
+# The query server exposes metrics on the configured --metrics-port (default 19181).
+# All metrics are prefixed with "log_engine_":
+#
+#   log_engine_writer_submitted_messages      (counter)
+#   log_engine_writer_submitted_bytes          (counter, unit: total_bytes)
+#   log_engine_writer_flushed_batches          (counter)
+#   log_engine_writer_flushed_bytes            (counter, unit: total_bytes)
+#   log_engine_writer_flush_errors             (counter)
+#   log_engine_writer_backpressure_waits       (counter)
+#   log_engine_writer_pending_entries          (gauge)
+#   log_engine_writer_pending_bytes            (gauge, unit: current_bytes)
+#   log_engine_writer_waiting_submitters       (gauge)
+#   log_engine_writer_logical_size_bytes       (gauge, unit: current_bytes)
+#
+#   log_engine_reader_segments_read            (counter)
+#   log_engine_reader_archive_segments_read    (counter)
+#   log_engine_reader_active_segments_read     (counter)
+#   log_engine_reader_records_returned         (counter)
+#   log_engine_reader_corrupted_segments       (counter)
+#   log_engine_reader_corrupted_lines          (counter)
+#   log_engine_reader_gzip_read_errors         (counter)
+#
+#   log_engine_log_manager_rotate_operations                    (counter)
+#   log_engine_log_manager_checkpoint_write_successes           (counter)
+#   log_engine_log_manager_checkpoint_write_failures            (counter)
+#   log_engine_log_manager_recovery_fallbacks                   (counter)
+#   log_engine_log_manager_recovery_fallback_incomplete_checkpoint (counter)
+#   log_engine_log_manager_recovery_fallback_stale_checkpoint   (counter)
+#   log_engine_log_manager_gzip_archive_successes               (counter)
+#   log_engine_log_manager_gzip_archive_failures                (counter)
+#
+#   log_engine_health_reader_corrupted_segments_recent          (gauge, 5-min window)
+#   log_engine_health_reader_corrupted_lines_recent             (gauge, 5-min window)
+#   log_engine_health_reader_gzip_read_errors_recent            (gauge, 5-min window)
+#   log_engine_health_checkpoint_write_failures_recent          (gauge, 5-min window)
+#   log_engine_health_gzip_archive_failures_recent              (gauge, 5-min window)
+#   log_engine_health_recovery_fallbacks_recent                 (gauge, 5-min window)
+#   log_engine_health_reader_corrupted_segments_lifetime        (counter)
+#   ... (matching lifetime counters for each of the above)
+
+# Recommended alerting rules are in config/prometheus-alerts.yml
