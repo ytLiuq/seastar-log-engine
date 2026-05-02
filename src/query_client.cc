@@ -21,19 +21,34 @@ using logengine::query::v1::StatusReply;
 
 void print_status(const StatusReply& reply) {
     fmt::print(
-        "{{\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\"}}\n",
+        "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}}}}\n",
+        reply.health(),
         reply.routing_strategy(),
         reply.routing_shards(),
         reply.routing_virtual_nodes(),
         reply.ring_size(),
         reply.log_dir(),
         reply.archive_dir(),
-        reply.shard_file_prefix());
+        reply.shard_file_prefix(),
+        reply.reader_segments_read(),
+        reply.reader_archive_segments_read(),
+        reply.reader_active_segments_read(),
+        reply.reader_records_returned(),
+        reply.reader_corrupted_segments(),
+        reply.reader_corrupted_lines(),
+        reply.reader_gzip_read_errors(),
+        reply.log_manager_rotate_operations(),
+        reply.log_manager_checkpoint_write_successes(),
+        reply.log_manager_checkpoint_write_failures(),
+        reply.log_manager_recovery_fallbacks(),
+        reply.log_manager_gzip_archive_successes(),
+        reply.log_manager_gzip_archive_failures());
 }
 
 void print_route(const RouteReply& reply) {
     fmt::print(
-        "{{\"shard\":{},\"hash\":{},\"token\":{},\"used_local_fallback\":{}}}\n",
+        "{{\"route_key\":\"{}\",\"shard\":{},\"hash\":{},\"token\":{},\"used_local_fallback\":{}}}\n",
+        reply.route_key(),
         reply.shard(),
         reply.hash(),
         reply.token(),

@@ -12,6 +12,20 @@ message StatusReply {
   string log_dir = 5;
   string archive_dir = 6;
   string shard_file_prefix = 7;
+  uint64 reader_segments_read = 8;
+  uint64 reader_archive_segments_read = 9;
+  uint64 reader_active_segments_read = 10;
+  uint64 reader_records_returned = 11;
+  uint64 reader_corrupted_segments = 12;
+  uint64 reader_corrupted_lines = 13;
+  uint64 reader_gzip_read_errors = 14;
+  string health = 15;
+  uint64 log_manager_rotate_operations = 16;
+  uint64 log_manager_checkpoint_write_successes = 17;
+  uint64 log_manager_checkpoint_write_failures = 18;
+  uint64 log_manager_recovery_fallbacks = 19;
+  uint64 log_manager_gzip_archive_successes = 20;
+  uint64 log_manager_gzip_archive_failures = 21;
 }
 
 message RouteRequest {
@@ -19,10 +33,11 @@ message RouteRequest {
 }
 
 message RouteReply {
-  uint32 shard = 1;
-  uint64 hash = 2;
-  uint64 token = 3;
-  bool used_local_fallback = 4;
+  string route_key = 1;
+  uint32 shard = 2;
+  uint64 hash = 3;
+  uint64 token = 4;
+  bool used_local_fallback = 5;
 }
 
 message QueryRecordsRequest {

@@ -23,6 +23,7 @@
 
 #include "../../seastar/apps/lib/stop_signal.hh"
 #include "log_engine/config_loader.hh"
+#include "log_engine/log_manager.hh"
 #include "log_engine/log_reader.hh"
 #include "log_engine/routing.hh"
 #include "log_engine_query.grpc.pb.h"
@@ -106,16 +107,40 @@ struct QueryContext {
         return log_engine::read_records(segments, query);
     }
 
+    std::string_view health_status() const noexcept {
+        const auto reader_stats = log_engine::get_reader_stats();
+        const bool degraded = reader_stats.corrupted_segments > 0 ||
+            reader_stats.corrupted_lines > 0 ||
+            reader_stats.gzip_read_errors > 0;
+        return degraded ? "degraded" : "ok";
+    }
+
     std::string render_status_json() const {
+        const auto reader_stats = log_engine::get_reader_stats();
+        const auto log_manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}}}}",
+            health_status(),
             log_engine::routing_strategy_to_string(router.strategy()),
             routing_shards,
             router.virtual_nodes(),
             router.ring_size(),
             json_escape(config.log_dir),
             json_escape(config.archive_dir),
-            json_escape(config.shard_file_prefix));
+            json_escape(config.shard_file_prefix),
+            reader_stats.segments_read,
+            reader_stats.archive_segments_read,
+            reader_stats.active_segments_read,
+            reader_stats.records_returned,
+            reader_stats.corrupted_segments,
+            reader_stats.corrupted_lines,
+            reader_stats.gzip_read_errors,
+            log_manager_stats.rotate_operations,
+            log_manager_stats.checkpoint_write_successes,
+            log_manager_stats.checkpoint_write_failures,
+            log_manager_stats.recovery_fallbacks,
+            log_manager_stats.gzip_archive_successes,
+            log_manager_stats.gzip_archive_failures);
     }
 
     std::string render_route_json(std::string_view key) const {
@@ -154,6 +179,9 @@ struct QueryContext {
     }
 
     void fill_status(StatusReply* reply) const {
+        const auto reader_stats = log_engine::get_reader_stats();
+        const auto log_manager_stats = log_engine::get_log_manager_stats();
+        reply->set_health(std::string(health_status()));
         reply->set_routing_strategy(log_engine::routing_strategy_to_string(router.strategy()));
         reply->set_routing_shards(routing_shards);
         reply->set_routing_virtual_nodes(router.virtual_nodes());
@@ -161,10 +189,24 @@ struct QueryContext {
         reply->set_log_dir(config.log_dir);
         reply->set_archive_dir(config.archive_dir);
         reply->set_shard_file_prefix(config.shard_file_prefix);
+        reply->set_reader_segments_read(reader_stats.segments_read);
+        reply->set_reader_archive_segments_read(reader_stats.archive_segments_read);
+        reply->set_reader_active_segments_read(reader_stats.active_segments_read);
+        reply->set_reader_records_returned(reader_stats.records_returned);
+        reply->set_reader_corrupted_segments(reader_stats.corrupted_segments);
+        reply->set_reader_corrupted_lines(reader_stats.corrupted_lines);
+        reply->set_reader_gzip_read_errors(reader_stats.gzip_read_errors);
+        reply->set_log_manager_rotate_operations(log_manager_stats.rotate_operations);
+        reply->set_log_manager_checkpoint_write_successes(log_manager_stats.checkpoint_write_successes);
+        reply->set_log_manager_checkpoint_write_failures(log_manager_stats.checkpoint_write_failures);
+        reply->set_log_manager_recovery_fallbacks(log_manager_stats.recovery_fallbacks);
+        reply->set_log_manager_gzip_archive_successes(log_manager_stats.gzip_archive_successes);
+        reply->set_log_manager_gzip_archive_failures(log_manager_stats.gzip_archive_failures);
     }
 
     void fill_route(std::string_view key, RouteReply* reply) const {
         const auto decision = route(key);
+        reply->set_route_key(std::string(key));
         reply->set_shard(decision.shard);
         reply->set_hash(decision.hash);
         reply->set_token(decision.token);
@@ -379,6 +421,10 @@ int main(int argc, char** argv) {
                 context.routing_shards = seastar::smp::count;
             }
             context.router.configure(config.routing_strategy, config.routing_virtual_nodes, context.routing_shards);
+            log_engine::register_reader_metrics();
+            auto unregister_reader_metrics = seastar::defer([] () noexcept {
+                log_engine::unregister_reader_metrics();
+            });
 
             seastar::httpd::http_server_control http_server;
             http_server.start("log-engine-query").get();

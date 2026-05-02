@@ -6,6 +6,7 @@
 #include <chrono>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 
 #include "log_engine/config.hh"
 #include "log_engine/log_layout.hh"
@@ -25,6 +26,15 @@ struct RecoveryState {
     std::string tail_buffer;
 };
 
+struct LogManagerStats {
+    std::uint64_t rotate_operations = 0;
+    std::uint64_t checkpoint_write_successes = 0;
+    std::uint64_t checkpoint_write_failures = 0;
+    std::uint64_t recovery_fallbacks = 0;
+    std::uint64_t gzip_archive_successes = 0;
+    std::uint64_t gzip_archive_failures = 0;
+};
+
 class LogManager {
 public:
     seastar::future<> prepare(const EngineConfig& config);
@@ -40,5 +50,10 @@ private:
     static void cleanup_archives(const EngineConfig& config, unsigned shard_id);
     static void gzip_file(const std::string& path);
 };
+
+LogManagerStats get_log_manager_stats() noexcept;
+void reset_log_manager_stats() noexcept;
+void register_log_manager_metrics();
+void unregister_log_manager_metrics() noexcept;
 
 }  // namespace log_engine

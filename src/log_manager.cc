@@ -2,15 +2,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <zlib.h>
 
+#include <seastar/core/metrics.hh>
 #include <seastar/core/thread.hh>
 
 #include "log_engine/log_layout.hh"
@@ -19,6 +22,14 @@
 namespace log_engine {
 
 namespace {
+
+std::atomic<std::uint64_t> g_rotate_operations{0};
+std::atomic<std::uint64_t> g_checkpoint_write_successes{0};
+std::atomic<std::uint64_t> g_checkpoint_write_failures{0};
+std::atomic<std::uint64_t> g_recovery_fallbacks{0};
+std::atomic<std::uint64_t> g_gzip_archive_successes{0};
+std::atomic<std::uint64_t> g_gzip_archive_failures{0};
+std::unique_ptr<seastar::metrics::metric_groups> g_log_manager_metrics;
 
 std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescriptor& active_segment) {
     const auto path = layout::checkpoint_path(active_segment);
@@ -32,6 +43,9 @@ std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescrip
     }
 
     CheckpointState checkpoint;
+    bool saw_logical_size = false;
+    bool saw_sequence = false;
+    bool saw_rotation_index = false;
     std::string line;
     while (std::getline(in, line)) {
         const auto pos = line.find('=');
@@ -47,11 +61,18 @@ std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescrip
         }
         if (key == "logical_size") {
             checkpoint.logical_size = parsed;
+            saw_logical_size = true;
         } else if (key == "sequence") {
             checkpoint.sequence = parsed;
+            saw_sequence = true;
         } else if (key == "rotation_index") {
             checkpoint.rotation_index = parsed;
+            saw_rotation_index = true;
         }
+    }
+
+    if (!saw_logical_size || !saw_sequence || !saw_rotation_index) {
+        return std::nullopt;
     }
     return checkpoint;
 }
@@ -104,27 +125,40 @@ seastar::future<> LogManager::rotate_active_file(
         auto archive_path = layout::archive_log_path(config, active_segment.shard_id, epoch_ms, rotation_index, false);
         fs::rename(active, archive_path);
         if (config.compress_archives) {
-            gzip_file(archive_path);
+            try {
+                gzip_file(archive_path);
+                ++g_gzip_archive_successes;
+            } catch (...) {
+                ++g_gzip_archive_failures;
+                throw;
+            }
         }
         cleanup_archives(config, active_segment.shard_id);
+        ++g_rotate_operations;
     });
 }
 
 seastar::future<> LogManager::store_checkpoint(const layout::SegmentDescriptor& active_segment, const CheckpointState& checkpoint) {
     return seastar::async([active_segment, checkpoint] {
-        const auto final_path = layout::checkpoint_path(active_segment);
-        const auto tmp_path = final_path + ".tmp";
-        {
-            std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-            out << "logical_size=" << checkpoint.logical_size << "\n";
-            out << "sequence=" << checkpoint.sequence << "\n";
-            out << "rotation_index=" << checkpoint.rotation_index << "\n";
-            out.flush();
-            if (!out.good()) {
-                throw std::runtime_error("failed to write checkpoint");
+        try {
+            const auto final_path = layout::checkpoint_path(active_segment);
+            const auto tmp_path = final_path + ".tmp";
+            {
+                std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+                out << "logical_size=" << checkpoint.logical_size << "\n";
+                out << "sequence=" << checkpoint.sequence << "\n";
+                out << "rotation_index=" << checkpoint.rotation_index << "\n";
+                out.flush();
+                if (!out.good()) {
+                    throw std::runtime_error("failed to write checkpoint");
+                }
             }
+            std::filesystem::rename(tmp_path, final_path);
+            ++g_checkpoint_write_successes;
+        } catch (...) {
+            ++g_checkpoint_write_failures;
+            throw;
         }
-        std::filesystem::rename(tmp_path, final_path);
     });
 }
 
@@ -148,13 +182,14 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
         auto sequence = verified.next_sequence;
         auto rotation_index = std::uint64_t{0};
 
+        const auto checkpoint_path = layout::checkpoint_path(active_segment);
+        const bool checkpoint_file_exists = fs::exists(checkpoint_path);
         const auto checkpoint = read_checkpoint_file(active_segment);
-        if (checkpoint) {
-            valid_size = std::min(valid_size, checkpoint->logical_size);
-            if (checkpoint->logical_size <= verified.valid_size) {
-                sequence = checkpoint->sequence;
-                rotation_index = checkpoint->rotation_index;
-            }
+        if (checkpoint && checkpoint->logical_size == verified.valid_size) {
+            sequence = checkpoint->sequence;
+            rotation_index = checkpoint->rotation_index;
+        } else if (checkpoint_file_exists) {
+            ++g_recovery_fallbacks;
         }
 
         recovery.logical_size = valid_size;
@@ -203,29 +238,102 @@ void LogManager::cleanup_archives(const EngineConfig& config, unsigned shard_id)
 void LogManager::gzip_file(const std::string& path) {
     namespace fs = std::filesystem;
     const auto gz_path = path + ".gz";
+    const auto tmp_gz_path = gz_path + ".tmp";
     std::ifstream in(path, std::ios::binary);
     if (!in.good()) {
         throw std::runtime_error("failed to open archive for gzip: " + path);
     }
-    gzFile out = gzopen(gz_path.c_str(), "wb");
+    gzFile out = gzopen(tmp_gz_path.c_str(), "wb");
     if (!out) {
-        throw std::runtime_error("failed to open gzip output: " + gz_path);
+        throw std::runtime_error("failed to open gzip output: " + tmp_gz_path);
     }
 
-    std::array<char, 64 * 1024> buffer{};
-    while (in.good()) {
-        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const auto bytes = in.gcount();
-        if (bytes <= 0) {
-            break;
+    try {
+        std::array<char, 64 * 1024> buffer{};
+        while (in.good()) {
+            in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const auto bytes = in.gcount();
+            if (bytes <= 0) {
+                break;
+            }
+            if (gzwrite(out, buffer.data(), static_cast<unsigned>(bytes)) == 0) {
+                throw std::runtime_error("gzwrite failed for: " + tmp_gz_path);
+            }
         }
-        if (gzwrite(out, buffer.data(), static_cast<unsigned>(bytes)) == 0) {
+        if (gzclose(out) != Z_OK) {
+            out = nullptr;
+            throw std::runtime_error("gzclose failed for: " + tmp_gz_path);
+        }
+        out = nullptr;
+        fs::rename(tmp_gz_path, gz_path);
+        fs::remove(path);
+    } catch (...) {
+        if (out) {
             gzclose(out);
-            throw std::runtime_error("gzwrite failed for: " + gz_path);
         }
+        fs::remove(tmp_gz_path);
+        throw;
     }
-    gzclose(out);
-    fs::remove(path);
+}
+
+LogManagerStats get_log_manager_stats() noexcept {
+    return LogManagerStats{
+        .rotate_operations = g_rotate_operations.load(std::memory_order_relaxed),
+        .checkpoint_write_successes = g_checkpoint_write_successes.load(std::memory_order_relaxed),
+        .checkpoint_write_failures = g_checkpoint_write_failures.load(std::memory_order_relaxed),
+        .recovery_fallbacks = g_recovery_fallbacks.load(std::memory_order_relaxed),
+        .gzip_archive_successes = g_gzip_archive_successes.load(std::memory_order_relaxed),
+        .gzip_archive_failures = g_gzip_archive_failures.load(std::memory_order_relaxed),
+    };
+}
+
+void reset_log_manager_stats() noexcept {
+    g_rotate_operations.store(0, std::memory_order_relaxed);
+    g_checkpoint_write_successes.store(0, std::memory_order_relaxed);
+    g_checkpoint_write_failures.store(0, std::memory_order_relaxed);
+    g_recovery_fallbacks.store(0, std::memory_order_relaxed);
+    g_gzip_archive_successes.store(0, std::memory_order_relaxed);
+    g_gzip_archive_failures.store(0, std::memory_order_relaxed);
+}
+
+void register_log_manager_metrics() {
+    namespace sm = seastar::metrics;
+    static const sm::label component_label("component");
+    const auto component = component_label("log_manager");
+
+    if (!g_log_manager_metrics) {
+        g_log_manager_metrics = std::make_unique<sm::metric_groups>();
+    } else {
+        g_log_manager_metrics->clear();
+    }
+
+    std::vector<sm::metric_definition> definitions;
+    definitions.reserve(6);
+    definitions.push_back(sm::make_counter("rotate_operations", sm::description("Total archive rotation operations"), [] {
+            return g_rotate_operations.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("checkpoint_write_successes", sm::description("Total successful checkpoint writes"), [] {
+            return g_checkpoint_write_successes.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("checkpoint_write_failures", sm::description("Total failed checkpoint writes"), [] {
+            return g_checkpoint_write_failures.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_fallbacks", sm::description("Total recovery fallback events caused by unusable checkpoint files"), [] {
+            return g_recovery_fallbacks.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("gzip_archive_successes", sm::description("Total successful gzip archive compressions"), [] {
+            return g_gzip_archive_successes.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("gzip_archive_failures", sm::description("Total failed gzip archive compressions"), [] {
+            return g_gzip_archive_failures.load(std::memory_order_relaxed);
+        })(component));
+    g_log_manager_metrics->add_group("log_engine_log_manager", definitions);
+}
+
+void unregister_log_manager_metrics() noexcept {
+    if (g_log_manager_metrics) {
+        g_log_manager_metrics->clear();
+    }
 }
 
 }  // namespace log_engine
