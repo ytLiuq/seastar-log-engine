@@ -8,6 +8,37 @@
 
 namespace log_engine {
 
+enum class CrcClass {
+    none,    // No CRC (maximum throughput)
+    header,  // CRC over metadata fields only (not payload)
+    full,    // CRC over entire record body (maximum integrity, current default)
+};
+
+inline const char* crc_class_to_string(CrcClass value) noexcept {
+    switch (value) {
+    case CrcClass::none:
+        return "none";
+    case CrcClass::header:
+        return "header";
+    case CrcClass::full:
+        return "full";
+    }
+    return "full";
+}
+
+inline CrcClass parse_crc_class(std::string_view value) {
+    if (value == "none" || value == "0") {
+        return CrcClass::none;
+    }
+    if (value == "header" || value == "1") {
+        return CrcClass::header;
+    }
+    if (value == "full" || value == "2") {
+        return CrcClass::full;
+    }
+    throw std::invalid_argument("crc_class must be none, header, or full");
+}
+
 enum class AckMode {
     write_ack,
     sync_ack,
@@ -82,6 +113,7 @@ struct EngineConfig {
     bool compress_archives = false;
     bool use_dsync = false;
     bool record_crc_enabled = false;
+    CrcClass record_crc_class = CrcClass::full;
     bool record_timestamp_enabled = false;
     bool record_level_enabled = false;
     bool record_shard_id_enabled = false;

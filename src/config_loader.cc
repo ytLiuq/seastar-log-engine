@@ -126,6 +126,7 @@ EngineConfig apply_engine_config_overrides(
     base.compress_archives = resolve_bool_option(cli, file_values, "compress-archives", base.compress_archives);
     base.use_dsync = resolve_bool_option(cli, file_values, "dsync", base.use_dsync);
     base.record_crc_enabled = resolve_bool_option(cli, file_values, "record-crc-enabled", base.record_crc_enabled);
+    base.record_crc_class = resolve_crc_class_option(cli, file_values, "record-crc-class", base.record_crc_class);
     base.record_timestamp_enabled = resolve_bool_option(cli, file_values, "record-timestamp-enabled", base.record_timestamp_enabled);
     base.record_level_enabled = resolve_bool_option(cli, file_values, "record-level-enabled", base.record_level_enabled);
     base.record_shard_id_enabled = resolve_bool_option(cli, file_values, "record-shard-id-enabled", base.record_shard_id_enabled);
@@ -197,6 +198,17 @@ RoutingStrategy resolve_routing_strategy_option(
         return current_value;
     }
     return parse_routing_strategy_option(file_values.at(name), name.c_str());
+}
+
+CrcClass resolve_crc_class_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    CrcClass current_value) {
+    if (!should_take_file_value(cli, name, file_values)) {
+        return current_value;
+    }
+    return parse_crc_class(file_values.at(name));
 }
 
 }  // namespace log_engine

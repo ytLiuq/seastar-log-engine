@@ -47,5 +47,10 @@ RoutingStrategy resolve_routing_strategy_option(
     const ConfigMap& file_values,
     const std::string& name,
     RoutingStrategy current_value);
+CrcClass resolve_crc_class_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    CrcClass current_value);
 
 }  // namespace log_engine

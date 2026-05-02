@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
         ("compress-archives", bpo::value<bool>()->default_value(false), "Compress rotated archives with gzip")
         ("dsync", bpo::value<bool>()->default_value(false), "Enable O_DSYNC when opening shard files")
         ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
+        ("record-crc-class", bpo::value<std::string>()->default_value("full"), "CRC coverage: none, header, or full")
         ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
         ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
         ("record-shard-id-enabled", bpo::value<bool>()->default_value(false), "Include shard= field in each record")
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
         base.compress_archives = app.configuration()["compress-archives"].as<bool>();
         base.use_dsync = app.configuration()["dsync"].as<bool>();
         base.record_crc_enabled = app.configuration()["record-crc-enabled"].as<bool>();
+        base.record_crc_class = log_engine::parse_crc_class(app.configuration()["record-crc-class"].as<std::string>());
         base.record_timestamp_enabled = app.configuration()["record-timestamp-enabled"].as<bool>();
         base.record_level_enabled = app.configuration()["record-level-enabled"].as<bool>();
         base.record_shard_id_enabled = app.configuration()["record-shard-id-enabled"].as<bool>();
