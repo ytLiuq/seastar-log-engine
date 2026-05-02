@@ -33,6 +33,8 @@ struct LogManagerStats {
     std::uint64_t recovery_fallbacks = 0;
     std::uint64_t gzip_archive_successes = 0;
     std::uint64_t gzip_archive_failures = 0;
+    std::uint64_t recovery_fallback_incomplete_checkpoint = 0;
+    std::uint64_t recovery_fallback_stale_checkpoint = 0;
 };
 
 class LogManager {

@@ -15,6 +15,7 @@
 
 #include <seastar/core/metrics.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/util/log.hh>
 
 #include "log_engine/health_monitor.hh"
 #include "log_engine/log_layout.hh"
@@ -24,12 +25,16 @@ namespace log_engine {
 
 namespace {
 
+seastar::logger mgrlog("log-manager");
+
 std::atomic<std::uint64_t> g_rotate_operations{0};
 std::atomic<std::uint64_t> g_checkpoint_write_successes{0};
 std::atomic<std::uint64_t> g_checkpoint_write_failures{0};
 std::atomic<std::uint64_t> g_recovery_fallbacks{0};
 std::atomic<std::uint64_t> g_gzip_archive_successes{0};
 std::atomic<std::uint64_t> g_gzip_archive_failures{0};
+std::atomic<std::uint64_t> g_recovery_fallback_incomplete_checkpoint{0};
+std::atomic<std::uint64_t> g_recovery_fallback_stale_checkpoint{0};
 std::unique_ptr<seastar::metrics::metric_groups> g_log_manager_metrics;
 
 std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescriptor& active_segment) {
@@ -194,6 +199,13 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
         } else if (checkpoint_file_exists) {
             ++g_recovery_fallbacks;
             record_recovery_fallback();
+            if (!checkpoint) {
+                ++g_recovery_fallback_incomplete_checkpoint;
+                mgrlog.warn("recovery fallback: checkpoint file {} exists but is incomplete or truncated", checkpoint_path);
+            } else {
+                ++g_recovery_fallback_stale_checkpoint;
+                mgrlog.warn("recovery fallback: checkpoint logical_size={} does not match verified active log size={}", checkpoint->logical_size, verified.valid_size);
+            }
         }
 
         recovery.logical_size = valid_size;
@@ -288,6 +300,8 @@ LogManagerStats get_log_manager_stats() noexcept {
         .recovery_fallbacks = g_recovery_fallbacks.load(std::memory_order_relaxed),
         .gzip_archive_successes = g_gzip_archive_successes.load(std::memory_order_relaxed),
         .gzip_archive_failures = g_gzip_archive_failures.load(std::memory_order_relaxed),
+        .recovery_fallback_incomplete_checkpoint = g_recovery_fallback_incomplete_checkpoint.load(std::memory_order_relaxed),
+        .recovery_fallback_stale_checkpoint = g_recovery_fallback_stale_checkpoint.load(std::memory_order_relaxed),
     };
 }
 
@@ -298,6 +312,8 @@ void reset_log_manager_stats() noexcept {
     g_recovery_fallbacks.store(0, std::memory_order_relaxed);
     g_gzip_archive_successes.store(0, std::memory_order_relaxed);
     g_gzip_archive_failures.store(0, std::memory_order_relaxed);
+    g_recovery_fallback_incomplete_checkpoint.store(0, std::memory_order_relaxed);
+    g_recovery_fallback_stale_checkpoint.store(0, std::memory_order_relaxed);
 }
 
 void register_log_manager_metrics() {
@@ -312,7 +328,7 @@ void register_log_manager_metrics() {
     }
 
     std::vector<sm::metric_definition> definitions;
-    definitions.reserve(6);
+    definitions.reserve(8);
     definitions.push_back(sm::make_counter("rotate_operations", sm::description("Total archive rotation operations"), [] {
             return g_rotate_operations.load(std::memory_order_relaxed);
         })(component));
@@ -330,6 +346,12 @@ void register_log_manager_metrics() {
         })(component));
     definitions.push_back(sm::make_counter("gzip_archive_failures", sm::description("Total failed gzip archive compressions"), [] {
             return g_gzip_archive_failures.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_fallback_incomplete_checkpoint", sm::description("Recovery fallbacks caused by incomplete or truncated checkpoint files"), [] {
+            return g_recovery_fallback_incomplete_checkpoint.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_fallback_stale_checkpoint", sm::description("Recovery fallbacks caused by checkpoint files with size mismatch"), [] {
+            return g_recovery_fallback_stale_checkpoint.load(std::memory_order_relaxed);
         })(component));
     g_log_manager_metrics->add_group("log_engine_log_manager", definitions);
 }

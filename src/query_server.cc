@@ -120,7 +120,7 @@ struct QueryContext {
         const auto health_snapshot = log_engine::collect_health_snapshot();
         const auto health = log_engine::compute_health_status(health_snapshot);
         return fmt::format(
-            "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}",
+            "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_fallback_incomplete_checkpoint\":{},\"recovery_fallback_stale_checkpoint\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}",
             log_engine::health_status_to_string(health),
             log_engine::routing_strategy_to_string(router.strategy()),
             routing_shards,
@@ -140,6 +140,8 @@ struct QueryContext {
             log_manager_stats.checkpoint_write_successes,
             log_manager_stats.checkpoint_write_failures,
             log_manager_stats.recovery_fallbacks,
+            log_manager_stats.recovery_fallback_incomplete_checkpoint,
+            log_manager_stats.recovery_fallback_stale_checkpoint,
             log_manager_stats.gzip_archive_successes,
             log_manager_stats.gzip_archive_failures,
             health_snapshot.reader_corrupted_segments_recent,
@@ -208,6 +210,8 @@ struct QueryContext {
         reply->set_log_manager_checkpoint_write_successes(log_manager_stats.checkpoint_write_successes);
         reply->set_log_manager_checkpoint_write_failures(log_manager_stats.checkpoint_write_failures);
         reply->set_log_manager_recovery_fallbacks(log_manager_stats.recovery_fallbacks);
+        reply->set_log_manager_recovery_fallback_incomplete_checkpoint(log_manager_stats.recovery_fallback_incomplete_checkpoint);
+        reply->set_log_manager_recovery_fallback_stale_checkpoint(log_manager_stats.recovery_fallback_stale_checkpoint);
         reply->set_log_manager_gzip_archive_successes(log_manager_stats.gzip_archive_successes);
         reply->set_log_manager_gzip_archive_failures(log_manager_stats.gzip_archive_failures);
         reply->set_health_reader_corrupted_segments_recent(health_snapshot.reader_corrupted_segments_recent);

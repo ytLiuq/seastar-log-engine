@@ -21,7 +21,7 @@ using logengine::query::v1::StatusReply;
 
 void print_status(const StatusReply& reply) {
     fmt::print(
-        "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}\n",
+        "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_fallback_incomplete_checkpoint\":{},\"recovery_fallback_stale_checkpoint\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}\n",
         reply.health(),
         reply.routing_strategy(),
         reply.routing_shards(),
@@ -41,6 +41,8 @@ void print_status(const StatusReply& reply) {
         reply.log_manager_checkpoint_write_successes(),
         reply.log_manager_checkpoint_write_failures(),
         reply.log_manager_recovery_fallbacks(),
+        reply.log_manager_recovery_fallback_incomplete_checkpoint(),
+        reply.log_manager_recovery_fallback_stale_checkpoint(),
         reply.log_manager_gzip_archive_successes(),
         reply.log_manager_gzip_archive_failures(),
         reply.health_reader_corrupted_segments_recent(),
