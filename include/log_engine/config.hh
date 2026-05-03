@@ -11,6 +11,7 @@ namespace log_engine {
 enum class CrcClass {
     none,    // No CRC (maximum throughput)
     header,  // CRC over metadata fields only (not payload)
+    payload_hash,  // CRC over metadata + 64-bit payload hash
     full,    // CRC over entire record body (maximum integrity, current default)
 };
 
@@ -20,6 +21,8 @@ inline const char* crc_class_to_string(CrcClass value) noexcept {
         return "none";
     case CrcClass::header:
         return "header";
+    case CrcClass::payload_hash:
+        return "payload_hash";
     case CrcClass::full:
         return "full";
     }
@@ -33,10 +36,13 @@ inline CrcClass parse_crc_class(std::string_view value) {
     if (value == "header" || value == "1") {
         return CrcClass::header;
     }
-    if (value == "full" || value == "2") {
+    if (value == "payload_hash" || value == "payload-hash" || value == "hash" || value == "2") {
+        return CrcClass::payload_hash;
+    }
+    if (value == "full" || value == "3") {
         return CrcClass::full;
     }
-    throw std::invalid_argument("crc_class must be none, header, or full");
+    throw std::invalid_argument("crc_class must be none, header, payload_hash, or full");
 }
 
 enum class AckMode {

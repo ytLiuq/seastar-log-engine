@@ -1,0 +1,5 @@
+INFO  2026-05-02 16:50:39,593 seastar - Reactor backend: linux-aio
+INFO  2026-05-02 16:50:39,593 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+INFO  2026-05-02 16:50:39,594 [shard 0:main] io - IO queue was unable to find a suitable maximum request length, the search was cut-off early at: 16MB
+INFO  2026-05-02 16:50:39,594 [shard 0:main] io - IO queue was unable to find a suitable maximum request length, the search was cut-off early at: 16MB
+messages=30000 elapsed_us=907533 throughput_msg_per_sec=33056.65 avg_submit_us=30.4122 p50_submit_us=3.0000 p95_submit_us=4.0000 p99_submit_us=19.0000

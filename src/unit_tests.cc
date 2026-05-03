@@ -144,6 +144,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
         out << "rotate-interval-seconds=9\n";
         out << "compress-archives=false\n";
         out << "record-crc-enabled=false\n";
+        out << "record-crc-class=payload_hash\n";
         out << "record-sequence-enabled=true\n";
     }
 
@@ -160,6 +161,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     require(config.rotate_interval_seconds == 9, "config loader should override rotate interval");
     require(config.compress_archives == false, "config loader should override compress_archives");
     require(config.record_crc_enabled == false, "config loader should override record_crc_enabled");
+    require(config.record_crc_class == log_engine::CrcClass::payload_hash, "config loader should override record_crc_class");
     require(config.record_sequence_enabled == true, "config loader should override record_sequence_enabled");
     co_return;
 }
@@ -312,6 +314,45 @@ seastar::future<> test_unified_large_payload_blocks(const std::string& root_dir)
     require(records[0].payload == payload_a, "first unified writer record payload mismatch");
     require(records[1].payload == payload_b, "second unified writer record payload mismatch");
     require(records[2].payload == payload_c, "third unified writer record payload mismatch");
+    co_return;
+}
+
+seastar::future<> test_append_batch_routes_and_persists(const std::string& root_dir) {
+    const auto log_dir = (fs::path(root_dir) / "append-batch-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "append-batch-archive").string();
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 16;
+    config.record_sequence_enabled = true;
+
+    std::vector<log_engine::LogMessage> batch;
+    batch.push_back({.level = log_engine::LogLevel::info, .payload = "batch-a", .route_key = "route-a"});
+    batch.push_back({.level = log_engine::LogLevel::warn, .payload = "batch-b", .route_key = "route-b"});
+    batch.push_back({.level = log_engine::LogLevel::error, .payload = "batch-c", .route_key = "route-a"});
+    batch.push_back({.level = log_engine::LogLevel::info, .payload = "batch-d", .route_key = "route-c"});
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    co_await engine.append_batch(std::move(batch));
+    co_await engine.stop();
+
+    const auto records = read_back_records(config, false, 16);
+    require(records.size() == 4, "append_batch should persist all batched records");
+    bool found_a = false;
+    bool found_b = false;
+    bool found_c = false;
+    bool found_d = false;
+    for (const auto& record : records) {
+        found_a = found_a || record.payload == "batch-a";
+        found_b = found_b || record.payload == "batch-b";
+        found_c = found_c || record.payload == "batch-c";
+        found_d = found_d || record.payload == "batch-d";
+    }
+    require(found_a && found_b && found_c && found_d, "append_batch should preserve every payload");
     co_return;
 }
 
@@ -519,6 +560,47 @@ seastar::future<> test_reader_skips_broken_gzip_archive(const std::string& root_
     co_return;
 }
 
+seastar::future<> test_reader_skips_segment_removed_after_enumeration(const std::string& root_dir) {
+    log_engine::reset_reader_stats();
+    const auto log_dir = (fs::path(root_dir) / "removed-segment-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "removed-segment-archive").string();
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+
+    const auto archive_path = log_engine::layout::archive_log_path(config, 0, 4455667788, 1, false);
+    const auto active_path = log_engine::layout::active_log_path(config, 0);
+
+    {
+        std::ofstream out(archive_path, std::ios::binary | std::ios::trunc);
+        out << log_engine::encode_record(config, 0, 0, log_engine::LogLevel::info, "", "archive-to-be-removed");
+    }
+    {
+        std::ofstream out(active_path, std::ios::binary | std::ios::trunc);
+        out << log_engine::encode_record(config, 0, 1, log_engine::LogLevel::info, "", "active-still-readable");
+    }
+
+    log_engine::ReadQuery query;
+    query.include_archive = true;
+    query.limit = 10;
+    auto segments = log_engine::collect_segments(config, query);
+    require(segments.size() == 2, "removed segment test should enumerate archive and active segments");
+
+    fs::remove(archive_path);
+
+    const auto records = log_engine::read_records(segments, query);
+    require(records.size() == 1, "removed segment test should keep only one active record");
+    require(records.front().payload == "active-still-readable", "removed segment test should preserve active record");
+    const auto stats = log_engine::get_reader_stats();
+    require(stats.corrupted_segments == 0, "removed segment test should not count missing files as corrupted segments");
+    require(stats.corrupted_lines == 0, "removed segment test should not count missing files as corrupted lines");
+    require(stats.gzip_read_errors == 0, "removed segment test should not count missing files as gzip errors");
+    co_return;
+}
+
 seastar::future<> test_recovery_scan(const std::string& root_dir) {
     const auto log_dir = (fs::path(root_dir) / "recovery-logs").string();
     const auto archive_dir = (fs::path(root_dir) / "recovery-archive").string();
@@ -715,6 +797,37 @@ seastar::future<> test_recovery_after_rotate(
     co_return;
 }
 
+seastar::future<> test_prepare_cleans_temporary_sidecars(const std::string& root_dir) {
+    const auto log_dir = (fs::path(root_dir) / "tmp-sidecar-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "tmp-sidecar-archive").string();
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.rotate_size_bytes = 128;
+    config.compress_archives = true;
+
+    const auto checkpoint_tmp = fs::path(log_dir) / "shard-0.log.checkpoint.tmp";
+    const auto gzip_tmp = fs::path(archive_dir) / "shard-0.123.1.log.gz.tmp";
+    {
+        std::ofstream out(checkpoint_tmp, std::ios::binary | std::ios::trunc);
+        out << "partial checkpoint";
+    }
+    {
+        std::ofstream out(gzip_tmp, std::ios::binary | std::ios::trunc);
+        out << "partial gzip";
+    }
+
+    log_engine::LogManager manager;
+    co_await manager.prepare(config);
+
+    require(!fs::exists(checkpoint_tmp), "prepare should remove checkpoint.tmp leftovers");
+    require(!fs::exists(gzip_tmp), "prepare should remove gz.tmp leftovers");
+    co_return;
+}
+
 }  // namespace
 
 seastar::future<> test_crc_class_roundtrip();
@@ -736,10 +849,12 @@ int main(int argc, char** argv) {
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);
         co_await test_unified_large_payload_blocks(root_dir);
+        co_await test_append_batch_routes_and_persists(root_dir);
         co_await test_time_rotation_and_archive_read(root_dir);
         co_await test_archive_duplicate_prefers_plain_log(root_dir);
         co_await test_reader_stops_after_corrupted_segment_line(root_dir);
         co_await test_reader_skips_broken_gzip_archive(root_dir);
+        co_await test_reader_skips_segment_removed_after_enumeration(root_dir);
         co_await test_recovery_scan(root_dir);
         co_await test_partial_checkpoint_ignored(root_dir);
         co_await test_stale_checkpoint_ignored(root_dir);
@@ -747,6 +862,7 @@ int main(int argc, char** argv) {
         co_await test_recovery_after_rotate(root_dir, true, false);
         co_await test_recovery_after_rotate(root_dir, false, true);
         co_await test_recovery_after_rotate(root_dir, true, true);
+        co_await test_prepare_cleans_temporary_sidecars(root_dir);
         co_await test_crc_class_roundtrip();
         co_await test_crash_during_write_recovery(root_dir);
         co_await test_checkpoint_clean_shutdown_restore(root_dir);
@@ -816,6 +932,22 @@ seastar::future<> test_crc_class_roundtrip() {
         require(parsed.has_value(), "CRC class full record should be parseable");
     }
 
+    // Test CRC class=payload_hash: payload hash plus metadata CRC
+    {
+        log_engine::EngineConfig config;
+        config.record_crc_enabled = true;
+        config.record_crc_class = CrcClass::payload_hash;
+        config.record_timestamp_enabled = true;
+        config.record_sequence_enabled = true;
+
+        auto buffer = log_engine::encode_record_buffer(config, 0, 5, log_engine::LogLevel::info, timestamp, payload);
+        std::string_view line(buffer.get(), buffer.size() - 1);
+        require(line.rfind("crc=x:", 0) == 0, "CRC class payload_hash should emit crc=x: prefix");
+        require(log_engine::verify_record_line(line), "CRC class payload_hash should pass verification");
+        const auto parsed = log_engine::parse_record_line(line);
+        require(parsed.has_value(), "CRC class payload_hash record should be parseable");
+    }
+
     // Test that header-only CRC detects payload corruption (false negative check)
     {
         log_engine::EngineConfig config;
@@ -852,6 +984,24 @@ seastar::future<> test_crc_class_roundtrip() {
 
         std::string_view corrupted(line.data(), line.size() - 1);
         require(!log_engine::verify_record_line(corrupted), "CRC class full should detect payload corruption");
+    }
+
+    // Test that payload-hash CRC detects payload corruption
+    {
+        log_engine::EngineConfig config;
+        config.record_crc_enabled = true;
+        config.record_crc_class = CrcClass::payload_hash;
+        config.record_timestamp_enabled = true;
+
+        auto buffer = log_engine::encode_record_buffer(config, 0, 6, log_engine::LogLevel::info, timestamp, payload);
+        std::string line(buffer.get(), buffer.size());
+
+        auto payload_pos = line.find("payload=");
+        require(payload_pos != std::string::npos, "should find payload field");
+        line[payload_pos + 10] = 'Q';
+
+        std::string_view corrupted(line.data(), line.size() - 1);
+        require(!log_engine::verify_record_line(corrupted), "CRC class payload_hash should detect payload corruption");
     }
 
     co_return;

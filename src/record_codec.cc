@@ -34,6 +34,11 @@ constexpr std::array<std::array<std::uint32_t, 256>, 8> make_crc32_tables() {
 
 constexpr auto crc32_tables = make_crc32_tables();
 constexpr char hex_digits[] = "0123456789abcdef";
+constexpr std::uint64_t xxh64_prime1 = 11400714785074694791ULL;
+constexpr std::uint64_t xxh64_prime2 = 14029467366897019727ULL;
+constexpr std::uint64_t xxh64_prime3 = 1609587929392839161ULL;
+constexpr std::uint64_t xxh64_prime4 = 9650029242287828579ULL;
+constexpr std::uint64_t xxh64_prime5 = 2870177450012600261ULL;
 
 std::uint32_t crc32_update(std::uint32_t value, std::string_view data) noexcept {
     const auto* current = reinterpret_cast<const unsigned char*>(data.data());
@@ -76,6 +81,100 @@ std::uint32_t crc32_update(std::uint32_t value, std::string_view data) noexcept 
 
 std::uint32_t crc32_update_byte(std::uint32_t value, char ch) noexcept {
     return crc32_tables[0][(value ^ static_cast<unsigned char>(ch)) & 0xffU] ^ (value >> 8U);
+}
+
+std::uint64_t rotl64(std::uint64_t value, unsigned count) noexcept {
+    return (value << count) | (value >> (64U - count));
+}
+
+std::uint64_t read_u64_le(const void* ptr) noexcept {
+    std::uint64_t value = 0;
+    std::memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+std::uint32_t read_u32_le(const void* ptr) noexcept {
+    std::uint32_t value = 0;
+    std::memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
+std::uint64_t xxh64_round(std::uint64_t acc, std::uint64_t input) noexcept {
+    acc += input * xxh64_prime2;
+    acc = rotl64(acc, 31);
+    acc *= xxh64_prime1;
+    return acc;
+}
+
+std::uint64_t xxh64_merge_round(std::uint64_t acc, std::uint64_t val) noexcept {
+    acc ^= xxh64_round(0, val);
+    acc = acc * xxh64_prime1 + xxh64_prime4;
+    return acc;
+}
+
+std::uint64_t xxh64_avalanche(std::uint64_t hash) noexcept {
+    hash ^= hash >> 33U;
+    hash *= xxh64_prime2;
+    hash ^= hash >> 29U;
+    hash *= xxh64_prime3;
+    hash ^= hash >> 32U;
+    return hash;
+}
+
+std::uint64_t xxh64(std::string_view data, std::uint64_t seed = 0) noexcept {
+    const auto* current = reinterpret_cast<const unsigned char*>(data.data());
+    const auto* const end = current + data.size();
+    std::uint64_t hash = 0;
+
+    if (data.size() >= 32) {
+        std::uint64_t v1 = seed + xxh64_prime1 + xxh64_prime2;
+        std::uint64_t v2 = seed + xxh64_prime2;
+        std::uint64_t v3 = seed;
+        std::uint64_t v4 = seed - xxh64_prime1;
+
+        const auto* const limit = end - 32;
+        do {
+            v1 = xxh64_round(v1, read_u64_le(current));
+            current += 8;
+            v2 = xxh64_round(v2, read_u64_le(current));
+            current += 8;
+            v3 = xxh64_round(v3, read_u64_le(current));
+            current += 8;
+            v4 = xxh64_round(v4, read_u64_le(current));
+            current += 8;
+        } while (current <= limit);
+
+        hash = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        hash = xxh64_merge_round(hash, v1);
+        hash = xxh64_merge_round(hash, v2);
+        hash = xxh64_merge_round(hash, v3);
+        hash = xxh64_merge_round(hash, v4);
+    } else {
+        hash = seed + xxh64_prime5;
+    }
+
+    hash += data.size();
+
+    while (current + 8 <= end) {
+        const auto k1 = xxh64_round(0, read_u64_le(current));
+        hash ^= k1;
+        hash = rotl64(hash, 27) * xxh64_prime1 + xxh64_prime4;
+        current += 8;
+    }
+
+    if (current + 4 <= end) {
+        hash ^= static_cast<std::uint64_t>(read_u32_le(current)) * xxh64_prime1;
+        hash = rotl64(hash, 23) * xxh64_prime2 + xxh64_prime3;
+        current += 4;
+    }
+
+    while (current < end) {
+        hash ^= static_cast<std::uint64_t>(*current) * xxh64_prime5;
+        hash = rotl64(hash, 11) * xxh64_prime1;
+        ++current;
+    }
+
+    return xxh64_avalanche(hash);
 }
 
 std::optional<std::uint32_t> parse_crc_hex(std::string_view input) {
@@ -171,6 +270,22 @@ char* append_decimal(char* out, std::uint64_t value, std::uint32_t* crc) {
     return result.ptr;
 }
 
+char* append_hex32(char* out, std::uint32_t value) noexcept {
+    for (int i = 7; i >= 0; --i) {
+        out[i] = hex_digits[value & 0xfU];
+        value >>= 4U;
+    }
+    return out + 8;
+}
+
+char* append_hex64(char* out, std::uint64_t value) noexcept {
+    for (int i = 15; i >= 0; --i) {
+        out[i] = hex_digits[value & 0xfU];
+        value >>= 4U;
+    }
+    return out + 16;
+}
+
 char* append_field_prefix(char* out, bool& first, std::string_view key, std::uint32_t* crc = nullptr) noexcept {
     if (!first) {
         *out++ = '\t';
@@ -183,31 +298,97 @@ char* append_field_prefix(char* out, bool& first, std::string_view key, std::uin
     return append_literal(out, key, crc);
 }
 
-void write_crc_prefix(char* out, std::uint32_t crc, bool header_only) noexcept {
+void write_crc_prefix(char* out, std::uint32_t crc, CrcClass crc_class, std::uint64_t payload_hash = 0) noexcept {
     out[0] = 'c';
     out[1] = 'r';
     out[2] = 'c';
-    if (header_only) {
-        out[3] = '=';
+    out[3] = '=';
+    switch (crc_class) {
+    case CrcClass::header:
         out[4] = 'h';
         out[5] = ':';
-        for (int i = 0; i < 8; ++i) {
-            out[13 - i] = hex_digits[crc & 0xfU];
-            crc >>= 4U;
-        }
+        append_hex32(out + 6, crc);
         out[14] = '\t';
-    } else {
-        out[3] = '=';
-        for (int i = 0; i < 8; ++i) {
-            out[11 - i] = hex_digits[crc & 0xfU];
-            crc >>= 4U;
-        }
+        return;
+    case CrcClass::payload_hash:
+        out[4] = 'x';
+        out[5] = ':';
+        append_hex32(out + 6, crc);
+        out[14] = ':';
+        append_hex64(out + 15, payload_hash);
+        out[31] = '\t';
+        return;
+    case CrcClass::full:
+        append_hex32(out + 4, crc);
         out[12] = '\t';
+        return;
+    case CrcClass::none:
+        return;
     }
 }
 
-std::size_t crc_prefix_size(bool header_only) noexcept {
-    return header_only ? 15 : 13;
+std::size_t crc_prefix_size(CrcClass crc_class) noexcept {
+    switch (crc_class) {
+    case CrcClass::header:
+        return 15;
+    case CrcClass::payload_hash:
+        return 32;
+    case CrcClass::full:
+        return 13;
+    case CrcClass::none:
+        return 0;
+    }
+    return 0;
+}
+
+struct PayloadFieldView {
+    std::string_view metadata;
+    std::string_view payload;
+};
+
+std::optional<PayloadFieldView> split_payload_field(std::string_view body) noexcept {
+    constexpr std::string_view payload_key = "payload=";
+    if (body.rfind(payload_key, 0) == 0) {
+        return PayloadFieldView{
+            .metadata = std::string_view(),
+            .payload = body.substr(payload_key.size()),
+        };
+    }
+    const auto payload_pos = body.find("\tpayload=");
+    if (payload_pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    return PayloadFieldView{
+        .metadata = body.substr(0, payload_pos),
+        .payload = body.substr(payload_pos + 9),
+    };
+}
+
+std::optional<std::pair<std::uint32_t, std::uint64_t>> parse_hash_crc_prefix(std::string_view line) {
+    constexpr std::string_view hash_prefix = "crc=x:";
+    if (line.rfind(hash_prefix, 0) != 0) {
+        return std::nullopt;
+    }
+    const auto tab = line.find('\t');
+    if (tab == std::string_view::npos || tab <= hash_prefix.size()) {
+        return std::nullopt;
+    }
+    const auto encoded = line.substr(hash_prefix.size(), tab - hash_prefix.size());
+    const auto sep = encoded.find(':');
+    if (sep == std::string_view::npos || sep == 0 || sep + 1 >= encoded.size()) {
+        return std::nullopt;
+    }
+    const auto crc_value = parse_crc_hex(encoded.substr(0, sep));
+    if (!crc_value) {
+        return std::nullopt;
+    }
+    std::uint64_t payload_hash = 0;
+    const auto hash_text = encoded.substr(sep + 1);
+    const auto result = std::from_chars(hash_text.data(), hash_text.data() + hash_text.size(), payload_hash, 16);
+    if (result.ec != std::errc{} || result.ptr != hash_text.data() + hash_text.size()) {
+        return std::nullopt;
+    }
+    return std::make_pair(*crc_value, payload_hash);
 }
 
 }  // namespace
@@ -221,6 +402,7 @@ seastar::temporary_buffer<char> encode_record_buffer(
     std::string_view payload) {
     const bool crc_wanted = config.record_crc_enabled && config.record_crc_class != CrcClass::none;
     const bool header_only = crc_wanted && config.record_crc_class == CrcClass::header;
+    const bool payload_hash_mode = crc_wanted && config.record_crc_class == CrcClass::payload_hash;
     const bool any_structured = crc_wanted || config.record_timestamp_enabled ||
         config.record_shard_id_enabled || config.record_sequence_enabled ||
         config.record_level_enabled;
@@ -251,7 +433,7 @@ seastar::temporary_buffer<char> encode_record_buffer(
         body_estimate += 6 + level_value.size();
     }
 
-    const std::size_t prefix_size = crc_wanted ? crc_prefix_size(header_only) : 0;
+    const std::size_t prefix_size = crc_wanted ? crc_prefix_size(config.record_crc_class) : 0;
     auto buffer = seastar::temporary_buffer<char>(prefix_size + body_estimate + 1);
     auto* const base = buffer.get_write();
     char* body = base + prefix_size;
@@ -282,11 +464,19 @@ seastar::temporary_buffer<char> encode_record_buffer(
     }
 
     // Payload: for header-only CRC, exclude payload bytes from CRC computation
-    out = append_field_prefix(out, first, "payload=", header_only ? nullptr : metadata_crc_ptr);
-    out = append_sanitized_payload(out, payload, header_only ? nullptr : metadata_crc_ptr);
+    out = append_field_prefix(out, first, "payload=", (header_only || payload_hash_mode) ? nullptr : metadata_crc_ptr);
+    char* const payload_begin = out;
+    out = append_sanitized_payload(out, payload, (header_only || payload_hash_mode) ? nullptr : metadata_crc_ptr);
 
     if (crc_wanted) {
-        write_crc_prefix(base, crc ^ 0xffffffffU, header_only);
+        std::uint64_t payload_hash = 0;
+        if (payload_hash_mode) {
+            payload_hash = xxh64(std::string_view(payload_begin, static_cast<std::size_t>(out - payload_begin)));
+            std::array<char, 16> hash_hex{};
+            append_hex64(hash_hex.data(), payload_hash);
+            crc = crc32_update(crc, std::string_view(hash_hex.data(), hash_hex.size()));
+        }
+        write_crc_prefix(base, crc ^ 0xffffffffU, config.record_crc_class, payload_hash);
     }
     *out++ = '\n';
     buffer.trim(static_cast<std::size_t>(out - base));
@@ -335,6 +525,28 @@ VerifiedLogState scan_log_content(std::string_view content) {
 bool verify_record_line(std::string_view line) {
     constexpr std::string_view full_prefix = "crc=";
     constexpr std::string_view header_prefix = "crc=h:";
+    constexpr std::string_view hash_prefix = "crc=x:";
+    if (line.rfind(hash_prefix, 0) == 0) {
+        const auto parsed_prefix = parse_hash_crc_prefix(line);
+        if (!parsed_prefix) {
+            return false;
+        }
+        const auto tab = line.find('\t');
+        const auto body = line.substr(tab + 1);
+        const auto payload_view = split_payload_field(body);
+        if (!payload_view) {
+            return false;
+        }
+        const auto payload_hash = xxh64(payload_view->payload);
+        if (payload_hash != parsed_prefix->second) {
+            return false;
+        }
+        std::array<char, 16> hash_hex{};
+        append_hex64(hash_hex.data(), payload_hash);
+        auto crc = crc32(payload_view->metadata);
+        crc = crc32_update(crc ^ 0xffffffffU, std::string_view(hash_hex.data(), hash_hex.size())) ^ 0xffffffffU;
+        return parsed_prefix->first == crc;
+    }
     if (line.rfind(header_prefix, 0) == 0) {
         const auto tab = line.find('\t');
         if (tab == std::string_view::npos || tab <= header_prefix.size()) {
@@ -394,10 +606,34 @@ std::optional<std::uint64_t> extract_sequence(std::string_view line) {
 std::optional<ParsedRecord> parse_record_line(std::string_view line) {
     constexpr std::string_view full_prefix = "crc=";
     constexpr std::string_view header_prefix = "crc=h:";
+    constexpr std::string_view hash_prefix = "crc=x:";
     std::optional<std::uint32_t> encoded_crc;
     std::string_view body = line;
 
-    if (line.rfind(header_prefix, 0) == 0) {
+    if (line.rfind(hash_prefix, 0) == 0) {
+        const auto parsed_prefix = parse_hash_crc_prefix(line);
+        if (!parsed_prefix) {
+            return std::nullopt;
+        }
+        const auto tab = line.find('\t');
+        body = line.substr(tab + 1);
+        const auto payload_view = split_payload_field(body);
+        if (!payload_view) {
+            return std::nullopt;
+        }
+        const auto payload_hash = xxh64(payload_view->payload);
+        if (payload_hash != parsed_prefix->second) {
+            return std::nullopt;
+        }
+        std::array<char, 16> hash_hex{};
+        append_hex64(hash_hex.data(), payload_hash);
+        auto crc = crc32(payload_view->metadata);
+        crc = crc32_update(crc ^ 0xffffffffU, std::string_view(hash_hex.data(), hash_hex.size())) ^ 0xffffffffU;
+        if (crc != parsed_prefix->first) {
+            return std::nullopt;
+        }
+        encoded_crc = parsed_prefix->first;
+    } else if (line.rfind(header_prefix, 0) == 0) {
         const auto tab = line.find('\t');
         if (tab == std::string_view::npos || tab <= header_prefix.size()) {
             return std::nullopt;

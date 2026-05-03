@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
         ("compress-archives", bpo::value<bool>()->default_value(false), "Compress rotated archives with gzip")
         ("dsync", bpo::value<bool>()->default_value(false), "Enable O_DSYNC when opening shard files")
         ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
-        ("record-crc-class", bpo::value<std::string>()->default_value("full"), "CRC coverage: none, header, or full")
+        ("record-crc-class", bpo::value<std::string>()->default_value("full"), "CRC coverage: none, header, payload_hash, or full")
         ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
         ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
         ("record-shard-id-enabled", bpo::value<bool>()->default_value(false), "Include shard= field in each record")
