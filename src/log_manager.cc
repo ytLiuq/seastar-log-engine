@@ -35,6 +35,8 @@ std::atomic<std::uint64_t> g_gzip_archive_successes{0};
 std::atomic<std::uint64_t> g_gzip_archive_failures{0};
 std::atomic<std::uint64_t> g_recovery_fallback_incomplete_checkpoint{0};
 std::atomic<std::uint64_t> g_recovery_fallback_stale_checkpoint{0};
+std::atomic<int> g_last_recovery_fallback_reason{
+    static_cast<int>(RecoveryFallbackReason::none)};
 std::unique_ptr<seastar::metrics::metric_groups> g_log_manager_metrics;
 
 std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescriptor& active_segment) {
@@ -83,6 +85,50 @@ std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescrip
     return checkpoint;
 }
 
+void remove_file_if_exists(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+void cleanup_temporary_sidecars(const EngineConfig& config) {
+    namespace fs = std::filesystem;
+    std::size_t removed_checkpoint_tmps = 0;
+    std::size_t removed_gzip_tmps = 0;
+
+    if (fs::exists(config.log_dir)) {
+        for (const auto& entry : fs::directory_iterator(config.log_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto path = entry.path().string();
+            if (path.size() >= 15 && path.substr(path.size() - 15) == ".checkpoint.tmp") {
+                fs::remove(entry.path());
+                ++removed_checkpoint_tmps;
+            }
+        }
+    }
+
+    if (config.archive_features_enabled() && fs::exists(config.archive_dir)) {
+        for (const auto& entry : fs::directory_iterator(config.archive_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto path = entry.path().string();
+            if (path.size() >= 7 && path.substr(path.size() - 7) == ".gz.tmp") {
+                fs::remove(entry.path());
+                ++removed_gzip_tmps;
+            }
+        }
+    }
+
+    if (removed_checkpoint_tmps > 0 || removed_gzip_tmps > 0) {
+        mgrlog.warn(
+            "startup cleanup removed {} checkpoint.tmp and {} gz.tmp sidecars",
+            removed_checkpoint_tmps,
+            removed_gzip_tmps);
+    }
+}
+
 std::string read_file_to_string(const std::string& path) {
     namespace fs = std::filesystem;
     const auto file_size = fs::file_size(path);
@@ -106,12 +152,25 @@ std::string read_file_to_string(const std::string& path) {
 
 }
 
+const char* recovery_fallback_reason_to_string(RecoveryFallbackReason reason) noexcept {
+    switch (reason) {
+    case RecoveryFallbackReason::none:
+        return "none";
+    case RecoveryFallbackReason::incomplete_checkpoint:
+        return "incomplete_checkpoint";
+    case RecoveryFallbackReason::stale_checkpoint:
+        return "stale_checkpoint";
+    }
+    return "none";
+}
+
 seastar::future<> LogManager::prepare(const EngineConfig& config) {
     return seastar::async([config] {
         std::filesystem::create_directories(config.log_dir);
         if (config.archive_features_enabled()) {
             std::filesystem::create_directories(config.archive_dir);
         }
+        cleanup_temporary_sidecars(config);
     });
 }
 
@@ -163,6 +222,7 @@ seastar::future<> LogManager::store_checkpoint(const layout::SegmentDescriptor& 
             std::filesystem::rename(tmp_path, final_path);
             ++g_checkpoint_write_successes;
         } catch (...) {
+            remove_file_if_exists(layout::checkpoint_path(active_segment) + ".tmp");
             ++g_checkpoint_write_failures;
             record_checkpoint_write_failure();
             throw;
@@ -201,9 +261,15 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
             record_recovery_fallback();
             if (!checkpoint) {
                 ++g_recovery_fallback_incomplete_checkpoint;
+                g_last_recovery_fallback_reason.store(
+                    static_cast<int>(RecoveryFallbackReason::incomplete_checkpoint),
+                    std::memory_order_relaxed);
                 mgrlog.warn("recovery fallback: checkpoint file {} exists but is incomplete or truncated", checkpoint_path);
             } else {
                 ++g_recovery_fallback_stale_checkpoint;
+                g_last_recovery_fallback_reason.store(
+                    static_cast<int>(RecoveryFallbackReason::stale_checkpoint),
+                    std::memory_order_relaxed);
                 mgrlog.warn("recovery fallback: checkpoint logical_size={} does not match verified active log size={}", checkpoint->logical_size, verified.valid_size);
             }
         }
@@ -315,6 +381,11 @@ LogManagerStats get_log_manager_stats() noexcept {
     };
 }
 
+RecoveryFallbackReason get_last_recovery_fallback_reason() noexcept {
+    return static_cast<RecoveryFallbackReason>(
+        g_last_recovery_fallback_reason.load(std::memory_order_relaxed));
+}
+
 void reset_log_manager_stats() noexcept {
     g_rotate_operations.store(0, std::memory_order_relaxed);
     g_checkpoint_write_successes.store(0, std::memory_order_relaxed);
@@ -324,6 +395,9 @@ void reset_log_manager_stats() noexcept {
     g_gzip_archive_failures.store(0, std::memory_order_relaxed);
     g_recovery_fallback_incomplete_checkpoint.store(0, std::memory_order_relaxed);
     g_recovery_fallback_stale_checkpoint.store(0, std::memory_order_relaxed);
+    g_last_recovery_fallback_reason.store(
+        static_cast<int>(RecoveryFallbackReason::none),
+        std::memory_order_relaxed);
 }
 
 void register_log_manager_metrics() {

@@ -77,5 +77,6 @@
 ## Docs
 
 - 详细使用说明：[doc/README.md](doc/README.md)
-- 当前状态与 TODO：[doc/seastar-log-engine-current-status-and-todo-2026-05-01.md](doc/seastar-log-engine-current-status-and-todo-2026-05-01.md)
+- 当前状态与 TODO：[TODO.md](TODO.md)
+- 历史状态快照：[doc/seastar-log-engine-current-status-and-todo-2026-05-01.md](doc/seastar-log-engine-current-status-and-todo-2026-05-01.md)
 - 实施方案：`../docs/基于Seastar的高性能异步批量日志顺序写入引擎实施方案.md`

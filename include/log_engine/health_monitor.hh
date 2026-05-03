@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 
 #include <seastar/core/metrics_registration.hh>
 
@@ -58,9 +59,22 @@ enum class HealthStatus {
     unhealthy,
 };
 
+enum class HealthReason {
+    none,
+    checkpoint_write_failures_recent,
+    gzip_archive_failures_recent,
+    recovery_fallbacks_recent,
+    reader_gzip_read_errors_recent,
+    reader_corrupted_segments_recent,
+    reader_corrupted_lines_recent,
+};
+
 const char* health_status_to_string(HealthStatus status) noexcept;
+const char* health_reason_to_string(HealthReason reason) noexcept;
 HealthSnapshot collect_health_snapshot() noexcept;
 HealthStatus compute_health_status(const HealthSnapshot& snapshot) noexcept;
+HealthReason compute_health_reason(const HealthSnapshot& snapshot) noexcept;
+std::string_view health_reason_basis(const HealthSnapshot& snapshot) noexcept;
 
 void record_reader_corrupted_segment() noexcept;
 void record_reader_corrupted_line() noexcept;

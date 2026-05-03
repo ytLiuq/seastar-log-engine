@@ -52,8 +52,9 @@
 
 ## 当前已知未收尾项
 
-- `log_engine_query_client` 仍可能因为 `fmt` 链接缺失导致全量构建失败
-- 部分 benchmark / test 脚本还保留历史 `fast/full`、`memory_ack` 参数，需要后续继续清理
+- 长稳验证、故障注入闭环和多 shard 真实负载性能画像还在继续补齐
+- 恢复 / 归档边界语义还在继续收紧，尤其是 crash consistency 和 archive cleanup 并发行为
+- 查询链路自测依赖当前运行环境允许监听本地端口；受限 sandbox / container 里可能需要跳过 query checks
 
 ## 兼容层说明
 
@@ -178,6 +179,31 @@ curl 'http://127.0.0.1:19181/metrics'
 - `waiting_submitters`
 - `logical_size_bytes`
 
+## Reader Metrics
+
+分组名：`log_engine_reader`
+
+当前核心指标：
+
+- `segments_read`
+- `archive_segments_read`
+- `active_segments_read`
+- `records_returned`
+- `corrupted_segments`
+- `corrupted_lines`
+- `gzip_read_errors`
+
+`/v1/status` 和 `--method status` 现在也会返回：
+
+- `health`
+- `reader_stats.segments_read`
+- `reader_stats.archive_segments_read`
+- `reader_stats.active_segments_read`
+- `reader_stats.records_returned`
+- `reader_stats.corrupted_segments`
+- `reader_stats.corrupted_lines`
+- `reader_stats.gzip_read_errors`
+
 ## Benchmark 输出
 
 `log_engine_bench` 当前会输出：
@@ -206,8 +232,21 @@ curl 'http://127.0.0.1:19181/metrics'
 ./script/test_rotation.sh
 ./script/test_recovery.sh
 ./script/test_fault_injection.sh
+./script/test_soak_and_fault.sh --duration-seconds 60 --messages-per-run 1000 --restart-interval 3
 ./script/test_read.sh
 ./script/test_unit.sh
+```
+
+`script/test_soak_and_fault.sh` 当前行为：
+
+- 先按 `duration-seconds` 跑 timed soak loop
+- 循环内覆盖 write / rotate / crash+recover / query / archive reset
+- 再继续跑 bad tail / bad checkpoint / stale checkpoint / bad gzip / multi-shard recovery consistency
+
+如果当前环境不允许 query server 监听端口，可临时加：
+
+```bash
+./script/test_soak_and_fault.sh --duration-seconds 60 --skip-query-checks
 ```
 
 ## 当前最小单元测试覆盖
@@ -232,7 +271,9 @@ curl 'http://127.0.0.1:19181/metrics'
 ## 长稳 / 回归 benchmark
 
 - `script/bench_regression.sh`
-  固定回归矩阵，当前脚本本身仍有历史参数待清理
+  固定回归矩阵，当前已统一到 `write_ack / sync_ack`
+- `script/bench_soak.sh`
+  按时长循环跑单一 benchmark 场景，适合观察吞吐与尾延迟随时间的漂移
 - `script/bench_soak.sh`
   连续循环压测，按时长收集多轮结果，用来观察吞吐波动和 `P95/P99` 漂移
 - 两个脚本都会把原始结果写到 `doc/*.tsv`，把摘要写到 `doc/*.md`

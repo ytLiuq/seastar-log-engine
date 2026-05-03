@@ -101,6 +101,26 @@ const char* health_status_to_string(HealthStatus status) noexcept {
     return "ok";
 }
 
+const char* health_reason_to_string(HealthReason reason) noexcept {
+    switch (reason) {
+    case HealthReason::none:
+        return "none";
+    case HealthReason::checkpoint_write_failures_recent:
+        return "checkpoint_write_failures_recent";
+    case HealthReason::gzip_archive_failures_recent:
+        return "gzip_archive_failures_recent";
+    case HealthReason::recovery_fallbacks_recent:
+        return "recovery_fallbacks_recent";
+    case HealthReason::reader_gzip_read_errors_recent:
+        return "reader_gzip_read_errors_recent";
+    case HealthReason::reader_corrupted_segments_recent:
+        return "reader_corrupted_segments_recent";
+    case HealthReason::reader_corrupted_lines_recent:
+        return "reader_corrupted_lines_recent";
+    }
+    return "none";
+}
+
 HealthSnapshot collect_health_snapshot() noexcept {
     HealthSnapshot snapshot;
 
@@ -124,28 +144,58 @@ HealthSnapshot collect_health_snapshot() noexcept {
 }
 
 HealthStatus compute_health_status(const HealthSnapshot& s) noexcept {
-    // Unhealthy: >10 errors of any category in the recent 5-minute window
-    constexpr std::uint64_t unhealthy_threshold = 10;
-    if (s.reader_corrupted_segments_recent > unhealthy_threshold ||
-        s.reader_corrupted_lines_recent > unhealthy_threshold ||
-        s.reader_gzip_read_errors_recent > unhealthy_threshold ||
-        s.log_manager_checkpoint_failures_recent > unhealthy_threshold ||
-        s.log_manager_gzip_failures_recent > unhealthy_threshold ||
-        s.log_manager_recovery_fallbacks_recent > unhealthy_threshold) {
+    if (s.log_manager_checkpoint_failures_recent > 0 ||
+        s.log_manager_gzip_failures_recent > 0) {
         return HealthStatus::unhealthy;
     }
 
-    // Degraded: any non-zero error count in the recent window
+    if (s.log_manager_recovery_fallbacks_recent > 3 ||
+        s.reader_gzip_read_errors_recent > 3) {
+        return HealthStatus::unhealthy;
+    }
+
+    constexpr std::uint64_t unhealthy_threshold = 10;
+    if (s.reader_corrupted_segments_recent > unhealthy_threshold ||
+        s.reader_corrupted_lines_recent > unhealthy_threshold) {
+        return HealthStatus::unhealthy;
+    }
+
     if (s.reader_corrupted_segments_recent > 0 ||
         s.reader_corrupted_lines_recent > 0 ||
         s.reader_gzip_read_errors_recent > 0 ||
-        s.log_manager_checkpoint_failures_recent > 0 ||
-        s.log_manager_gzip_failures_recent > 0 ||
         s.log_manager_recovery_fallbacks_recent > 0) {
         return HealthStatus::degraded;
     }
 
     return HealthStatus::ok;
+}
+
+HealthReason compute_health_reason(const HealthSnapshot& s) noexcept {
+    if (s.log_manager_checkpoint_failures_recent > 0) {
+        return HealthReason::checkpoint_write_failures_recent;
+    }
+    if (s.log_manager_gzip_failures_recent > 0) {
+        return HealthReason::gzip_archive_failures_recent;
+    }
+    if (s.log_manager_recovery_fallbacks_recent > 0) {
+        return HealthReason::recovery_fallbacks_recent;
+    }
+    if (s.reader_gzip_read_errors_recent > 0) {
+        return HealthReason::reader_gzip_read_errors_recent;
+    }
+    if (s.reader_corrupted_segments_recent > 0) {
+        return HealthReason::reader_corrupted_segments_recent;
+    }
+    if (s.reader_corrupted_lines_recent > 0) {
+        return HealthReason::reader_corrupted_lines_recent;
+    }
+    return HealthReason::none;
+}
+
+std::string_view health_reason_basis(const HealthSnapshot& snapshot) noexcept {
+    return compute_health_reason(snapshot) == HealthReason::none
+        ? "none"
+        : "recent_window";
 }
 
 void record_reader_corrupted_segment() noexcept {

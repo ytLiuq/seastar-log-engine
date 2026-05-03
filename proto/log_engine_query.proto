@@ -34,6 +34,9 @@ message StatusReply {
   uint64 health_recovery_fallbacks_recent = 27;
   uint64 log_manager_recovery_fallback_incomplete_checkpoint = 28;
   uint64 log_manager_recovery_fallback_stale_checkpoint = 29;
+  string health_reason = 30;
+  string health_reason_basis = 31;
+  string recovery_fallback_reason = 32;
 }
 
 message RouteRequest {

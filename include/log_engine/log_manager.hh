@@ -37,6 +37,14 @@ struct LogManagerStats {
     std::uint64_t recovery_fallback_stale_checkpoint = 0;
 };
 
+enum class RecoveryFallbackReason {
+    none,
+    incomplete_checkpoint,
+    stale_checkpoint,
+};
+
+const char* recovery_fallback_reason_to_string(RecoveryFallbackReason reason) noexcept;
+
 class LogManager {
 public:
     seastar::future<> prepare(const EngineConfig& config);
@@ -54,6 +62,7 @@ private:
 };
 
 LogManagerStats get_log_manager_stats() noexcept;
+RecoveryFallbackReason get_last_recovery_fallback_reason() noexcept;
 void reset_log_manager_stats() noexcept;
 void register_log_manager_metrics();
 void unregister_log_manager_metrics() noexcept;

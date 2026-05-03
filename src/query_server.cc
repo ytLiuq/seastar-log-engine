@@ -119,9 +119,14 @@ struct QueryContext {
         const auto log_manager_stats = log_engine::get_log_manager_stats();
         const auto health_snapshot = log_engine::collect_health_snapshot();
         const auto health = log_engine::compute_health_status(health_snapshot);
+        const auto health_reason = log_engine::compute_health_reason(health_snapshot);
+        const auto recovery_reason = log_engine::get_last_recovery_fallback_reason();
         return fmt::format(
-            "{{\"health\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_fallback_incomplete_checkpoint\":{},\"recovery_fallback_stale_checkpoint\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}",
+            "{{\"health\":\"{}\",\"health_reason\":\"{}\",\"health_reason_basis\":\"{}\",\"recovery_fallback_reason\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_fallback_incomplete_checkpoint\":{},\"recovery_fallback_stale_checkpoint\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}",
             log_engine::health_status_to_string(health),
+            log_engine::health_reason_to_string(health_reason),
+            log_engine::health_reason_basis(health_snapshot),
+            log_engine::recovery_fallback_reason_to_string(recovery_reason),
             log_engine::routing_strategy_to_string(router.strategy()),
             routing_shards,
             router.virtual_nodes(),
@@ -191,7 +196,12 @@ struct QueryContext {
         const auto reader_stats = log_engine::get_reader_stats();
         const auto log_manager_stats = log_engine::get_log_manager_stats();
         const auto health_snapshot = log_engine::collect_health_snapshot();
+        const auto health_reason = log_engine::compute_health_reason(health_snapshot);
         reply->set_health(std::string(health_status()));
+        reply->set_health_reason(log_engine::health_reason_to_string(health_reason));
+        reply->set_health_reason_basis(std::string(log_engine::health_reason_basis(health_snapshot)));
+        reply->set_recovery_fallback_reason(log_engine::recovery_fallback_reason_to_string(
+            log_engine::get_last_recovery_fallback_reason()));
         reply->set_routing_strategy(log_engine::routing_strategy_to_string(router.strategy()));
         reply->set_routing_shards(routing_shards);
         reply->set_routing_virtual_nodes(router.virtual_nodes());

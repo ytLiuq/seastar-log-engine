@@ -13,6 +13,20 @@ bool parse_u64(std::string_view value, std::uint64_t& out) {
     return result.ec == std::errc{} && result.ptr == value.data() + value.size();
 }
 
+bool same_archive_identity(const SegmentDescriptor& lhs, const SegmentDescriptor& rhs) {
+    return lhs.archived && rhs.archived &&
+        lhs.shard_id == rhs.shard_id &&
+        lhs.timestamp_ms == rhs.timestamp_ms &&
+        lhs.rotation_index == rhs.rotation_index;
+}
+
+bool prefer_archive_candidate(const SegmentDescriptor& candidate, const SegmentDescriptor& current) {
+    if (candidate.compressed != current.compressed) {
+        return !candidate.compressed;
+    }
+    return candidate.path < current.path;
+}
+
 }  // namespace
 
 std::string shard_prefix(const EngineConfig& config, unsigned shard_id) {
@@ -97,7 +111,18 @@ std::vector<SegmentDescriptor> collect_archive_segments(const EngineConfig& conf
     }
 
     sort_segments(segments);
-    return segments;
+    std::vector<SegmentDescriptor> deduped;
+    deduped.reserve(segments.size());
+    for (const auto& segment : segments) {
+        if (!deduped.empty() && same_archive_identity(deduped.back(), segment)) {
+            if (prefer_archive_candidate(segment, deduped.back())) {
+                deduped.back() = segment;
+            }
+            continue;
+        }
+        deduped.push_back(segment);
+    }
+    return deduped;
 }
 
 std::vector<SegmentDescriptor> collect_query_segments(
@@ -116,25 +141,10 @@ std::optional<SegmentDescriptor> describe_path(const EngineConfig& config, const
     const fs::path file_path(path);
     const auto filename = file_path.filename().string();
     const auto extension = file_path.extension().string();
+    const auto prefix = config.shard_file_prefix + "-";
 
     SegmentDescriptor segment;
     segment.path = path;
-
-    if (extension == ".log") {
-        const auto prefix = config.shard_file_prefix + "-";
-        if (filename.rfind(prefix, 0) != 0) {
-            return std::nullopt;
-        }
-        const auto shard_part = filename.substr(prefix.size(), filename.size() - prefix.size() - 4);
-        std::uint64_t shard_value = 0;
-        if (!parse_u64(shard_part, shard_value)) {
-            return std::nullopt;
-        }
-        segment.shard_id = static_cast<unsigned>(shard_value);
-        segment.archived = false;
-        return segment;
-    }
-
     segment.compressed = extension == ".gz";
     const auto archive_name = segment.compressed
         ? filename.substr(0, filename.size() - 3)
@@ -143,14 +153,26 @@ std::optional<SegmentDescriptor> describe_path(const EngineConfig& config, const
         return std::nullopt;
     }
     const auto base = archive_name.substr(0, archive_name.size() - 4);
-    const auto prefix = config.shard_file_prefix + "-";
     if (base.rfind(prefix, 0) != 0) {
         return std::nullopt;
     }
 
     const auto first_dot = base.find('.', prefix.size());
-    const auto second_dot = first_dot == std::string::npos ? std::string::npos : base.find('.', first_dot + 1);
-    if (first_dot == std::string::npos || second_dot == std::string::npos) {
+    if (first_dot == std::string::npos) {
+        if (segment.compressed) {
+            return std::nullopt;
+        }
+        std::uint64_t shard_value = 0;
+        if (!parse_u64(std::string_view(base).substr(prefix.size()), shard_value)) {
+            return std::nullopt;
+        }
+        segment.shard_id = static_cast<unsigned>(shard_value);
+        segment.archived = false;
+        segment.compressed = false;
+        return segment;
+    }
+    const auto second_dot = base.find('.', first_dot + 1);
+    if (second_dot == std::string::npos) {
         return std::nullopt;
     }
 

@@ -13,6 +13,12 @@ FLUSH_MS=5
 ROTATE_SIZE_BYTES=4096
 MESSAGES_PER_RUN=1000
 RESTART_INTERVAL_RUNS=3
+QUERY_CHECK_INTERVAL_RUNS=5
+ARCHIVE_RESET_INTERVAL_RUNS=7
+HTTP_PORT=18080
+GRPC_PORT=19090
+METRICS_PORT=19190
+SKIP_QUERY_CHECKS=0
 
 usage() {
   cat <<'EOF'
@@ -27,7 +33,13 @@ Options:
   --duration-seconds <n>    Total soak duration in seconds (default: 120)
   --shards <n>              Seastar shard count (default: 2)
   --payload-size <n>        Log payload size in bytes (default: 128)
-IOF
+  --messages-per-run <n>    Messages emitted per write cycle (default: 1000)
+  --restart-interval <n>    Crash+recover every N cycles (default: 3)
+  --http-port <n>           HTTP query port (default: 18080)
+  --grpc-port <n>           gRPC query port (default: 19090)
+  --metrics-port <n>        Metrics port (default: 19190)
+  --skip-query-checks       Skip HTTP/gRPC query server checks
+EOF
 }
 
 TMP_DIR="$(mktemp -d /tmp/log-engine-soak-fault.XXXXXX)"
@@ -52,6 +64,12 @@ while [[ $# -gt 0 ]]; do
     --duration-seconds) SOAK_DURATION_SECONDS="$2"; shift 2 ;;
     --shards) SHARDS="$2"; shift 2 ;;
     --payload-size) PAYLOAD_SIZE="$2"; shift 2 ;;
+    --messages-per-run) MESSAGES_PER_RUN="$2"; shift 2 ;;
+    --restart-interval) RESTART_INTERVAL_RUNS="$2"; shift 2 ;;
+    --http-port) HTTP_PORT="$2"; shift 2 ;;
+    --grpc-port) GRPC_PORT="$2"; shift 2 ;;
+    --metrics-port) METRICS_PORT="$2"; shift 2 ;;
+    --skip-query-checks) SKIP_QUERY_CHECKS=1; shift 1 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -59,8 +77,23 @@ done
 
 mkdir -p "${LOG_DIR}" "${ARCHIVE_DIR}"
 
+has_option() {
+  local needle="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "${needle}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 run_demo() {
   local extra_args=("${@}")
+  if ! has_option "--truncate-on-start" "${extra_args[@]}"; then
+    extra_args+=(--truncate-on-start 0)
+  fi
   ./build/log_engine_demo \
     --log-dir "${LOG_DIR}" \
     --archive-dir "${ARCHIVE_DIR}" \
@@ -71,7 +104,6 @@ run_demo() {
     --rotate-size-bytes "${ROTATE_SIZE_BYTES}" \
     --checkpoint-enabled 1 \
     --compress-archives 1 \
-    --truncate-on-start 0 \
     --record-timestamp-enabled 1 \
     --record-crc-enabled 1 \
     -c "${SHARDS}" \
@@ -79,28 +111,34 @@ run_demo() {
 }
 
 run_query_server() {
-  local http_port="${1:-18080}"
-  local grpc_port="${2:-19090}"
-  local metrics_port="${3:-19190}"
-
   ./build/log_engine_query_server \
     --log-dir "${LOG_DIR}" \
     --archive-dir "${ARCHIVE_DIR}" \
     --http-address 127.0.0.1 \
-    --http-port "${http_port}" \
+    --http-port "${HTTP_PORT}" \
     --grpc-address 127.0.0.1 \
-    --grpc-port "${grpc_port}" \
+    --grpc-port "${GRPC_PORT}" \
     --metrics-address 127.0.0.1 \
-    --metrics-port "${metrics_port}" \
+    --metrics-port "${METRICS_PORT}" \
     -c "${SHARDS}" >/tmp/log_engine_soak_server.out 2>&1 &
   SERVER_PID=$!
 
   for _ in $(seq 1 50); do
-    if curl -fsS "http://127.0.0.1:${http_port}/healthz" >/dev/null 2>&1; then
-      break
+    if curl -fsS "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1 ||
+       curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+      echo "WARN: query server exited before becoming ready" >&2
+      tail -n 40 /tmp/log_engine_soak_server.out >&2 || true
+      return 1
     fi
     sleep 0.2
   done
+
+  echo "WARN: query server readiness timed out" >&2
+  tail -n 40 /tmp/log_engine_soak_server.out >&2 || true
+  return 1
 }
 
 stop_query_server() {
@@ -156,31 +194,51 @@ inject_broken_gzip() {
 }
 
 verify_active_file() {
-  if [[ -f "${LOG_DIR}/shard-0.log" ]]; then
-    ./build/log_engine_verify --path "${LOG_DIR}/shard-0.log" 2>/dev/null || {
-      echo "verify failed for shard-0.log" >&2
+  local shard_file="$1"
+  if [[ -f "${shard_file}" ]]; then
+    ./build/log_engine_verify --path "${shard_file}" 2>/dev/null || {
+      echo "verify failed for ${shard_file}" >&2
       return 1
     }
+    echo "$(basename "${shard_file}") verify OK"
   fi
-  echo "shard-0.log verify OK"
+}
+
+verify_all_active_files() {
+  local shard_id
+  for shard_id in $(seq 0 $((SHARDS - 1))); do
+    verify_active_file "${LOG_DIR}/shard-${shard_id}.log"
+  done
 }
 
 check_health() {
-  local status_json
-  status_json="$(curl -fsS "http://127.0.0.1:18080/v1/status" 2>/dev/null)" || {
+  local status_json=""
+  local _attempt
+  for _attempt in $(seq 1 20); do
+    status_json="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/status" 2>/dev/null)" && break
+    sleep 0.2
+  done
+  if [[ -z "${status_json}" ]]; then
     echo "WARN: cannot fetch status" >&2
     return 0
-  }
+  fi
   local health
   health="$(echo "${status_json}" | grep -o '"health":"[^"]*"' | head -1 | cut -d'"' -f4)"
   echo "health=${health}"
 }
 
 query_consistency_check() {
-  local http_records
-  local grpc_records
-  http_records="$(curl -fsS "http://127.0.0.1:18080/v1/records?include_archive=true&limit=50" 2>/dev/null)" || true
-  grpc_records="$(./build/log_engine_query_client --target "127.0.0.1:19090" --method records --include-archive true --limit 50 2>/dev/null)" || true
+  local http_records=""
+  local grpc_records=""
+  local _attempt
+  for _attempt in $(seq 1 20); do
+    http_records="$(curl -fsS "http://127.0.0.1:${HTTP_PORT}/v1/records?include_archive=true&limit=50" 2>/dev/null)" && break
+    sleep 0.2
+  done
+  for _attempt in $(seq 1 20); do
+    grpc_records="$(./build/log_engine_query_client --target "127.0.0.1:${GRPC_PORT}" --method records --include-archive true --limit 50 2>/dev/null)" && break
+    sleep 0.2
+  done
   if [[ "${http_records}" != "${grpc_records}" ]]; then
     echo "WARN: query consistency mismatch" >&2
     return 1
@@ -188,31 +246,97 @@ query_consistency_check() {
   echo "query consistency OK"
 }
 
+reset_data_dirs() {
+  rm -rf "${LOG_DIR}" "${ARCHIVE_DIR}"
+  mkdir -p "${LOG_DIR}" "${ARCHIVE_DIR}"
+}
+
+run_soak_loop() {
+  local start_epoch run_count
+  start_epoch="$(date +%s)"
+  run_count=0
+
+  reset_data_dirs
+  while (( $(date +%s) - start_epoch < SOAK_DURATION_SECONDS )); do
+    run_count=$((run_count + 1))
+    echo "  Soak cycle ${run_count}..."
+
+    if (( run_count % RESTART_INTERVAL_RUNS == 0 )); then
+      timeout 30s ./build/log_engine_demo \
+        --log-dir "${LOG_DIR}" \
+        --archive-dir "${ARCHIVE_DIR}" \
+        --messages "${MESSAGES_PER_RUN}" \
+        --payload-size "${PAYLOAD_SIZE}" \
+        --batch-size "${BATCH_SIZE}" \
+        --flush-ms "${FLUSH_MS}" \
+        --rotate-size-bytes "${ROTATE_SIZE_BYTES}" \
+        --checkpoint-enabled 1 \
+        --compress-archives 1 \
+        --truncate-on-start 0 \
+        -c "${SHARDS}" >/tmp/log_engine_soak_kill.out 2>&1 &
+      DEMO_PID=$!
+      sleep 1
+      kill -9 "${DEMO_PID}" 2>/dev/null || true
+      wait "${DEMO_PID}" 2>/dev/null || true
+      DEMO_PID=""
+      run_demo
+      echo "  Soak cycle ${run_count}: crash+recover OK"
+    else
+      run_demo
+    fi
+
+    verify_all_active_files
+
+    if (( SKIP_QUERY_CHECKS == 0 && run_count % QUERY_CHECK_INTERVAL_RUNS == 0 )); then
+      run_query_server
+      check_health
+      query_consistency_check
+      stop_query_server
+    fi
+
+    if (( run_count % ARCHIVE_RESET_INTERVAL_RUNS == 0 )); then
+      echo "  Soak cycle ${run_count}: archive reset + rebuild"
+      reset_data_dirs
+      run_bench $((MESSAGES_PER_RUN * SHARDS)) --route-keys $((SHARDS * 4))
+      verify_all_active_files
+    fi
+  done
+
+  echo "Soak loop completed: ${run_count} cycles in ${SOAK_DURATION_SECONDS}s"
+}
+
 echo "=== Soak & Fault Injection Test ==="
 echo "Duration: ${SOAK_DURATION_SECONDS}s, Shards: ${SHARDS}, Payload: ${PAYLOAD_SIZE}B"
 echo "Log dir: ${LOG_DIR}"
+if (( SKIP_QUERY_CHECKS == 1 )); then
+  echo "Query checks: skipped"
+fi
 
-# Phase 1: Initial write with rotation
+# Phase 1: Timed soak loop
 echo ""
-echo "--- Phase 1: Initial write with rotation ---"
-run_demo
-verify_active_file
+echo "--- Phase 1: Timed soak loop ---"
+run_soak_loop
 echo "Phase 1 OK"
 
-# Phase 2: Start query server and verify status
-echo ""
-echo "--- Phase 2: Query server + status check ---"
-run_query_server 18080 19090 19190
-check_health
-query_consistency_check
-stop_query_server
-echo "Phase 2 OK"
+# Phase 2: Initial query server + status check
+if (( SKIP_QUERY_CHECKS == 0 )); then
+  echo ""
+  echo "--- Phase 2: Query server + status check ---"
+  run_query_server
+  check_health
+  query_consistency_check
+  stop_query_server
+  echo "Phase 2 OK"
+else
+  echo ""
+  echo "--- Phase 2: Query server + status check (skipped) ---"
+fi
 
 # Phase 3: Restart recovery after clean stop
 echo ""
 echo "--- Phase 3: Restart recovery after clean stop ---"
 run_demo
-verify_active_file
+verify_all_active_files
 echo "Phase 3 OK"
 
 # Phase 4: Broken tail injection + recovery
@@ -224,13 +348,13 @@ if run_demo; then
 else
   echo "Phase 4a recovery ran (may have warned about tail corruption)"
 fi
-verify_active_file
+verify_all_active_files
 
 # Recover from broken tail by truncating and restarting
 rm -f "${LOG_DIR}/shard-0.log" "${LOG_DIR}/shard-0.log.checkpoint"
 run_demo --truncate-on-start 1
 run_demo --truncate-on-start 0
-verify_active_file
+verify_all_active_files
 echo "Phase 4b (recovered after tail corruption) OK"
 
 # Phase 5: Broken checkpoint injection
@@ -238,7 +362,7 @@ echo ""
 echo "--- Phase 5: Bad checkpoint + recovery ---"
 inject_broken_checkpoint
 run_demo
-verify_active_file
+verify_all_active_files
 echo "Phase 5 OK"
 
 # Phase 6: Stale checkpoint injection
@@ -246,29 +370,30 @@ echo ""
 echo "--- Phase 6: Stale checkpoint + recovery ---"
 inject_stale_checkpoint
 run_demo
-verify_active_file
+verify_all_active_files
 echo "Phase 6 OK"
 
 # Phase 7: Broken gzip archive + query
 echo ""
-echo "--- Phase 7: Broken gzip + query ---"
-# Generate some data first, then corrupt a gzip archive
-rm -rf "${LOG_DIR}" "${ARCHIVE_DIR}"
-mkdir -p "${LOG_DIR}" "${ARCHIVE_DIR}"
-run_bench 5000
-inject_broken_gzip
-run_query_server 18080 19090 19190
-check_health
-query_consistency_check
-stop_query_server
-verify_active_file
-echo "Phase 7 OK"
+if (( SKIP_QUERY_CHECKS == 0 )); then
+  echo "--- Phase 7: Broken gzip + query ---"
+  reset_data_dirs
+  run_bench 5000
+  inject_broken_gzip
+  run_query_server
+  check_health
+  query_consistency_check
+  stop_query_server
+  verify_all_active_files
+  echo "Phase 7 OK"
+else
+  echo "--- Phase 7: Broken gzip + query (skipped query checks) ---"
+fi
 
 # Phase 8: Multi-shard recovery consistency
 echo ""
 echo "--- Phase 8: Multi-shard recovery consistency ---"
-rm -rf "${LOG_DIR}" "${ARCHIVE_DIR}"
-mkdir -p "${LOG_DIR}" "${ARCHIVE_DIR}"
+reset_data_dirs
 run_bench 10000 --route-keys $((SHARDS * 4))
 
 # Verify all shard files
@@ -286,54 +411,5 @@ done
 run_demo
 echo "Phase 8 OK"
 
-# Phase 9: Long soak with periodic rotate and restart
-echo ""
-echo "--- Phase 9: Long soak with rotate/restart cycles ---"
-rm -rf "${LOG_DIR}" "${ARCHIVE_DIR}"
-mkdir -p "${LOG_DIR}" "${ARCHIVE_DIR}"
-
-start_epoch="$(date +%s)"
-run_count=0
-while (( $(date +%s) - start_epoch < SOAK_DURATION_SECONDS )); do
-  run_count=$((run_count + 1))
-  echo "  Soak run ${run_count}..."
-
-  if (( run_count % RESTART_INTERVAL_RUNS == 0 )); then
-    # Simulate crash by killing a running demo
-    timeout 30s ./build/log_engine_demo \
-      --log-dir "${LOG_DIR}" \
-      --archive-dir "${ARCHIVE_DIR}" \
-      --messages 5000 \
-      --payload-size "${PAYLOAD_SIZE}" \
-      --batch-size "${BATCH_SIZE}" \
-      --flush-ms "${FLUSH_MS}" \
-      --rotate-size-bytes "${ROTATE_SIZE_BYTES}" \
-      --checkpoint-enabled 1 \
-      --compress-archives 1 \
-      --truncate-on-start 0 \
-      -c "${SHARDS}" >/tmp/log_engine_soak_kill.out 2>&1 &
-    DEMO_PID=$!
-    sleep 1
-    kill -9 "${DEMO_PID}" 2>/dev/null || true
-    wait "${DEMO_PID}" 2>/dev/null || true
-    DEMO_PID=""
-
-    # Recover
-    run_demo
-    echo "  Soak run ${run_count}: crash+recover OK"
-  else
-    run_demo
-  fi
-
-  # Periodically run query during soak
-  if (( run_count % 5 == 0 )); then
-    run_query_server 18080 19090 19190
-    check_health
-    query_consistency_check
-    stop_query_server
-  fi
-done
-
 echo ""
 echo "=== All soak and fault injection tests passed ==="
-echo "Total soak runs: ${run_count}"

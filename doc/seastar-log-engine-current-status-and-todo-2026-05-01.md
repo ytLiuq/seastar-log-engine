@@ -1,5 +1,8 @@
 # Seastar Log Engine 当前功能与 TODO
 
+> 历史快照：本文档保留 2026-05-01 时点状态。
+> 当前待办请以仓库根目录 [TODO.md](../TODO.md) 和 [doc/README.md](README.md) 为准。
+
 更新时间：`2026-05-01`
 
 ## 项目定位

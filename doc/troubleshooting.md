@@ -4,11 +4,17 @@
 
 | Status | Condition |
 |--------|-----------|
-| `ok` | No errors in the last 5-minute window |
-| `degraded` | 1-10 errors of any category in the last 5 minutes |
-| `unhealthy` | >10 errors of any category in the last 5 minutes |
+| `ok` | No recent errors in the last 5-minute window |
+| `degraded` | Recent reader corruption / gzip read errors / recovery fallbacks exist, but are still below unhealthy thresholds |
+| `unhealthy` | Recent checkpoint write failure or gzip archive failure exists, or recent reader / recovery errors exceeded their thresholds |
 
 Check current health: `curl http://<host>:18080/v1/status | jq .health`
+
+Additional status fields:
+
+- `health_reason`: primary category currently driving health
+- `health_reason_basis`: currently `recent_window` when health is degraded/unhealthy
+- `recovery_fallback_reason`: latest recovery fallback classification (`none`, `incomplete_checkpoint`, `stale_checkpoint`)
 
 ## Common issues
 
@@ -95,6 +101,18 @@ category is elevated.
 - Default ports: HTTP 18080, gRPC 19090, Metrics 19181
 - Change ports via CLI flags: `--http-port`, `--grpc-port`, `--metrics-port`
 - Check: `ss -tlnp | grep -E '18080|19090|19181'`
+
+### 8. Query server exits with "socket: Operation not permitted"
+
+- Common in restricted containers or sandboxed CI environments
+- Symptom:
+  `std::system_error (error system:1, socket: Operation not permitted)`
+- Meaning:
+  the process is not allowed to bind listening sockets in the current environment
+- Options:
+  - run the query server on a less restricted host / container
+  - change ports and retry in case the environment only blocks some bindings
+  - for `script/test_soak_and_fault.sh`, use `--skip-query-checks` to keep validating recovery / rotate / fault-injection paths without HTTP/gRPC startup
 
 ## Diagnostic commands
 
