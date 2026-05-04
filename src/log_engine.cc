@@ -47,6 +47,20 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
         co_return;
     }
 
+    if (_config.empty_route_policy == EmptyRoutePolicy::local) {
+        bool all_empty_local = true;
+        for (const auto& message : messages) {
+            if (!message.route_key.empty()) {
+                all_empty_local = false;
+                break;
+            }
+        }
+        if (all_empty_local) {
+            co_await _writers.local().submit_many(std::move(messages));
+            co_return;
+        }
+    }
+
     std::vector<std::size_t> per_shard_counts(seastar::smp::count, 0);
     std::uint64_t empty_route_base = 0;
     std::uint64_t empty_route_index = 0;

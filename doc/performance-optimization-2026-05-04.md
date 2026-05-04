@@ -228,6 +228,59 @@ Interpretation:
 - tail latency improved together with throughput
 - the effect is large enough to justify keeping a dedicated fast path for this workload shape
 
+## Accepted Optimization
+
+Commit:
+
+- to be recorded after push: all-empty local batch fast path
+
+Changes:
+
+- when `append_batch()` sees that every record has an empty route key and `empty-route-policy=local`
+- it now bypasses all routing bookkeeping and submits the whole batch directly to the local shard writer
+
+### Why this was accepted
+
+The previous same-shard fast path still required a full routing/counting loop before it could conclude that the entire batch should stay on the local shard.
+
+For the common "no route key, stay local" workload, that loop is pure overhead.
+
+### Benchmark signal
+
+Command shape:
+
+```bash
+./build/log_engine_bench \
+  --messages 40000 \
+  --payload-size 512 \
+  --batch-size 512 \
+  --flush-ms 1 \
+  --inflight 16 \
+  --route-keys 0 \
+  --empty-route-policy local \
+  --submit-group-size 16 \
+  -c 4
+```
+
+Results:
+
+| Version | Throughput (msg/s) | Avg Group Submit (us) | P99 Group Submit (us) |
+| --- | ---: | ---: | ---: |
+| before all-empty local fast path | `527913.42` | `51.2704` | `1022` |
+| after all-empty local fast path | `540394.49` | `47.6780` | `1022` |
+
+Additional reference point:
+
+| Payload | Throughput (msg/s) |
+| ---: | ---: |
+| `2048` | `158159.65` |
+
+Interpretation:
+
+- throughput improved by about `2.4%`
+- average grouped submit latency also improved
+- the gain is smaller than the round-robin fast paths, but it is stable and comes from a very small, low-risk specialization
+
 ## Rejected Experiment
 
 Experiment:
