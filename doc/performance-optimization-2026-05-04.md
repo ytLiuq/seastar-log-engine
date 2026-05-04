@@ -118,6 +118,62 @@ Interpretation:
 - rerun stayed directionally positive and crossed `1.08M msg/s`
 - tail latency also improved rather than regressed, which makes this a clean acceptance
 
+## Accepted Optimization
+
+Commit:
+
+- to be recorded after push: same-shard batch fast path
+
+Changes:
+
+- `append_batch()` now detects when every record in the batch routes to the same shard
+- in that case it skips building per-shard buckets and skips the generic fanout path
+- it directly calls one `submit_many()` on the local shard or one `invoke_on()` for the remote shard
+
+### Why this was accepted
+
+The grouped-submit path was still paying the full partition/fanout control cost even when the whole batch obviously belonged to one shard.
+
+This showed up in workloads such as:
+
+- `route_keys=1`
+- repeated hot-key traffic
+- grouped submit with larger payloads
+
+### Benchmark signal
+
+Command shape:
+
+```bash
+./build/log_engine_bench \
+  --messages 40000 \
+  --payload-size 2048 \
+  --batch-size 512 \
+  --flush-ms 1 \
+  --inflight 16 \
+  --route-keys 1 \
+  --submit-group-size 16 \
+  -c 4
+```
+
+Results:
+
+| Version | Throughput (msg/s) | P95 Group Submit (us) | P99 Group Submit (us) |
+| --- | ---: | ---: | ---: |
+| before same-shard fast path | `130604.57` | `960` | `2936` |
+| after same-shard fast path | `138089.60` | `800` | `1025` |
+
+Additional reference point:
+
+| Payload | Throughput (msg/s) |
+| ---: | ---: |
+| `512` | `501573.69` |
+
+Interpretation:
+
+- the primary validation case improved by about `5.7%`
+- tail latency also improved, which suggests this is genuinely removing control overhead instead of just shifting work around
+
 ## Rejected Experiment
 
 Experiment:

@@ -47,12 +47,14 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
         co_return;
     }
 
-    std::vector<std::vector<LogMessage>> per_shard(seastar::smp::count);
     std::vector<unsigned> shards;
     shards.reserve(messages.size());
     std::vector<std::size_t> per_shard_counts(seastar::smp::count, 0);
     std::uint64_t empty_route_base = 0;
     std::uint64_t empty_route_index = 0;
+    unsigned first_shard = 0;
+    bool first_shard_set = false;
+    bool all_same_shard = true;
     if (_config.empty_route_policy == EmptyRoutePolicy::round_robin) {
         std::size_t empty_count = 0;
         for (const auto& message : messages) {
@@ -70,9 +72,28 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
         } else {
             shard = route_to_shard(message.route_key);
         }
+        if (!first_shard_set) {
+            first_shard = shard;
+            first_shard_set = true;
+        } else if (shard != first_shard) {
+            all_same_shard = false;
+        }
         shards.push_back(shard);
         ++per_shard_counts[shard];
     }
+
+    if (all_same_shard) {
+        if (first_shard == seastar::this_shard_id()) {
+            co_await _writers.local().submit_many(std::move(messages));
+            co_return;
+        }
+        co_await _writers.invoke_on(first_shard, [batch = std::move(messages)](AsyncWriter& writer) mutable {
+            return writer.submit_many(std::move(batch));
+        });
+        co_return;
+    }
+
+    std::vector<std::vector<LogMessage>> per_shard(seastar::smp::count);
     for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
         per_shard[shard].reserve(per_shard_counts[shard]);
     }
