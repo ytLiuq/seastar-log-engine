@@ -51,13 +51,29 @@ void ShardRouter::configure(RoutingStrategy strategy, std::size_t virtual_nodes,
     });
 }
 
-RouteDecision ShardRouter::route(std::string_view route_key, unsigned local_shard) const noexcept {
-    if (route_key.empty() || _shard_count == 0) {
+RouteDecision ShardRouter::route(
+    std::string_view route_key,
+    unsigned local_shard,
+    EmptyRoutePolicy empty_route_policy,
+    std::uint64_t empty_route_index) const noexcept {
+    if (_shard_count == 0) {
         return RouteDecision{
-            .shard = _shard_count == 0 ? 0u : local_shard % _shard_count,
+            .shard = 0u,
             .hash = 0,
             .token = 0,
             .used_local_fallback = true,
+        };
+    }
+
+    if (route_key.empty()) {
+        const auto shard = empty_route_policy == EmptyRoutePolicy::round_robin
+            ? static_cast<unsigned>(empty_route_index % _shard_count)
+            : (local_shard % _shard_count);
+        return RouteDecision{
+            .shard = shard,
+            .hash = 0,
+            .token = 0,
+            .used_local_fallback = empty_route_policy == EmptyRoutePolicy::local,
         };
     }
 

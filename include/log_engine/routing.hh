@@ -20,7 +20,11 @@ struct RouteDecision {
 class ShardRouter {
 public:
     void configure(RoutingStrategy strategy, std::size_t virtual_nodes, unsigned shard_count);
-    [[nodiscard]] RouteDecision route(std::string_view route_key, unsigned local_shard) const noexcept;
+    [[nodiscard]] RouteDecision route(
+        std::string_view route_key,
+        unsigned local_shard,
+        EmptyRoutePolicy empty_route_policy = EmptyRoutePolicy::local,
+        std::uint64_t empty_route_index = 0) const noexcept;
     [[nodiscard]] unsigned shard_count() const noexcept;
     [[nodiscard]] std::size_t ring_size() const noexcept;
     [[nodiscard]] RoutingStrategy strategy() const noexcept;

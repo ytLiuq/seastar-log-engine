@@ -85,6 +85,7 @@
 ```bash
 ./build/log_engine_demo \
   --routing-strategy consistent_hashing \
+  --empty-route-policy local \
   --routing-virtual-nodes 256 \
   --log-dir ./logs \
   --archive-dir ./archive \
@@ -102,6 +103,7 @@
 ```bash
 ./build/log_engine_bench \
   --ack-mode write_ack \
+  --empty-route-policy local \
   --log-dir ./logs \
   --archive-dir ./archive \
   --messages 200000 \
@@ -159,8 +161,10 @@ curl 'http://127.0.0.1:19181/metrics'
 ## 路由参数
 
 - `--routing-strategy hash_modulo|consistent_hashing`
+- `--empty-route-policy local|round_robin`
 - `--routing-virtual-nodes <n>`
-- 空 `route_key` 会回退到当前 shard
+- `empty-route-policy=local` 时，空 `route_key` 回退到当前 shard
+- `empty-route-policy=round_robin` 时，空 `route_key` 会在 shard 间轮转分发
 
 ## Writer Metrics
 

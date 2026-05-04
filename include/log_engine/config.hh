@@ -95,12 +95,38 @@ inline RoutingStrategy parse_routing_strategy(std::string_view value) {
     throw std::invalid_argument("routing_strategy must be hash_modulo or consistent_hashing");
 }
 
+enum class EmptyRoutePolicy {
+    local,
+    round_robin,
+};
+
+inline const char* empty_route_policy_to_string(EmptyRoutePolicy policy) noexcept {
+    switch (policy) {
+    case EmptyRoutePolicy::local:
+        return "local";
+    case EmptyRoutePolicy::round_robin:
+        return "round_robin";
+    }
+    return "local";
+}
+
+inline EmptyRoutePolicy parse_empty_route_policy(std::string_view value) {
+    if (value == "local") {
+        return EmptyRoutePolicy::local;
+    }
+    if (value == "round_robin" || value == "round-robin" || value == "rr") {
+        return EmptyRoutePolicy::round_robin;
+    }
+    throw std::invalid_argument("empty_route_policy must be local or round_robin");
+}
+
 struct EngineConfig {
     std::string log_dir = "logs";
     std::string archive_dir = "archive";
     std::string shard_file_prefix = "shard";
     AckMode ack_mode = AckMode::write_ack;
     RoutingStrategy routing_strategy = RoutingStrategy::hash_modulo;
+    EmptyRoutePolicy empty_route_policy = EmptyRoutePolicy::local;
     std::size_t routing_virtual_nodes = 128;
     std::size_t batch_size = 32;
     std::size_t flush_interval_ms = 0;

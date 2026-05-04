@@ -136,6 +136,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
         std::ofstream out(config_path, std::ios::trunc);
         out << "ack-mode=sync_ack\n";
         out << "routing-strategy=consistent_hashing\n";
+        out << "empty-route-policy=round_robin\n";
         out << "routing-virtual-nodes=33\n";
         out << "log-dir=/tmp/demo-logs\n";
         out << "batch-size=17\n";
@@ -153,6 +154,7 @@ seastar::future<> test_config_loader(const std::string& root_dir) {
     auto config = log_engine::apply_engine_config_overrides(log_engine::EngineConfig{}, cli, values);
     require(config.ack_mode == log_engine::AckMode::sync_ack, "config loader should override ack mode");
     require(config.routing_strategy == log_engine::RoutingStrategy::consistent_hashing, "config loader should override routing strategy");
+    require(config.empty_route_policy == log_engine::EmptyRoutePolicy::round_robin, "config loader should override empty route policy");
     require(config.routing_virtual_nodes == 33, "config loader should override routing virtual nodes");
     require(config.log_dir == "/tmp/demo-logs", "config loader should override log_dir");
     require(config.batch_size == 17, "config loader should override batch_size");
@@ -204,6 +206,14 @@ seastar::future<> test_consistent_hash_routing() {
     const auto fallback = consistent_router.route("", 3);
     require(fallback.shard == 3, "empty route key should fall back to local shard");
     require(fallback.used_local_fallback, "empty route key should mark local fallback");
+
+    const auto rr0 = consistent_router.route("", 3, log_engine::EmptyRoutePolicy::round_robin, 0);
+    const auto rr1 = consistent_router.route("", 3, log_engine::EmptyRoutePolicy::round_robin, 1);
+    const auto rr5 = consistent_router.route("", 3, log_engine::EmptyRoutePolicy::round_robin, 5);
+    require(rr0.shard == 0, "round-robin empty route should start from shard zero");
+    require(rr1.shard == 1, "round-robin empty route should advance across shards");
+    require(rr5.shard == 1, "round-robin empty route should wrap by shard count");
+    require(!rr0.used_local_fallback, "round-robin empty route should not report local fallback");
     co_return;
 }
 

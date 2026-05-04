@@ -55,6 +55,14 @@ RoutingStrategy parse_routing_strategy_option(const std::string& value, const ch
     }
 }
 
+EmptyRoutePolicy parse_empty_route_policy_option(const std::string& value, const char* name) {
+    try {
+        return parse_empty_route_policy(value);
+    } catch (const std::invalid_argument&) {
+        throw std::invalid_argument(std::string("invalid empty route policy for option ") + name + ": " + value);
+    }
+}
+
 bool should_take_file_value(
     const boost::program_options::variables_map& cli,
     const std::string& name,
@@ -105,6 +113,7 @@ EngineConfig apply_engine_config_overrides(
     const ConfigMap& file_values) {
     base.ack_mode = resolve_ack_mode_option(cli, file_values, "ack-mode", base.ack_mode);
     base.routing_strategy = resolve_routing_strategy_option(cli, file_values, "routing-strategy", base.routing_strategy);
+    base.empty_route_policy = resolve_empty_route_policy_option(cli, file_values, "empty-route-policy", base.empty_route_policy);
     base.routing_virtual_nodes = resolve_size_option(cli, file_values, "routing-virtual-nodes", base.routing_virtual_nodes);
     base.log_dir = resolve_string_option(cli, file_values, "log-dir", base.log_dir);
     base.archive_dir = resolve_string_option(cli, file_values, "archive-dir", base.archive_dir);
@@ -198,6 +207,17 @@ RoutingStrategy resolve_routing_strategy_option(
         return current_value;
     }
     return parse_routing_strategy_option(file_values.at(name), name.c_str());
+}
+
+EmptyRoutePolicy resolve_empty_route_policy_option(
+    const boost::program_options::variables_map& cli,
+    const ConfigMap& file_values,
+    const std::string& name,
+    EmptyRoutePolicy current_value) {
+    if (!should_take_file_value(cli, name, file_values)) {
+        return current_value;
+    }
+    return parse_empty_route_policy_option(file_values.at(name), name.c_str());
 }
 
 CrcClass resolve_crc_class_option(

@@ -48,29 +48,39 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
     }
 
     std::vector<std::vector<LogMessage>> per_shard(seastar::smp::count);
-    for (auto& message : messages) {
+    std::vector<unsigned> shards;
+    shards.reserve(messages.size());
+    std::vector<std::size_t> per_shard_counts(seastar::smp::count, 0);
+    for (const auto& message : messages) {
         const auto shard = route_to_shard(message.route_key);
-        per_shard[shard].push_back(std::move(message));
+        shards.push_back(shard);
+        ++per_shard_counts[shard];
+    }
+    for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
+        per_shard[shard].reserve(per_shard_counts[shard]);
+    }
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        per_shard[shards[index]].push_back(std::move(messages[index]));
     }
 
-    std::vector<seastar::future<>> remote_submits;
-    remote_submits.reserve(seastar::smp::count > 0 ? seastar::smp::count - 1 : 0);
+    std::vector<seastar::future<>> shard_submits;
+    shard_submits.reserve(seastar::smp::count);
 
     for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
         if (per_shard[shard].empty()) {
             continue;
         }
         if (shard == seastar::this_shard_id()) {
-            co_await _writers.local().submit_many(std::move(per_shard[shard]));
+            shard_submits.push_back(_writers.local().submit_many(std::move(per_shard[shard])));
             continue;
         }
-        remote_submits.push_back(_writers.invoke_on(shard, [batch = std::move(per_shard[shard])](AsyncWriter& writer) mutable {
+        shard_submits.push_back(_writers.invoke_on(shard, [batch = std::move(per_shard[shard])](AsyncWriter& writer) mutable {
             return writer.submit_many(std::move(batch));
         }));
     }
 
-    if (!remote_submits.empty()) {
-        co_await seastar::when_all_succeed(remote_submits.begin(), remote_submits.end());
+    if (!shard_submits.empty()) {
+        co_await seastar::when_all_succeed(shard_submits.begin(), shard_submits.end());
     }
 }
 
@@ -87,7 +97,14 @@ seastar::future<> LogEngine::error(std::string payload, std::string route_key) {
 }
 
 unsigned LogEngine::route_to_shard(std::string_view route_key) noexcept {
-    return _router.route(route_key, seastar::this_shard_id()).shard;
+    return _router.route(route_key, seastar::this_shard_id(), _config.empty_route_policy, next_empty_route_index()).shard;
+}
+
+std::uint64_t LogEngine::next_empty_route_index() noexcept {
+    if (_config.empty_route_policy != EmptyRoutePolicy::round_robin) {
+        return 0;
+    }
+    return _rr_counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace log_engine

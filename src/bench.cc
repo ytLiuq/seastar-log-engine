@@ -25,6 +25,10 @@ log_engine::AckMode parse_ack(std::string_view value) {
     return log_engine::parse_ack_mode(value);
 }
 
+log_engine::EmptyRoutePolicy parse_empty_route_policy(std::string_view value) {
+    return log_engine::parse_empty_route_policy(value);
+}
+
 double percentile_us(const std::vector<std::uint64_t>& sorted_latencies, double ratio) {
     if (sorted_latencies.empty()) {
         return 0.0;
@@ -55,6 +59,7 @@ int main(int argc, char** argv) {
         ("shard-file-prefix", bpo::value<std::string>()->default_value("shard"), "Shard log file prefix")
         ("ack-mode", bpo::value<std::string>()->default_value("write_ack"), "Ack mode: write_ack or sync_ack")
         ("routing-strategy", bpo::value<std::string>()->default_value("hash_modulo"), "Routing strategy: hash_modulo or consistent_hashing")
+        ("empty-route-policy", bpo::value<std::string>()->default_value("local"), "Empty route-key policy: local or round_robin")
         ("routing-virtual-nodes", bpo::value<std::size_t>()->default_value(128), "Virtual nodes per shard for consistent hashing")
         ("messages", bpo::value<std::uint64_t>()->default_value(200000), "Number of messages to write")
         ("payload-size", bpo::value<std::size_t>()->default_value(256), "Approximate size of each log payload")
@@ -86,6 +91,7 @@ int main(int argc, char** argv) {
         log_engine::EngineConfig base;
         base.ack_mode = parse_ack(app.configuration()["ack-mode"].as<std::string>());
         base.routing_strategy = parse_routing(app.configuration()["routing-strategy"].as<std::string>());
+        base.empty_route_policy = parse_empty_route_policy(app.configuration()["empty-route-policy"].as<std::string>());
         base.routing_virtual_nodes = app.configuration()["routing-virtual-nodes"].as<std::size_t>();
         base.log_dir = app.configuration()["log-dir"].as<std::string>();
         base.archive_dir = app.configuration()["archive-dir"].as<std::string>();

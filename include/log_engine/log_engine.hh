@@ -26,6 +26,7 @@ public:
 
 private:
     unsigned route_to_shard(std::string_view route_key) noexcept;
+    std::uint64_t next_empty_route_index() noexcept;
 
 private:
     EngineConfig _config;
