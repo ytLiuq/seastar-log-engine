@@ -4,6 +4,7 @@
 #include <deque>
 #include <string>
 #include <chrono>
+#include <vector>
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/condition-variable.hh>
@@ -26,6 +27,7 @@ public:
     seastar::future<> start(EngineConfig config);
     seastar::future<> stop();
     seastar::future<> submit(LogMessage message);
+    seastar::future<> submit_many(std::vector<LogMessage> messages);
 
     std::size_t pending_entries() const noexcept;
     std::string shard_path() const;

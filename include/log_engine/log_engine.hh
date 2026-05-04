@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <string_view>
+#include <vector>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -18,6 +19,7 @@ public:
     seastar::future<> stop();
 
     seastar::future<> append(LogMessage message);
+    seastar::future<> append_batch(std::vector<LogMessage> messages);
     seastar::future<> info(std::string payload, std::string route_key = {});
     seastar::future<> warn(std::string payload, std::string route_key = {});
     seastar::future<> error(std::string payload, std::string route_key = {});

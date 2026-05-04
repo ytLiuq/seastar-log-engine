@@ -42,6 +42,38 @@ seastar::future<> LogEngine::append(LogMessage message) {
     });
 }
 
+seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
+    if (messages.empty()) {
+        co_return;
+    }
+
+    std::vector<std::vector<LogMessage>> per_shard(seastar::smp::count);
+    for (auto& message : messages) {
+        const auto shard = route_to_shard(message.route_key);
+        per_shard[shard].push_back(std::move(message));
+    }
+
+    std::vector<seastar::future<>> remote_submits;
+    remote_submits.reserve(seastar::smp::count > 0 ? seastar::smp::count - 1 : 0);
+
+    for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
+        if (per_shard[shard].empty()) {
+            continue;
+        }
+        if (shard == seastar::this_shard_id()) {
+            co_await _writers.local().submit_many(std::move(per_shard[shard]));
+            continue;
+        }
+        remote_submits.push_back(_writers.invoke_on(shard, [batch = std::move(per_shard[shard])](AsyncWriter& writer) mutable {
+            return writer.submit_many(std::move(batch));
+        }));
+    }
+
+    if (!remote_submits.empty()) {
+        co_await seastar::when_all_succeed(remote_submits.begin(), remote_submits.end());
+    }
+}
+
 seastar::future<> LogEngine::info(std::string payload, std::string route_key) {
     co_await append(LogMessage{.level = LogLevel::info, .payload = std::move(payload), .route_key = std::move(route_key)});
 }

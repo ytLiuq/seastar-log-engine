@@ -74,8 +74,9 @@ int main(int argc, char** argv) {
         ("write-retry-count", bpo::value<std::size_t>()->default_value(3), "Maximum retries for a failed write batch")
         ("write-retry-backoff-ms", bpo::value<std::size_t>()->default_value(2), "Retry backoff in milliseconds")
         ("inflight", bpo::value<std::size_t>()->default_value(1), "Maximum writes issued concurrently")
+        ("submit-group-size", bpo::value<std::size_t>()->default_value(1), "Messages grouped into one append_batch call, 1 keeps per-message submit")
         ("record-crc-enabled", bpo::value<bool>()->default_value(false), "Emit crc= prefix and verify record checksum")
-        ("record-crc-class", bpo::value<std::string>()->default_value("full"), "CRC coverage: none, header, or full")
+        ("record-crc-class", bpo::value<std::string>()->default_value("full"), "CRC coverage: none, header, payload_hash, or full")
         ("record-timestamp-enabled", bpo::value<bool>()->default_value(false), "Include ts= field in each record")
         ("record-level-enabled", bpo::value<bool>()->default_value(false), "Include level= field in each record")
         ("record-shard-id-enabled", bpo::value<bool>()->default_value(false), "Include shard= field in each record")
@@ -118,28 +119,62 @@ int main(int argc, char** argv) {
         const auto payload_size = log_engine::resolve_size_option(app.configuration(), file_values, "payload-size", app.configuration()["payload-size"].as<std::size_t>());
         const auto route_key_count = log_engine::resolve_size_option(app.configuration(), file_values, "route-keys", app.configuration()["route-keys"].as<std::size_t>());
         const auto inflight = log_engine::resolve_size_option(app.configuration(), file_values, "inflight", app.configuration()["inflight"].as<std::size_t>());
+        const auto submit_group_size = log_engine::resolve_size_option(app.configuration(), file_values, "submit-group-size", app.configuration()["submit-group-size"].as<std::size_t>());
 
         log_engine::LogEngine engine;
         co_await engine.start(config);
 
         std::vector<std::uint64_t> indices;
-        indices.reserve(total_messages);
+        const auto effective_group_size = std::max<std::size_t>(1, submit_group_size);
+        const auto total_groups = (total_messages + effective_group_size - 1) / effective_group_size;
+        indices.reserve(total_groups);
         std::vector<std::uint64_t> submit_latencies_us(total_messages, 0);
-        for (std::uint64_t i = 0; i < total_messages; ++i) {
+        std::vector<std::uint64_t> group_submit_latencies_us(total_groups, 0);
+        for (std::uint64_t i = 0; i < total_groups; ++i) {
             indices.push_back(i);
         }
 
         auto start = std::chrono::steady_clock::now();
-        co_await seastar::max_concurrent_for_each(indices, inflight, [&](std::uint64_t current) {
-            const auto route_key = route_key_count == 0
-                ? std::string()
-                : ("route-" + std::to_string(current % route_key_count));
+        co_await seastar::max_concurrent_for_each(indices, inflight, [&](std::uint64_t group_index) {
+            const auto begin = group_index * effective_group_size;
+            const auto end_index = std::min<std::uint64_t>(begin + effective_group_size, total_messages);
             const auto submit_started = std::chrono::steady_clock::now();
-            return engine.info(make_payload(current, payload_size), route_key).then([&, current, submit_started] {
-                submit_latencies_us[current] = static_cast<std::uint64_t>(
+            if (effective_group_size == 1) {
+                const auto current = begin;
+                const auto route_key = route_key_count == 0
+                    ? std::string()
+                    : ("route-" + std::to_string(current % route_key_count));
+                return engine.info(make_payload(current, payload_size), route_key).then([&, current, group_index, submit_started] {
+                    const auto elapsed = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - submit_started)
+                            .count());
+                    submit_latencies_us[current] = elapsed;
+                    group_submit_latencies_us[group_index] = elapsed;
+                });
+            }
+
+            std::vector<log_engine::LogMessage> batch;
+            batch.reserve(end_index - begin);
+            for (std::uint64_t current = begin; current < end_index; ++current) {
+                const auto route_key = route_key_count == 0
+                    ? std::string()
+                    : ("route-" + std::to_string(current % route_key_count));
+                batch.push_back(log_engine::LogMessage{
+                    .level = log_engine::LogLevel::info,
+                    .payload = make_payload(current, payload_size),
+                    .route_key = std::move(route_key),
+                });
+            }
+            return engine.append_batch(std::move(batch)).then([&, begin, end_index, group_index, submit_started] {
+                const auto elapsed = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - submit_started)
                         .count());
+                group_submit_latencies_us[group_index] = elapsed;
+                for (std::uint64_t current = begin; current < end_index; ++current) {
+                    submit_latencies_us[current] = elapsed;
+                }
             });
         });
 
@@ -161,15 +196,33 @@ int main(int argc, char** argv) {
         const auto p50_latency_us = percentile_us(sorted_latencies, 0.50);
         const auto p95_latency_us = percentile_us(sorted_latencies, 0.95);
         const auto p99_latency_us = percentile_us(sorted_latencies, 0.99);
+        double avg_group_latency_us = 0.0;
+        if (!group_submit_latencies_us.empty()) {
+            std::uint64_t latency_sum = 0;
+            for (const auto latency_us : group_submit_latencies_us) {
+                latency_sum += latency_us;
+            }
+            avg_group_latency_us = static_cast<double>(latency_sum) / static_cast<double>(group_submit_latencies_us.size());
+        }
+        auto sorted_group_latencies = group_submit_latencies_us;
+        std::sort(sorted_group_latencies.begin(), sorted_group_latencies.end());
+        const auto p50_group_latency_us = percentile_us(sorted_group_latencies, 0.50);
+        const auto p95_group_latency_us = percentile_us(sorted_group_latencies, 0.95);
+        const auto p99_group_latency_us = percentile_us(sorted_group_latencies, 0.99);
 
         fmt::print(
-            "messages={} elapsed_us={} throughput_msg_per_sec={:.2f} avg_submit_us={:.4f} p50_submit_us={:.4f} p95_submit_us={:.4f} p99_submit_us={:.4f}\n",
+            "messages={} elapsed_us={} throughput_msg_per_sec={:.2f} submit_group_size={} avg_submit_us={:.4f} p50_submit_us={:.4f} p95_submit_us={:.4f} p99_submit_us={:.4f} avg_group_submit_us={:.4f} p50_group_submit_us={:.4f} p95_group_submit_us={:.4f} p99_group_submit_us={:.4f}\n",
             total_messages,
             elapsed_us,
             throughput,
+            effective_group_size,
             avg_latency_us,
             p50_latency_us,
             p95_latency_us,
-            p99_latency_us);
+            p99_latency_us,
+            avg_group_latency_us,
+            p50_group_latency_us,
+            p95_group_latency_us,
+            p99_group_latency_us);
     });
 }

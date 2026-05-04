@@ -123,6 +123,26 @@ seastar::future<> AsyncWriter::submit(LogMessage message) {
     co_await maybe_wait_for_backpressure();
 }
 
+seastar::future<> AsyncWriter::submit_many(std::vector<LogMessage> messages) {
+    if (_stopping || messages.empty()) {
+        co_return;
+    }
+    for (auto& message : messages) {
+        submit_record(std::move(message));
+    }
+    if (pending_entries() >= _config.batch_size || above_backpressure_limit()) {
+        switch (_config.ack_mode) {
+        case AckMode::write_ack:
+            co_await flush_background(false, true);
+            break;
+        case AckMode::sync_ack:
+            co_await flush_background(true, true);
+            break;
+        }
+    }
+    co_await maybe_wait_for_backpressure();
+}
+
 std::size_t AsyncWriter::pending_entries() const noexcept {
     return _pending.size();
 }
