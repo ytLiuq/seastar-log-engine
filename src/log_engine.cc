@@ -51,8 +51,25 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
     std::vector<unsigned> shards;
     shards.reserve(messages.size());
     std::vector<std::size_t> per_shard_counts(seastar::smp::count, 0);
+    std::uint64_t empty_route_base = 0;
+    std::uint64_t empty_route_index = 0;
+    if (_config.empty_route_policy == EmptyRoutePolicy::round_robin) {
+        std::size_t empty_count = 0;
+        for (const auto& message : messages) {
+            empty_count += message.route_key.empty();
+        }
+        if (empty_count > 0) {
+            empty_route_base = _rr_counter.fetch_add(empty_count, std::memory_order_relaxed);
+        }
+    }
     for (const auto& message : messages) {
-        const auto shard = route_to_shard(message.route_key);
+        unsigned shard = 0;
+        if (_config.empty_route_policy == EmptyRoutePolicy::round_robin && message.route_key.empty()) {
+            shard = static_cast<unsigned>((empty_route_base + empty_route_index) % seastar::smp::count);
+            ++empty_route_index;
+        } else {
+            shard = route_to_shard(message.route_key);
+        }
         shards.push_back(shard);
         ++per_shard_counts[shard];
     }

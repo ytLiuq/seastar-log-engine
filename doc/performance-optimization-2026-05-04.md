@@ -16,6 +16,7 @@ It separates:
 Commit:
 
 - `daf70d4` `Improve multi-shard empty-key routing`
+- pending new optimization from the same date is recorded below after validation
 
 Changes in this commit:
 
@@ -69,6 +70,54 @@ Additional reference point under distributed keys:
 
 This confirms that the earlier batched cross-shard submit path is still directionally helpful when routing already spreads traffic.
 
+## Accepted Optimization
+
+Commit:
+
+- to be recorded after push: batch round-robin reservation for empty-key grouped submit
+
+Changes:
+
+- for `append_batch()` under `empty-route-policy=round_robin`, empty route keys no longer call `_rr_counter.fetch_add(1)` per message
+- the batch first counts empty-key records, reserves one contiguous round-robin index range, and then assigns shard targets from that reserved range
+
+### Why this was accepted
+
+After enabling round-robin for empty keys, grouped submit still paid one atomic increment per empty-key record.
+
+That overhead is pure control-plane cost in the exact scenario where the caller is trying to batch many empty-key writes together.
+
+### Benchmark signal
+
+Command shape:
+
+```bash
+./build/log_engine_bench \
+  --messages 40000 \
+  --payload-size 512 \
+  --batch-size 512 \
+  --flush-ms 1 \
+  --inflight 16 \
+  --route-keys 0 \
+  --empty-route-policy round_robin \
+  --submit-group-size 16 \
+  -c 4
+```
+
+Results:
+
+| Version | Throughput (msg/s) | P95 Group Submit (us) | P99 Group Submit (us) |
+| --- | ---: | ---: | ---: |
+| before batch reservation | `865220.31` | `475` | `2661` |
+| after batch reservation | `959140.61` | `383` | `2200` |
+| after rerun | `1084334.08` | `276` | `1905` |
+
+Interpretation:
+
+- first confirmed run improved throughput by about `10.9%`
+- rerun stayed directionally positive and crossed `1.08M msg/s`
+- tail latency also improved rather than regressed, which makes this a clean acceptance
+
 ## Rejected Experiment
 
 Experiment:
@@ -114,6 +163,7 @@ Reason:
 ## Current Takeaways
 
 - The most material bottleneck fixed on 2026-05-04 was distribution of empty-key traffic, not raw record encoding cost.
+- Once empty-key traffic is allowed to spread, reducing round-robin control overhead inside grouped submit produces another measurable gain.
 - If a workload emits many records without route keys, `empty-route-policy=round_robin` is now the right benchmark setting when the goal is to evaluate multi-shard ingest capacity rather than single-shard locality.
 - The next likely high-value optimization is still deeper batching inside the target shard:
   - batch record encoding
