@@ -8,7 +8,6 @@ DOC_DIR="${ROOT_DIR}/doc"
 messages=100000
 repeats=3
 shards=1
-mode="fast"
 output_prefix=""
 
 usage() {
@@ -20,7 +19,6 @@ Options:
   --messages <n>
   --repeats <n>
   --shards <n>
-  --mode <fast|full>
   --output-prefix <name>
 EOF
 }
@@ -52,7 +50,6 @@ run_log_engine() {
   mkdir -p "${ROOT_DIR}/logs" "${ROOT_DIR}/archive"
 
   ./build/log_engine_bench \
-    --mode "${mode}" \
     --ack-mode "${ack_mode}" \
     --log-dir "${ROOT_DIR}/logs" \
     --archive-dir "${ROOT_DIR}/archive" \
@@ -98,7 +95,7 @@ append_row() {
   local batch_size="$6"
   local inflight="$7"
   local line="$8"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${scenario}" \
     "${target}" \
     "${run_id}" \
@@ -113,8 +110,7 @@ append_row() {
     "$(extract_metric "${line}" "avg_submit_us")" \
     "$(extract_metric "${line}" "p50_submit_us")" \
     "$(extract_metric "${line}" "p95_submit_us")" \
-    "$(extract_metric "${line}" "p99_submit_us")" \
-    "${mode}" >>"${tsv_path}"
+    "$(extract_metric "${line}" "p99_submit_us")" >>"${tsv_path}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -122,7 +118,6 @@ while [[ $# -gt 0 ]]; do
     --messages) messages="$2"; shift 2 ;;
     --repeats) repeats="$2"; shift 2 ;;
     --shards) shards="$2"; shift 2 ;;
-    --mode) mode="$2"; shift 2 ;;
     --output-prefix) output_prefix="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
@@ -137,17 +132,17 @@ md_path="${DOC_DIR}/${prefix}.md"
 raw_dir="${DOC_DIR}/${prefix}-raw"
 mkdir -p "${raw_dir}"
 
-printf 'scenario\ttarget\trun\tmessages\tpayload_size\tack_mode\tbatch_size\tinflight\tshards\telapsed_us\tthroughput_msg_per_sec\tavg_submit_us\tp50_submit_us\tp95_submit_us\tp99_submit_us\tmode\n' >"${tsv_path}"
+printf 'scenario\ttarget\trun\tmessages\tpayload_size\tack_mode\tbatch_size\tinflight\tshards\telapsed_us\tthroughput_msg_per_sec\tavg_submit_us\tp50_submit_us\tp95_submit_us\tp99_submit_us\n' >"${tsv_path}"
 
 log_engine_scenarios=(
-  "fast-128 memory_ack 8192 1 128"
-  "fast-512 memory_ack 8192 1 512"
-  "fast-2048 memory_ack 8192 1 2048"
+  "baseline-128 write_ack 8192 1 128"
+  "baseline-512 write_ack 8192 1 512"
+  "baseline-2048 write_ack 8192 1 2048"
   "ack-write-2048 write_ack 8192 1 2048"
   "ack-sync-2048 sync_ack 8192 1 2048"
-  "batch-2048-1024 memory_ack 1024 1 2048"
-  "batch-2048-8192 memory_ack 8192 1 2048"
-  "inflight-2048-4 memory_ack 8192 4 2048"
+  "batch-2048-1024 write_ack 1024 1 2048"
+  "batch-2048-8192 write_ack 8192 1 2048"
+  "inflight-2048-4 write_ack 8192 4 2048"
 )
 
 compare_payloads=(128 512 2048)
@@ -187,7 +182,6 @@ fi
   echo "- messages_per_run: \`${messages}\`"
   echo "- repeats: \`${repeats}\`"
   echo "- shards: \`${shards}\`"
-  echo "- mode: \`${mode}\`"
   echo
   echo "| Scenario | Target | Payload | Runs | Avg Throughput (msg/s) | Avg P95 (us) | Avg P99 (us) |"
   echo "| --- | --- | ---: | ---: | ---: | ---: | ---: |"

@@ -48,7 +48,6 @@ run_log_engine() {
   mkdir -p "${ROOT_DIR}/logs" "${ROOT_DIR}/archive"
 
   ./build/log_engine_bench \
-    --mode fast \
     --log-dir "${ROOT_DIR}/logs" \
     --archive-dir "${ROOT_DIR}/archive" \
     --messages "${messages}" \
