@@ -174,6 +174,60 @@ Interpretation:
 - the primary validation case improved by about `5.7%`
 - tail latency also improved, which suggests this is genuinely removing control overhead instead of just shifting work around
 
+## Accepted Optimization
+
+Commit:
+
+- to be recorded after push: all-empty round-robin batch partition fast path
+
+Changes:
+
+- when `append_batch()` sees that every record has an empty route key and `empty-route-policy=round_robin`
+- it now partitions the batch directly by arithmetic shard sequence
+- it skips building the intermediate `shards` vector used by the generic routing path
+
+### Why this was accepted
+
+After batching the round-robin counter reservation, the grouped empty-key case still paid one extra per-message bookkeeping pass to remember every target shard before bucketing.
+
+For a batch whose routing pattern is already fully determined by:
+
+- batch start index
+- shard count
+- record position in the batch
+
+that indirection is unnecessary.
+
+### Benchmark signal
+
+Command shape:
+
+```bash
+./build/log_engine_bench \
+  --messages 40000 \
+  --payload-size 512 \
+  --batch-size 512 \
+  --flush-ms 1 \
+  --inflight 16 \
+  --route-keys 0 \
+  --empty-route-policy round_robin \
+  --submit-group-size 16 \
+  -c 4
+```
+
+Results:
+
+| Version | Throughput (msg/s) | P95 Group Submit (us) | P99 Group Submit (us) |
+| --- | ---: | ---: | ---: |
+| before direct all-empty partition | `986144.67` | `347` | `2044` |
+| after direct all-empty partition | `1123658.63` | `270` | `1905` |
+
+Interpretation:
+
+- throughput improved by about `13.9%`
+- tail latency improved together with throughput
+- the effect is large enough to justify keeping a dedicated fast path for this workload shape
+
 ## Rejected Experiment
 
 Experiment:

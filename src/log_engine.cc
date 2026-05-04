@@ -47,23 +47,61 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
         co_return;
     }
 
-    std::vector<unsigned> shards;
-    shards.reserve(messages.size());
     std::vector<std::size_t> per_shard_counts(seastar::smp::count, 0);
     std::uint64_t empty_route_base = 0;
     std::uint64_t empty_route_index = 0;
     unsigned first_shard = 0;
     bool first_shard_set = false;
     bool all_same_shard = true;
+    bool all_empty_round_robin = _config.empty_route_policy == EmptyRoutePolicy::round_robin;
+    std::size_t empty_count = 0;
     if (_config.empty_route_policy == EmptyRoutePolicy::round_robin) {
-        std::size_t empty_count = 0;
         for (const auto& message : messages) {
             empty_count += message.route_key.empty();
         }
         if (empty_count > 0) {
             empty_route_base = _rr_counter.fetch_add(empty_count, std::memory_order_relaxed);
         }
+        all_empty_round_robin = empty_count == messages.size();
     }
+
+    if (all_empty_round_robin) {
+        std::vector<std::vector<LogMessage>> per_shard(seastar::smp::count);
+        const auto shard_count = seastar::smp::count;
+        const auto base_shard = static_cast<unsigned>(empty_route_base % shard_count);
+        const auto full_cycles = messages.size() / shard_count;
+        const auto remainder = messages.size() % shard_count;
+        for (unsigned offset = 0; offset < shard_count; ++offset) {
+            const auto shard = (base_shard + offset) % shard_count;
+            per_shard[shard].reserve(full_cycles + (offset < remainder ? 1 : 0));
+        }
+        for (std::size_t index = 0; index < messages.size(); ++index) {
+            const auto shard = static_cast<unsigned>((base_shard + index) % shard_count);
+            per_shard[shard].push_back(std::move(messages[index]));
+        }
+
+        std::vector<seastar::future<>> shard_submits;
+        shard_submits.reserve(shard_count);
+        for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
+            if (per_shard[shard].empty()) {
+                continue;
+            }
+            if (shard == seastar::this_shard_id()) {
+                shard_submits.push_back(_writers.local().submit_many(std::move(per_shard[shard])));
+                continue;
+            }
+            shard_submits.push_back(_writers.invoke_on(shard, [batch = std::move(per_shard[shard])](AsyncWriter& writer) mutable {
+                return writer.submit_many(std::move(batch));
+            }));
+        }
+        if (!shard_submits.empty()) {
+            co_await seastar::when_all_succeed(shard_submits.begin(), shard_submits.end());
+        }
+        co_return;
+    }
+
+    std::vector<unsigned> shards;
+    shards.reserve(messages.size());
     for (const auto& message : messages) {
         unsigned shard = 0;
         if (_config.empty_route_policy == EmptyRoutePolicy::round_robin && message.route_key.empty()) {
