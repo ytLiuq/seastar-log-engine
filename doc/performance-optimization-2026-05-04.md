@@ -281,6 +281,61 @@ Interpretation:
 - average grouped submit latency also improved
 - the gain is smaller than the round-robin fast paths, but it is stable and comes from a very small, low-risk specialization
 
+## Accepted Optimization
+
+Commit:
+
+- to be recorded after push: consistent-hash single-key batch fast path
+
+Changes:
+
+- under `routing_strategy=consistent_hashing`, `append_batch()` now detects the case where every record in the batch carries the same non-empty route key
+- in that case it routes once, then directly submits the whole batch to the target shard
+- this avoids repeating the same hash + ring lookup and skips the generic bucket/fanout path
+
+### Why this was accepted
+
+This optimization is intentionally scoped to `consistent_hashing`.
+
+On `hash_modulo`, the extra string-equality scan was not worth keeping.
+On `consistent_hashing`, the repeated hash plus `lower_bound()` on the vnode ring is expensive enough that the fast path becomes worthwhile.
+
+### Benchmark signal
+
+Command shape:
+
+```bash
+./build/log_engine_bench \
+  --routing-strategy consistent_hashing \
+  --routing-virtual-nodes 128 \
+  --messages 40000 \
+  --payload-size 2048 \
+  --batch-size 512 \
+  --flush-ms 1 \
+  --inflight 16 \
+  --route-keys 1 \
+  --submit-group-size 16 \
+  -c 4
+```
+
+Results:
+
+| Version | Throughput (msg/s) | P95 Group Submit (us) |
+| --- | ---: | ---: |
+| before single-key fast path | `134558.26` | `796` |
+| after single-key fast path | `135940.21` | `845` |
+
+Additional reference point:
+
+| Payload | Throughput (msg/s) |
+| ---: | ---: |
+| `512` | `511620.17` |
+
+Interpretation:
+
+- throughput improved by about `1.0%`
+- this is a small optimization, but it is tightly scoped and low-risk once limited to `consistent_hashing`
+
 ## Rejected Experiment
 
 Experiment:

@@ -47,6 +47,30 @@ seastar::future<> LogEngine::append_batch(std::vector<LogMessage> messages) {
         co_return;
     }
 
+    if (_config.routing_strategy == RoutingStrategy::consistent_hashing) {
+        const auto& first_route_key = messages.front().route_key;
+        if (!first_route_key.empty()) {
+            bool all_same_route_key = true;
+            for (std::size_t index = 1; index < messages.size(); ++index) {
+                if (messages[index].route_key != first_route_key) {
+                    all_same_route_key = false;
+                    break;
+                }
+            }
+            if (all_same_route_key) {
+                const auto shard = route_to_shard(first_route_key);
+                if (shard == seastar::this_shard_id()) {
+                    co_await _writers.local().submit_many(std::move(messages));
+                    co_return;
+                }
+                co_await _writers.invoke_on(shard, [batch = std::move(messages)](AsyncWriter& writer) mutable {
+                    return writer.submit_many(std::move(batch));
+                });
+                co_return;
+            }
+        }
+    }
+
     if (_config.empty_route_policy == EmptyRoutePolicy::local) {
         bool all_empty_local = true;
         for (const auto& message : messages) {
