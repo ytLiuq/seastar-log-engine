@@ -129,25 +129,96 @@ void cleanup_temporary_sidecars(const EngineConfig& config) {
     }
 }
 
-std::string read_file_to_string(const std::string& path) {
-    namespace fs = std::filesystem;
-    const auto file_size = fs::file_size(path);
-    if (file_size == 0) {
-        return {};
-    }
+struct StreamedVerifiedLogState {
+    VerifiedLogState verified;
+    std::string trailing_bytes;
+};
 
+StreamedVerifiedLogState scan_log_file_streaming(const std::string& path, std::size_t trailing_capacity) {
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
         throw std::runtime_error("failed to open active log for recovery: " + path);
     }
 
-    std::string content(static_cast<std::size_t>(file_size), '\0');
-    in.read(content.data(), static_cast<std::streamsize>(content.size()));
-    const auto bytes_read = static_cast<std::size_t>(in.gcount());
-    if (bytes_read != content.size()) {
-        throw std::runtime_error("failed to read active log for recovery: " + path);
+    StreamedVerifiedLogState state;
+    std::array<char, 64 * 1024> buffer{};
+    std::string pending_line;
+    pending_line.reserve(4096);
+
+    auto append_to_trailing = [&](std::string_view bytes) {
+        if (trailing_capacity == 0 || bytes.empty()) {
+            return;
+        }
+        if (bytes.size() >= trailing_capacity) {
+            state.trailing_bytes.assign(bytes.substr(bytes.size() - trailing_capacity));
+            return;
+        }
+        const auto overflow = state.trailing_bytes.size() + bytes.size() > trailing_capacity
+            ? state.trailing_bytes.size() + bytes.size() - trailing_capacity
+            : 0;
+        if (overflow > 0) {
+            state.trailing_bytes.erase(0, overflow);
+        }
+        state.trailing_bytes.append(bytes.data(), bytes.size());
+    };
+
+    while (in.good()) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto bytes_read = static_cast<std::size_t>(in.gcount());
+        if (bytes_read == 0) {
+            break;
+        }
+
+        std::string_view chunk(buffer.data(), bytes_read);
+        std::size_t offset = 0;
+        while (offset < chunk.size()) {
+            const auto newline = chunk.find('\n', offset);
+            if (newline == std::string_view::npos) {
+                pending_line.append(chunk.substr(offset));
+                break;
+            }
+
+            if (pending_line.empty()) {
+                const auto line = chunk.substr(offset, newline - offset);
+                if (!line.empty()) {
+                    if (!verify_record_line(line)) {
+                        state.verified.clean_end = false;
+                        return state;
+                    }
+                    const auto sequence = extract_sequence(line);
+                    state.verified.next_sequence = sequence ? (*sequence + 1) : (state.verified.next_sequence + 1);
+                    ++state.verified.valid_records;
+                }
+                state.verified.valid_size += static_cast<std::uint64_t>(newline - offset + 1);
+                append_to_trailing(chunk.substr(offset, newline - offset + 1));
+            } else {
+                pending_line.append(chunk.substr(offset, newline - offset));
+                if (!pending_line.empty()) {
+                    if (!verify_record_line(pending_line)) {
+                        state.verified.clean_end = false;
+                        return state;
+                    }
+                    const auto sequence = extract_sequence(pending_line);
+                    state.verified.next_sequence = sequence ? (*sequence + 1) : (state.verified.next_sequence + 1);
+                    ++state.verified.valid_records;
+                }
+                state.verified.valid_size += static_cast<std::uint64_t>(pending_line.size() + 1);
+                append_to_trailing(pending_line);
+                append_to_trailing("\n");
+                pending_line.clear();
+            }
+            offset = newline + 1;
+        }
     }
-    return content;
+
+    if (!in.eof() && in.fail()) {
+        throw std::runtime_error("failed while reading active log for recovery: " + path);
+    }
+
+    if (!pending_line.empty()) {
+        state.verified.clean_end = false;
+    }
+    return state;
 }
 
 }
@@ -244,8 +315,9 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
             return recovery;
         }
 
-        const auto content = read_file_to_string(active_segment.path);
-        const auto verified = scan_log_content(content);
+        const auto trailing_capacity = alignment == 0 ? std::size_t{0} : alignment;
+        const auto streamed = scan_log_file_streaming(active_segment.path, trailing_capacity);
+        const auto& verified = streamed.verified;
         auto valid_size = verified.valid_size;
         auto sequence = verified.next_sequence;
         auto rotation_index = std::uint64_t{0};
@@ -283,8 +355,11 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
         }
 
         const auto tail_size = alignment == 0 ? 0 : static_cast<std::size_t>(valid_size % alignment);
-        if (tail_size > 0 && valid_size <= content.size()) {
-            recovery.tail_buffer = content.substr(valid_size - tail_size, tail_size);
+        if (tail_size > 0) {
+            if (streamed.trailing_bytes.size() < tail_size) {
+                throw std::runtime_error("recovery trailing buffer shorter than expected valid tail");
+            }
+            recovery.tail_buffer = streamed.trailing_bytes.substr(streamed.trailing_bytes.size() - tail_size);
         }
         return recovery;
     });
