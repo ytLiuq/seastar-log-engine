@@ -158,11 +158,21 @@ elseif (SYSTEM_FMT_LIBRARY)
 endif ()
 
 add_executable(log_engine_unit_tests
-    src/unit_tests.cc)
+    src/unit_tests.cc
+    src/unit_tests_health.cc
+    src/unit_tests_query.cc
+    src/unit_tests_recovery_streaming.cc
+    ${LOG_ENGINE_QUERY_PROTO_SRCS})
+
+target_include_directories(log_engine_unit_tests
+    PRIVATE
+        ${GENERATED_PROTO_DIR})
 
 target_link_libraries(log_engine_unit_tests
     PRIVATE
-        log_engine_core)
+        log_engine_core
+        PkgConfig::PROTOBUF
+        PkgConfig::GRPCPP)
 
 if (GLOG_LIBRARY)
     add_executable(glog_bench

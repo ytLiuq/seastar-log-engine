@@ -21,11 +21,14 @@ public:
     [[nodiscard]] std::uint64_t lifetime_total() const noexcept;
     void reset() noexcept;
     bool maybe_advance_window() noexcept;
+    void record_for_minute(std::uint64_t minute, std::uint64_t delta = 1) noexcept;
+    [[nodiscard]] std::uint64_t recent_sum_for_minute(std::uint64_t minute) const noexcept;
 
 private:
-    void clear_stale_windows(std::uint64_t current_minute) noexcept;
+    void rotate_current_bucket(std::uint64_t minute) noexcept;
 
     std::array<std::atomic<std::uint64_t>, kNumWindows> _windows{};
+    std::array<std::atomic<std::uint64_t>, kNumWindows> _window_minutes{};
     std::atomic<std::uint64_t> _lifetime{0};
     std::atomic<std::uint64_t> _last_minute{0};
     std::atomic<std::size_t> _current_bucket{0};

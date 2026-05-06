@@ -4,6 +4,7 @@
 #include <string>
 
 #include <boost/program_options.hpp>
+#include <log_engine_query.pb.h>
 #include <zlib.h>
 
 #include <seastar/core/app-template.hh>
@@ -16,6 +17,11 @@
 #include "log_engine/log_reader.hh"
 #include "log_engine/record_codec.hh"
 #include "log_engine/routing.hh"
+
+seastar::future<> test_recovery_scan_large_file_streaming(const std::string& root_dir);
+seastar::future<> test_health_counter_window_eviction();
+seastar::future<> test_limit_zero_returns_no_records(const std::string& root_dir);
+seastar::future<> test_query_records_proto_defaults();
 
 namespace {
 namespace fs = std::filesystem;
@@ -855,6 +861,7 @@ int main(int argc, char** argv) {
         co_await test_record_codec();
         co_await test_config_loader(root_dir);
         co_await test_config_validation();
+        co_await test_health_counter_window_eviction();
         co_await test_consistent_hash_routing();
         co_await test_compat_logging(root_dir);
         co_await test_compat_unbound_drops_messages(root_dir);
@@ -866,6 +873,7 @@ int main(int argc, char** argv) {
         co_await test_reader_skips_broken_gzip_archive(root_dir);
         co_await test_reader_skips_segment_removed_after_enumeration(root_dir);
         co_await test_recovery_scan(root_dir);
+        co_await test_recovery_scan_large_file_streaming(root_dir);
         co_await test_partial_checkpoint_ignored(root_dir);
         co_await test_stale_checkpoint_ignored(root_dir);
         co_await test_recovery_after_rotate(root_dir, false, false);
@@ -874,6 +882,8 @@ int main(int argc, char** argv) {
         co_await test_recovery_after_rotate(root_dir, true, true);
         co_await test_prepare_cleans_temporary_sidecars(root_dir);
         co_await test_crc_class_roundtrip();
+        co_await test_limit_zero_returns_no_records(root_dir);
+        co_await test_query_records_proto_defaults();
         co_await test_crash_during_write_recovery(root_dir);
         co_await test_checkpoint_clean_shutdown_restore(root_dir);
         co_return;

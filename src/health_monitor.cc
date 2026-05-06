@@ -29,18 +29,11 @@ std::unique_ptr<seastar::metrics::metric_groups> g_health_metrics;
 }  // namespace
 
 void SlidingWindowCounter::record(std::uint64_t delta) noexcept {
-    maybe_advance_window();
-    _windows[_current_bucket.load(std::memory_order_relaxed)].fetch_add(delta, std::memory_order_relaxed);
-    _lifetime.fetch_add(delta, std::memory_order_relaxed);
+    record_for_minute(current_wall_clock_minute(), delta);
 }
 
 std::uint64_t SlidingWindowCounter::recent_sum() const noexcept {
-    const auto current = _current_bucket.load(std::memory_order_relaxed);
-    std::uint64_t sum = 0;
-    for (std::size_t i = 0; i < kNumWindows; ++i) {
-        sum += _windows[i].load(std::memory_order_relaxed);
-    }
-    return sum;  // all buckets are within the window since stale ones are cleared on advance
+    return recent_sum_for_minute(current_wall_clock_minute());
 }
 
 std::uint64_t SlidingWindowCounter::lifetime_total() const noexcept {
@@ -51,41 +44,62 @@ void SlidingWindowCounter::reset() noexcept {
     for (auto& window : _windows) {
         window.store(0, std::memory_order_relaxed);
     }
+    for (auto& minute : _window_minutes) {
+        minute.store(0, std::memory_order_relaxed);
+    }
     _lifetime.store(0, std::memory_order_relaxed);
     _last_minute.store(0, std::memory_order_relaxed);
     _current_bucket.store(0, std::memory_order_relaxed);
 }
 
 bool SlidingWindowCounter::maybe_advance_window() noexcept {
-    const auto minute = current_wall_clock_minute();
-    auto last = _last_minute.load(std::memory_order_relaxed);
-    if (minute == last) {
-        return false;
-    }
-    if (!_last_minute.compare_exchange_strong(last, minute, std::memory_order_relaxed)) {
-        return false;  // another caller advanced
-    }
-    clear_stale_windows(minute);
-    const auto next = (_current_bucket.load(std::memory_order_relaxed) + 1) % kNumWindows;
-    _current_bucket.store(next, std::memory_order_relaxed);
-    _windows[next].store(0, std::memory_order_relaxed);
-    return true;
+    const auto before = _last_minute.load(std::memory_order_relaxed);
+    rotate_current_bucket(current_wall_clock_minute());
+    return _last_minute.load(std::memory_order_relaxed) != before;
 }
 
-void SlidingWindowCounter::clear_stale_windows(std::uint64_t current_minute) noexcept {
-    const auto oldest_valid_minute = current_minute > kNumWindows
-        ? current_minute - kNumWindows
-        : 0;
-    // If we've been idle for more than kNumWindows minutes, clear all windows
-    if (current_minute - oldest_valid_minute >= kNumWindows) {
-        // Only clear buckets that are more than kNumWindows behind
-        for (std::size_t i = 0; i < kNumWindows; ++i) {
-            const auto bucket = (i + _current_bucket.load(std::memory_order_relaxed) + 1) % kNumWindows;
-            // Clear stale buckets that are too far behind
-            if (i >= kNumWindows - 1) {
-                _windows[bucket].store(0, std::memory_order_relaxed);
-            }
+void SlidingWindowCounter::record_for_minute(std::uint64_t minute, std::uint64_t delta) noexcept {
+    rotate_current_bucket(minute);
+    _windows[_current_bucket.load(std::memory_order_relaxed)].fetch_add(delta, std::memory_order_relaxed);
+    _lifetime.fetch_add(delta, std::memory_order_relaxed);
+}
+
+std::uint64_t SlidingWindowCounter::recent_sum_for_minute(std::uint64_t minute) const noexcept {
+    std::uint64_t sum = 0;
+    for (std::size_t i = 0; i < kNumWindows; ++i) {
+        const auto bucket_minute = _window_minutes[i].load(std::memory_order_relaxed);
+        if (bucket_minute == 0 || bucket_minute > minute) {
+            continue;
         }
+        if (minute - bucket_minute >= kNumWindows) {
+            continue;
+        }
+        sum += _windows[i].load(std::memory_order_relaxed);
+    }
+    return sum;
+}
+
+void SlidingWindowCounter::rotate_current_bucket(std::uint64_t minute) noexcept {
+    while (true) {
+        auto last = _last_minute.load(std::memory_order_relaxed);
+        if (last == minute) {
+            return;
+        }
+        if (!_last_minute.compare_exchange_weak(last, minute, std::memory_order_relaxed)) {
+            continue;
+        }
+
+        auto next = _current_bucket.load(std::memory_order_relaxed);
+        if (last == 0 || minute <= last || minute - last >= kNumWindows) {
+            next = static_cast<std::size_t>(minute % kNumWindows);
+        } else {
+            next = (next + static_cast<std::size_t>(minute - last)) % kNumWindows;
+        }
+
+        _current_bucket.store(next, std::memory_order_relaxed);
+        _windows[next].store(0, std::memory_order_relaxed);
+        _window_minutes[next].store(minute, std::memory_order_relaxed);
+        return;
     }
 }
 
