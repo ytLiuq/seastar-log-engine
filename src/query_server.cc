@@ -309,7 +309,7 @@ log_engine::ReadQuery read_query_from_proto(const QueryRecordsRequest& req) {
         query.time_to = req.time_to();
     }
     query.limit = req.limit() == 0 ? 100 : static_cast<std::size_t>(req.limit());
-    query.include_archive = req.include_archive();
+    query.include_archive = req.has_include_archive() ? req.include_archive() : true;
     return query;
 }
 

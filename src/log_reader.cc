@@ -166,6 +166,10 @@ std::vector<ParsedRecord> read_records_from_segments(
     std::vector<ParsedRecord> records;
     records.reserve(query.limit);
 
+    if (query.limit == 0) {
+        return records;
+    }
+
     for (const auto& segment : segments) {
         ++g_segments_read;
         if (segment.archived) {

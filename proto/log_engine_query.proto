@@ -58,7 +58,7 @@ message QueryRecordsRequest {
   optional string time_from = 4;
   optional string time_to = 5;
   uint64 limit = 6;
-  bool include_archive = 7;
+  optional bool include_archive = 7;
 }
 
 message QueryRecord {
