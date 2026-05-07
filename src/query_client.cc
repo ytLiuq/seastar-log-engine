@@ -19,20 +19,48 @@ using logengine::query::v1::RouteReply;
 using logengine::query::v1::RouteRequest;
 using logengine::query::v1::StatusReply;
 
+std::string json_escape(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (const char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            escaped.push_back(ch);
+            break;
+        }
+    }
+    return escaped;
+}
+
 void print_status(const StatusReply& reply) {
     fmt::print(
         "{{\"health\":\"{}\",\"health_reason\":\"{}\",\"health_reason_basis\":\"{}\",\"recovery_fallback_reason\":\"{}\",\"routing_strategy\":\"{}\",\"routing_shards\":{},\"routing_virtual_nodes\":{},\"ring_size\":{},\"log_dir\":\"{}\",\"archive_dir\":\"{}\",\"shard_file_prefix\":\"{}\",\"reader_stats\":{{\"segments_read\":{},\"archive_segments_read\":{},\"active_segments_read\":{},\"records_returned\":{},\"corrupted_segments\":{},\"corrupted_lines\":{},\"gzip_read_errors\":{}}},\"log_manager_stats\":{{\"rotate_operations\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_fallback_incomplete_checkpoint\":{},\"recovery_fallback_stale_checkpoint\":{},\"gzip_archive_successes\":{},\"gzip_archive_failures\":{}}},\"health_recent_errors\":{{\"reader_corrupted_segments\":{},\"reader_corrupted_lines\":{},\"reader_gzip_read_errors\":{},\"log_manager_checkpoint_failures\":{},\"log_manager_gzip_failures\":{},\"log_manager_recovery_fallbacks\":{}}}}}\n",
-        reply.health(),
-        reply.health_reason(),
-        reply.health_reason_basis(),
-        reply.recovery_fallback_reason(),
-        reply.routing_strategy(),
+        json_escape(reply.health()),
+        json_escape(reply.health_reason()),
+        json_escape(reply.health_reason_basis()),
+        json_escape(reply.recovery_fallback_reason()),
+        json_escape(reply.routing_strategy()),
         reply.routing_shards(),
         reply.routing_virtual_nodes(),
         reply.ring_size(),
-        reply.log_dir(),
-        reply.archive_dir(),
-        reply.shard_file_prefix(),
+        json_escape(reply.log_dir()),
+        json_escape(reply.archive_dir()),
+        json_escape(reply.shard_file_prefix()),
         reply.reader_segments_read(),
         reply.reader_archive_segments_read(),
         reply.reader_active_segments_read(),
@@ -59,7 +87,7 @@ void print_status(const StatusReply& reply) {
 void print_route(const RouteReply& reply) {
     fmt::print(
         "{{\"route_key\":\"{}\",\"shard\":{},\"hash\":{},\"token\":{},\"used_local_fallback\":{}}}\n",
-        reply.route_key(),
+        json_escape(reply.route_key()),
         reply.shard(),
         reply.hash(),
         reply.token(),
@@ -77,13 +105,13 @@ void print_records(const QueryRecordsReply& reply) {
         fmt::print(
             "{{\"crc\":{},\"timestamp\":\"{}\",\"shard\":{},\"has_sequence\":{},\"sequence\":{},\"level\":\"{}\",\"payload\":\"{}\",\"raw_line\":\"{}\"}}",
             record.crc(),
-            record.timestamp(),
+            json_escape(record.timestamp()),
             record.shard(),
             record.has_sequence() ? "true" : "false",
             record.sequence(),
-            record.level(),
-            record.payload(),
-            record.raw_line());
+            json_escape(record.level()),
+            json_escape(record.payload()),
+            json_escape(record.raw_line()));
     }
     fmt::print("]}}\n");
 }
