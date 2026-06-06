@@ -1,5 +1,6 @@
 #include <atomic>
 #include <charconv>
+#include <csignal>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -13,15 +14,16 @@
 #include <grpcpp/grpcpp.h>
 
 #include <seastar/core/app-template.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/prometheus.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/defer.hh>
 
-#include "../../seastar/apps/lib/stop_signal.hh"
 #include "log_engine/config_loader.hh"
 #include "log_engine/health_monitor.hh"
 #include "log_engine/log_manager.hh"
@@ -93,6 +95,37 @@ bool parse_bool_or_default(std::string_view value, bool fallback) {
     }
     throw std::invalid_argument("invalid bool query parameter");
 }
+
+class StopSignal {
+public:
+    StopSignal() {
+        seastar::engine().handle_signal(SIGINT, [this] {
+            signal();
+        });
+        seastar::engine().handle_signal(SIGTERM, [this] {
+            signal();
+        });
+    }
+
+    seastar::future<> wait() {
+        return _stopped.wait([this] {
+            return _signaled;
+        });
+    }
+
+private:
+    void signal() {
+        if (_signaled) {
+            return;
+        }
+        _signaled = true;
+        _stopped.broadcast();
+    }
+
+private:
+    bool _signaled = false;
+    seastar::condition_variable _stopped;
+};
 
 struct QueryContext {
     log_engine::EngineConfig config;
@@ -429,7 +462,7 @@ int main(int argc, char** argv) {
 
     return app.run(argc, argv, [&app] {
         return seastar::async([&app] {
-            seastar_apps_lib::stop_signal stop_signal;
+            StopSignal stop_signal;
             auto& options = app.configuration();
 
             log_engine::EngineConfig base;

@@ -3,5 +3,7 @@ Dockerfile text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
 *.md text eol=lf
+*.cc text eol=lf
+*.hh text eol=lf
 .gitignore text eol=lf
 CMakeLists.txt text eol=lf
