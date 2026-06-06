@@ -1,0 +1,10 @@
+.git
+.deps
+build
+logs
+archive
+logs-glog
+logs-spdlog
+test-tmp
+*.log
+*.log.checkpoint

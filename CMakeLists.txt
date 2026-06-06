@@ -6,15 +6,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(SEASTAR_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../seastar"
+    CACHE PATH
+    "Path to a Seastar source checkout")
+
 set(SEASTAR_BUILD_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../seastar/build/release"
+    "${SEASTAR_ROOT}/build/release"
     CACHE PATH
     "Path to a Seastar build directory containing SeastarConfig.cmake")
 
-list(APPEND CMAKE_MODULE_PATH
-    "${CMAKE_CURRENT_SOURCE_DIR}/../seastar/cmake")
+if (EXISTS "${SEASTAR_ROOT}/cmake")
+    list(APPEND CMAKE_MODULE_PATH "${SEASTAR_ROOT}/cmake")
+endif ()
 
 find_package(Seastar REQUIRED CONFIG PATHS "${SEASTAR_BUILD_DIR}" NO_DEFAULT_PATH)
+find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(fmt QUIET CONFIG)

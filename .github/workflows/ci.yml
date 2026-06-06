@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docker-regression:
+    name: Docker build and unit regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and run unit tests
+        run: docker build --target test --build-arg SEASTAR_REF="${SEASTAR_REF}" .
+        env:
+          SEASTAR_REF: master

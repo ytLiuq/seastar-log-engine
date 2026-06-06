@@ -27,6 +27,21 @@
 ./script/build.sh
 ```
 
+By default the build script expects a Seastar checkout at `.deps/seastar`.
+Bootstrap it locally with:
+
+```bash
+bash ./script/bootstrap_seastar.sh
+./script/build.sh
+./script/test_unit.sh
+```
+
+For a fully containerized build and unit regression run:
+
+```bash
+docker build --target test .
+```
+
 ## Quick Start
 
 运行 demo：
@@ -77,6 +92,5 @@
 ## Docs
 
 - 详细使用说明：[doc/README.md](doc/README.md)
-- 当前状态与 TODO：[TODO.md](TODO.md)
 - 历史状态快照：[doc/seastar-log-engine-current-status-and-todo-2026-05-01.md](doc/seastar-log-engine-current-status-and-todo-2026-05-01.md)
 - 实施方案：`../docs/基于Seastar的高性能异步批量日志顺序写入引擎实施方案.md`
