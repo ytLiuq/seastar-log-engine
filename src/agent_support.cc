@@ -9,6 +9,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <glob.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -25,6 +26,8 @@ namespace log_engine::agent {
 
 namespace {
 namespace fs = std::filesystem;
+
+constexpr std::string_view kBase64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::uint64_t parse_u64(std::string_view value, const char* field) {
     std::uint64_t parsed = 0;
@@ -108,6 +111,71 @@ std::string json_escape(std::string_view value) {
         }
     }
     return escaped;
+}
+
+std::string base64_encode(std::string_view input) {
+    std::string output;
+    output.reserve(((input.size() + 2) / 3) * 4);
+    std::size_t i = 0;
+    while (i < input.size()) {
+        const auto b0 = static_cast<unsigned char>(input[i++]);
+        const auto has_b1 = i < input.size();
+        const auto b1 = has_b1 ? static_cast<unsigned char>(input[i++]) : 0;
+        const auto has_b2 = i < input.size();
+        const auto b2 = has_b2 ? static_cast<unsigned char>(input[i++]) : 0;
+
+        output.push_back(kBase64Alphabet[(b0 >> 2) & 0x3f]);
+        output.push_back(kBase64Alphabet[((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0f)]);
+        output.push_back(has_b1 ? kBase64Alphabet[((b1 & 0x0f) << 2) | ((b2 >> 6) & 0x03)] : '=');
+        output.push_back(has_b2 ? kBase64Alphabet[b2 & 0x3f] : '=');
+    }
+    return output;
+}
+
+int base64_value(char ch) {
+    if (ch >= 'A' && ch <= 'Z') {
+        return ch - 'A';
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        return ch - 'a' + 26;
+    }
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0' + 52;
+    }
+    if (ch == '+') {
+        return 62;
+    }
+    if (ch == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+std::string base64_decode(std::string_view input) {
+    if (input.size() % 4 != 0) {
+        throw std::runtime_error("invalid base64 pending delivery record");
+    }
+    std::string output;
+    output.reserve((input.size() / 4) * 3);
+    for (std::size_t i = 0; i < input.size(); i += 4) {
+        const auto v0 = base64_value(input[i]);
+        const auto v1 = base64_value(input[i + 1]);
+        const bool pad2 = input[i + 2] == '=';
+        const bool pad3 = input[i + 3] == '=';
+        const auto v2 = pad2 ? 0 : base64_value(input[i + 2]);
+        const auto v3 = pad3 ? 0 : base64_value(input[i + 3]);
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0 || (pad2 && !pad3)) {
+            throw std::runtime_error("invalid base64 pending delivery record");
+        }
+        output.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
+        if (!pad2) {
+            output.push_back(static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+        }
+        if (!pad3) {
+            output.push_back(static_cast<char>(((v2 & 0x03) << 6) | v3));
+        }
+    }
+    return output;
 }
 
 class SocketFd {
@@ -230,6 +298,73 @@ void store_delivery_offsets(const std::string& path, const std::vector<DeliveryO
             ",next_sequence=" + std::to_string(offset.next_sequence) + "\n";
     }
     store_text_file(path, content);
+}
+
+std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return std::nullopt;
+    }
+
+    DeliveryBatch batch;
+    bool saw_version = false;
+    bool saw_shard = false;
+    bool saw_first_sequence = false;
+    bool saw_next_sequence = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const auto pos = line.find('=');
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const auto key = line.substr(0, pos);
+        const auto value = line.substr(pos + 1);
+        if (key == "format_version") {
+            if (value != "1") {
+                return std::nullopt;
+            }
+            saw_version = true;
+        } else if (key == "shard") {
+            batch.shard = static_cast<unsigned>(parse_u64(value, "shard"));
+            saw_shard = true;
+        } else if (key == "first_sequence") {
+            batch.first_sequence = parse_u64(value, "first_sequence");
+            saw_first_sequence = true;
+        } else if (key == "next_sequence") {
+            batch.next_sequence = parse_u64(value, "next_sequence");
+            saw_next_sequence = true;
+        } else if (key == "record_b64") {
+            batch.records.push_back(base64_decode(value));
+        }
+    }
+
+    if (!saw_version || !saw_shard || !saw_first_sequence || !saw_next_sequence || batch.records.empty()) {
+        return std::nullopt;
+    }
+    if (batch.next_sequence < batch.first_sequence) {
+        return std::nullopt;
+    }
+    return batch;
+}
+
+void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch) {
+    std::string content = "format_version=1\n";
+    content += "shard=" + std::to_string(batch.shard) + "\n";
+    content += "first_sequence=" + std::to_string(batch.first_sequence) + "\n";
+    content += "next_sequence=" + std::to_string(batch.next_sequence) + "\n";
+    for (const auto& record : batch.records) {
+        content += "record_b64=" + base64_encode(record) + "\n";
+    }
+    store_text_file(path, content);
+}
+
+void remove_pending_delivery_batch(const std::string& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    fs::remove(path + ".tmp", ec);
 }
 
 std::uint64_t directory_size_bytes(const std::string& path) {
@@ -393,6 +528,31 @@ std::string render_json_batch(const std::vector<std::string>& records) {
         }
         body += "{\"message\":\"";
         body += json_escape(records[i]);
+        body += "\"}";
+    }
+    body += "]}";
+    return body;
+}
+
+std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch) {
+    std::string body = "{";
+    body += "\"agent_id\":\"";
+    body += json_escape(agent_id);
+    body += "\",\"shard\":";
+    body += std::to_string(batch.shard);
+    body += ",\"first_sequence\":";
+    body += std::to_string(batch.first_sequence);
+    body += ",\"next_sequence\":";
+    body += std::to_string(batch.next_sequence);
+    body += ",\"records\":[";
+    for (std::size_t i = 0; i < batch.records.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"sequence\":";
+        body += std::to_string(batch.first_sequence + i);
+        body += ",\"message\":\"";
+        body += json_escape(batch.records[i]);
         body += "\"}";
     }
     body += "]}";

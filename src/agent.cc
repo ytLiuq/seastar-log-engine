@@ -214,7 +214,7 @@ struct AgentContext {
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{}}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
@@ -229,7 +229,8 @@ struct AgentContext {
             stats.dynamic_backpressure.load(std::memory_order_relaxed),
             manager_stats.checkpoint_write_successes,
             manager_stats.checkpoint_write_failures,
-            manager_stats.recovery_fallbacks);
+            manager_stats.recovery_fallbacks,
+            log_engine::recovery_fallback_reason_to_string(log_engine::get_last_recovery_fallback_reason()));
     }
 };
 
@@ -261,6 +262,7 @@ SinkKind parse_sink_kind(std::string_view value) {
 }
 
 struct AgentRuntimeOptions {
+    std::string agent_id = "seastar-log-agent";
     std::string file_source_path;
     std::string file_source_glob;
     bool stdin_source_enabled = false;
@@ -273,6 +275,7 @@ struct AgentRuntimeOptions {
     SinkKind sink_kind = SinkKind::none;
     std::string sink_http_url;
     std::string delivery_offset_path = "agent-delivery.offset";
+    std::string pending_delivery_path = "agent-delivery.pending";
     std::size_t sink_batch_size = 100;
     std::size_t sink_retry_backoff_ms = 1000;
     std::size_t sink_retry_max_backoff_ms = 30000;
@@ -605,18 +608,23 @@ seastar::future<> run_unix_socket_source_loop(
     });
 }
 
-seastar::future<> deliver_batch(const AgentRuntimeOptions& options, const std::optional<log_engine::agent::HttpEndpoint>& endpoint, const std::vector<std::string>& payloads) {
+seastar::future<> deliver_batch(
+    const AgentRuntimeOptions& options,
+    const std::optional<log_engine::agent::HttpEndpoint>& endpoint,
+    const log_engine::agent::DeliveryBatch& batch) {
     switch (options.sink_kind) {
     case SinkKind::none:
         return seastar::make_ready_future<>();
     case SinkKind::stdout:
-        log_engine::agent::write_stdout_batch(payloads);
+        log_engine::agent::write_stdout_batch(batch.records);
         return seastar::make_ready_future<>();
     case SinkKind::http:
         if (!endpoint) {
             throw std::runtime_error("sink-kind=http requires sink-http-url");
         }
-        return log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_json_batch(payloads));
+        return log_engine::agent::post_http_batch_async(
+            *endpoint,
+            log_engine::agent::render_delivery_batch_json(options.agent_id, batch));
     case SinkKind::kafka:
         throw std::runtime_error("sink-kind=kafka is configured but Kafka sink is not linked in this build");
     case SinkKind::object_store:
@@ -646,7 +654,7 @@ seastar::future<> run_http_sink_loop(
             next_by_shard.try_emplace(shard, 0);
         }
 
-        std::optional<log_engine::agent::DeliveryBatch> pending;
+        auto pending = log_engine::agent::load_pending_delivery_batch(options.pending_delivery_path);
         std::size_t current_backoff_ms = options.sink_retry_backoff_ms;
         while (!stopping.load(std::memory_order_relaxed)) {
             try {
@@ -675,6 +683,7 @@ seastar::future<> run_http_sink_loop(
                             }
                         }
                         pending = std::move(batch);
+                        log_engine::agent::store_pending_delivery_batch(options.pending_delivery_path, *pending);
                         context.stats.sink_backlog_records.store(pending->records.size(), std::memory_order_relaxed);
                     }
                 }
@@ -686,7 +695,7 @@ seastar::future<> run_http_sink_loop(
                 }
 
                 const auto start = std::chrono::steady_clock::now();
-                deliver_batch(options, endpoint, pending->records).get();
+                deliver_batch(options, endpoint, *pending).get();
                 const auto end = std::chrono::steady_clock::now();
                 context.stats.last_sink_latency_ms.store(
                     static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()),
@@ -699,6 +708,7 @@ seastar::future<> run_http_sink_loop(
                     offsets.push_back(log_engine::agent::DeliveryOffset{.shard = shard, .next_sequence = next});
                 }
                 log_engine::agent::store_delivery_offsets(options.delivery_offset_path, offsets);
+                log_engine::agent::remove_pending_delivery_batch(options.pending_delivery_path);
                 context.stats.sink_sent.fetch_add(pending->records.size(), std::memory_order_relaxed);
                 context.stats.sink_backlog_records.store(0, std::memory_order_relaxed);
                 pending.reset();
@@ -799,6 +809,7 @@ int main(int argc, char** argv) {
         ("http-ingest-address", bpo::value<std::string>()->default_value("0.0.0.0"), "HTTP ingest listen address")
         ("http-ingest-port", bpo::value<uint16_t>()->default_value(18081), "HTTP ingest listen port")
         ("max-request-bytes", bpo::value<std::size_t>()->default_value(1024 * 1024), "Max HTTP ingest request body bytes")
+        ("agent-id", bpo::value<std::string>()->default_value("seastar-log-agent"), "Stable agent id included in sink delivery batches")
         ("file-source-path", bpo::value<std::string>()->default_value(""), "Optional file source to tail")
         ("file-source-glob", bpo::value<std::string>()->default_value(""), "Optional glob pattern for multiple file sources")
         ("stdin-source-enabled", bpo::value<bool>()->default_value(false), "Read newline-delimited logs from stdin")
@@ -811,6 +822,7 @@ int main(int argc, char** argv) {
         ("sink-kind", bpo::value<std::string>()->default_value("none"), "Sink kind: none, http, stdout, kafka, object_store")
         ("sink-http-url", bpo::value<std::string>()->default_value(""), "Optional HTTP sink URL, e.g. http://127.0.0.1:9000/ingest")
         ("delivery-offset-path", bpo::value<std::string>()->default_value("agent-delivery.offset"), "HTTP sink delivery offset checkpoint")
+        ("pending-delivery-path", bpo::value<std::string>()->default_value("agent-delivery.pending"), "Durable pending sink batch file")
         ("sink-batch-size", bpo::value<std::size_t>()->default_value(100), "HTTP sink batch size")
         ("sink-retry-backoff-ms", bpo::value<std::size_t>()->default_value(1000), "HTTP sink idle/retry backoff")
         ("sink-retry-max-backoff-ms", bpo::value<std::size_t>()->default_value(30000), "HTTP sink max retry backoff")
@@ -867,6 +879,8 @@ int main(int argc, char** argv) {
                 options["max-request-bytes"].as<std::size_t>());
 
             AgentRuntimeOptions runtime_options;
+            runtime_options.agent_id = log_engine::resolve_string_option(
+                options, file_values, "agent-id", options["agent-id"].as<std::string>());
             runtime_options.file_source_path = log_engine::resolve_string_option(
                 options, file_values, "file-source-path", options["file-source-path"].as<std::string>());
             runtime_options.file_source_glob = log_engine::resolve_string_option(
@@ -891,6 +905,8 @@ int main(int argc, char** argv) {
                 options, file_values, "sink-http-url", options["sink-http-url"].as<std::string>());
             runtime_options.delivery_offset_path = log_engine::resolve_string_option(
                 options, file_values, "delivery-offset-path", options["delivery-offset-path"].as<std::string>());
+            runtime_options.pending_delivery_path = log_engine::resolve_string_option(
+                options, file_values, "pending-delivery-path", options["pending-delivery-path"].as<std::string>());
             runtime_options.sink_batch_size = log_engine::resolve_size_option(
                 options, file_values, "sink-batch-size", options["sink-batch-size"].as<std::size_t>());
             runtime_options.sink_retry_backoff_ms = log_engine::resolve_size_option(

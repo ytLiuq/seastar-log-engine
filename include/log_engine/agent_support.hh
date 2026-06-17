@@ -68,6 +68,9 @@ std::optional<DeliveryOffset> load_delivery_offset(const std::string& path);
 void store_delivery_offset(const std::string& path, const DeliveryOffset& offset);
 std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path);
 void store_delivery_offsets(const std::string& path, const std::vector<DeliveryOffset>& offsets);
+std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path);
+void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch);
+void remove_pending_delivery_batch(const std::string& path);
 
 std::uint64_t directory_size_bytes(const std::string& path);
 bool disk_quota_exceeded(const std::string& path, const DiskQuota& quota);
@@ -82,6 +85,7 @@ std::vector<std::string> expand_glob_paths(std::string_view pattern);
 
 std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url);
 std::string render_json_batch(const std::vector<std::string>& records);
+std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
 void post_http_batch(const HttpEndpoint& endpoint, std::string_view body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body);
 void write_stdout_batch(const std::vector<std::string>& records);

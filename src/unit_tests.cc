@@ -974,6 +974,7 @@ seastar::future<> test_agent_tail_file_complete_lines_and_resume(const std::stri
 seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string& root_dir);
 seastar::future<> test_agent_disk_quota_and_http_helpers(const std::string& root_dir);
 seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_dir);
+seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string& root_dir);
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
 seastar::future<> test_agent_http_sink_fake_server();
 seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir);
@@ -1020,6 +1021,7 @@ int main(int argc, char** argv) {
         co_await test_agent_tail_file_truncate_resets_offset(root_dir);
         co_await test_agent_disk_quota_and_http_helpers(root_dir);
         co_await test_agent_per_shard_delivery_offsets(root_dir);
+        co_await test_agent_pending_delivery_batch_roundtrip(root_dir);
         co_await test_agent_glob_and_dynamic_backpressure(root_dir);
         co_await test_agent_http_sink_fake_server();
         co_await test_agent_file_to_http_sink_delivery_flow(root_dir);
@@ -1416,6 +1418,38 @@ seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_
     co_return;
 }
 
+seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-pending-delivery";
+    reset_directory(dir);
+    const auto path = (dir / "pending.batch").string();
+
+    log_engine::agent::DeliveryBatch batch;
+    batch.shard = 4;
+    batch.first_sequence = 10;
+    batch.next_sequence = 13;
+    batch.records = {"plain", "line\nbreak", "quote\"slash\\"};
+    log_engine::agent::store_pending_delivery_batch(path, batch);
+
+    const auto loaded = log_engine::agent::load_pending_delivery_batch(path);
+    require(loaded.has_value(), "agent pending delivery batch should load");
+    require(loaded->shard == batch.shard, "agent pending delivery shard mismatch");
+    require(loaded->first_sequence == batch.first_sequence, "agent pending delivery first sequence mismatch");
+    require(loaded->next_sequence == batch.next_sequence, "agent pending delivery next sequence mismatch");
+    require(loaded->records == batch.records, "agent pending delivery records mismatch");
+
+    const auto body = log_engine::agent::render_delivery_batch_json("agent-A", batch);
+    require(body.find("\"agent_id\":\"agent-A\"") != std::string::npos, "agent delivery JSON should include agent id");
+    require(body.find("\"shard\":4") != std::string::npos, "agent delivery JSON should include shard");
+    require(body.find("\"first_sequence\":10") != std::string::npos, "agent delivery JSON should include first sequence");
+    require(body.find("\"next_sequence\":13") != std::string::npos, "agent delivery JSON should include next sequence");
+    require(body.find("\"sequence\":11") != std::string::npos, "agent delivery JSON should include per-record sequence");
+    require(body.find("line\\nbreak") != std::string::npos, "agent delivery JSON should escape record payload");
+
+    log_engine::agent::remove_pending_delivery_batch(path);
+    require(!log_engine::agent::load_pending_delivery_batch(path).has_value(), "agent pending delivery batch should be removable");
+    co_return;
+}
+
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir) {
     const auto dir = fs::path(root_dir) / "agent-glob";
     reset_directory(dir);
@@ -1465,8 +1499,16 @@ seastar::future<> test_agent_http_sink_fake_server() {
     }
     const auto endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19081/sink");
     require(endpoint.has_value(), "agent async HTTP sink test should parse endpoint");
-    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_json_batch({"http-a", "http-b"}));
+    log_engine::agent::DeliveryBatch ok_batch;
+    ok_batch.shard = 1;
+    ok_batch.first_sequence = 20;
+    ok_batch.next_sequence = 22;
+    ok_batch.records = {"http-a", "http-b"};
+    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_delivery_batch_json("agent-test", ok_batch));
     ok_sink.worker.join();
+    require(ok_sink.received_body.find("\"agent_id\":\"agent-test\"") != std::string::npos, "agent async HTTP sink should include agent id");
+    require(ok_sink.received_body.find("\"shard\":1") != std::string::npos, "agent async HTTP sink should include shard");
+    require(ok_sink.received_body.find("\"first_sequence\":20") != std::string::npos, "agent async HTTP sink should include first sequence");
     require(ok_sink.received_body.find("http-a") != std::string::npos, "agent async HTTP sink should deliver first record");
     require(ok_sink.received_body.find("http-b") != std::string::npos, "agent async HTTP sink should deliver second record");
 
@@ -1480,7 +1522,12 @@ seastar::future<> test_agent_http_sink_fake_server() {
     require(fail_endpoint.has_value(), "agent async HTTP sink failure test should parse endpoint");
     bool threw = false;
     try {
-        co_await log_engine::agent::post_http_batch_async(*fail_endpoint, log_engine::agent::render_json_batch({"http-fail"}));
+        log_engine::agent::DeliveryBatch fail_batch;
+        fail_batch.shard = 0;
+        fail_batch.first_sequence = 0;
+        fail_batch.next_sequence = 1;
+        fail_batch.records = {"http-fail"};
+        co_await log_engine::agent::post_http_batch_async(*fail_endpoint, log_engine::agent::render_delivery_batch_json("agent-test", fail_batch));
     } catch (const std::exception&) {
         threw = true;
     }
@@ -1547,8 +1594,18 @@ seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& 
         payloads.push_back(record.payload);
         next_sequence = std::max(next_sequence, record.sequence + 1);
     }
-    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_json_batch(payloads));
+    log_engine::agent::DeliveryBatch delivery_batch;
+    delivery_batch.shard = 0;
+    delivery_batch.first_sequence = records.front().sequence;
+    delivery_batch.next_sequence = next_sequence;
+    delivery_batch.records = payloads;
+    const auto pending_path = (dir / "delivery.pending").string();
+    log_engine::agent::store_pending_delivery_batch(pending_path, delivery_batch);
+    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_delivery_batch_json("agent-flow", delivery_batch));
     sink.worker.join();
+    require(sink.received_body.find("\"agent_id\":\"agent-flow\"") != std::string::npos, "agent flow sink should receive agent id");
+    require(sink.received_body.find("\"first_sequence\":0") != std::string::npos, "agent flow sink should receive first sequence");
+    require(sink.received_body.find("\"next_sequence\":2") != std::string::npos, "agent flow sink should receive next sequence");
     require(sink.received_body.find("flow-a") != std::string::npos, "agent flow sink should receive first payload");
     require(sink.received_body.find("flow-b") != std::string::npos, "agent flow sink should receive second payload");
 
@@ -1556,6 +1613,8 @@ seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& 
     log_engine::agent::store_delivery_offsets(delivery_path, {
         log_engine::agent::DeliveryOffset{.shard = 0, .next_sequence = next_sequence},
     });
+    log_engine::agent::remove_pending_delivery_batch(pending_path);
+    require(!log_engine::agent::load_pending_delivery_batch(pending_path).has_value(), "agent flow should remove pending delivery after ACK");
     const auto offsets = log_engine::agent::load_delivery_offsets(delivery_path);
     require(offsets.size() == 1, "agent flow should persist delivery offset");
     require(offsets[0].shard == 0, "agent flow delivery offset shard mismatch");
