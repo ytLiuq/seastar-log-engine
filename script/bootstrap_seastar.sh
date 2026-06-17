@@ -6,13 +6,17 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SEASTAR_ROOT="${SEASTAR_ROOT:-${ROOT_DIR}/.deps/seastar}"
 SEASTAR_REF="${SEASTAR_REF:-master}"
 SEASTAR_BUILD_MODE="${SEASTAR_BUILD_MODE:-release}"
+SEASTAR_BUILD_JOBS="${SEASTAR_BUILD_JOBS:-2}"
+SEASTAR_BUILD_TARGET="${SEASTAR_BUILD_TARGET:-seastar}"
 
 if [[ ! -d "${SEASTAR_ROOT}/.git" ]]; then
   mkdir -p "$(dirname "${SEASTAR_ROOT}")"
   git clone --recursive https://github.com/scylladb/seastar.git "${SEASTAR_ROOT}"
 fi
 
-git -C "${SEASTAR_ROOT}" fetch --tags origin
+if [[ "${SEASTAR_FETCH:-0}" == "1" ]]; then
+  git -C "${SEASTAR_ROOT}" fetch --tags origin
+fi
 git -C "${SEASTAR_ROOT}" checkout "${SEASTAR_REF}"
 git -C "${SEASTAR_ROOT}" submodule update --init --recursive
 
@@ -26,4 +30,4 @@ fi
 
 python3 "${SEASTAR_ROOT}/configure.py" --mode="${SEASTAR_BUILD_MODE}"
 
-cmake --build "${SEASTAR_ROOT}/build/${SEASTAR_BUILD_MODE}" -j"$(nproc)"
+cmake --build "${SEASTAR_ROOT}/build/${SEASTAR_BUILD_MODE}" --target "${SEASTAR_BUILD_TARGET}" -j"${SEASTAR_BUILD_JOBS}"

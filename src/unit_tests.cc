@@ -1,7 +1,13 @@
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <thread>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 #include <boost/program_options.hpp>
 #include <log_engine_query.pb.h>
@@ -10,6 +16,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sleep.hh>
 
+#include "log_engine/agent_support.hh"
 #include "log_engine/compat_glog.hh"
 #include "log_engine/config_loader.hh"
 #include "log_engine/log_layout.hh"
@@ -68,6 +75,70 @@ std::vector<log_engine::ParsedRecord> read_back_records(const log_engine::Engine
     query.limit = limit;
     const auto segments = log_engine::collect_segments(config, query);
     return log_engine::read_records(segments, query);
+}
+
+struct FakeHttpSink {
+    std::thread worker;
+    std::atomic<bool> ready{false};
+    std::string received_body;
+    int status = 200;
+};
+
+void run_fake_http_sink_once(FakeHttpSink& sink, std::uint16_t port) {
+    sink.worker = std::thread([&sink, port] {
+        const int server = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (server < 0) {
+            return;
+        }
+        int reuse = 1;
+        ::setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        if (::bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(server, 1) != 0) {
+            ::close(server);
+            return;
+        }
+        sink.ready.store(true, std::memory_order_release);
+        const int client = ::accept(server, nullptr, nullptr);
+        if (client >= 0) {
+            std::string request;
+            char buffer[1024];
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const auto rc = ::recv(client, buffer, sizeof(buffer), 0);
+                if (rc <= 0) {
+                    break;
+                }
+                request.append(buffer, static_cast<std::size_t>(rc));
+            }
+            const auto header_end = request.find("\r\n\r\n");
+            std::size_t content_length = 0;
+            const auto length_pos = request.find("Content-Length:");
+            if (length_pos != std::string::npos) {
+                const auto value_start = length_pos + std::string("Content-Length:").size();
+                const auto value_end = request.find("\r\n", value_start);
+                content_length = static_cast<std::size_t>(std::stoul(request.substr(value_start, value_end - value_start)));
+            }
+            if (header_end != std::string::npos) {
+                sink.received_body = request.substr(header_end + 4);
+            }
+            while (sink.received_body.size() < content_length) {
+                const auto rc = ::recv(client, buffer, sizeof(buffer), 0);
+                if (rc <= 0) {
+                    break;
+                }
+                sink.received_body.append(buffer, static_cast<std::size_t>(rc));
+            }
+            const auto response = std::string("HTTP/1.1 ") +
+                std::to_string(sink.status) +
+                (sink.status >= 200 && sink.status < 300 ? " OK\r\n" : " Error\r\n") +
+                "Content-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}";
+            ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server);
+    });
 }
 
 void write_gzip_file(const fs::path& path, std::string_view content) {
@@ -692,9 +763,9 @@ seastar::future<> test_partial_checkpoint_ignored(const std::string& root_dir) {
     co_return;
 }
 
-seastar::future<> test_stale_checkpoint_ignored(const std::string& root_dir) {
-    const auto log_dir = (fs::path(root_dir) / "stale-checkpoint-logs").string();
-    const auto archive_dir = (fs::path(root_dir) / "stale-checkpoint-archive").string();
+seastar::future<> test_checkpoint_tail_scan_preserves_valid_records_after_checkpoint(const std::string& root_dir) {
+    const auto log_dir = (fs::path(root_dir) / "tail-scan-checkpoint-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "tail-scan-checkpoint-archive").string();
     reset_directory(log_dir);
     reset_directory(archive_dir);
 
@@ -708,34 +779,83 @@ seastar::future<> test_stale_checkpoint_ignored(const std::string& root_dir) {
 
     log_engine::LogEngine engine;
     co_await engine.start(config);
-    co_await engine.info("stale-checkpoint-a", "route-sc");
-    co_await engine.info("stale-checkpoint-b", "route-sc");
+    co_await engine.info("tail-scan-checkpoint-a", "route-sc");
+    co_await engine.info("tail-scan-checkpoint-b", "route-sc");
     co_await engine.stop();
 
     const auto shard_path = find_non_empty_shard_log(log_dir);
-    require(shard_path.has_value(), "stale checkpoint test should find a non-empty shard log");
+    require(shard_path.has_value(), "tail scan checkpoint test should find a non-empty shard log");
 
     const auto content = read_file(*shard_path);
     const auto verified = log_engine::scan_log_content(content);
-    require(verified.valid_size > 0, "stale checkpoint test should keep valid log content");
+    require(verified.valid_size > 0, "tail scan checkpoint test should keep valid log content");
     const auto first_record_end = content.find('\n');
-    require(first_record_end != std::string::npos, "stale checkpoint test should find first record boundary");
-    const auto stale_size = static_cast<std::uint64_t>(first_record_end + 1);
-    require(stale_size < verified.valid_size, "stale checkpoint test should create a smaller logical_size");
+    require(first_record_end != std::string::npos, "tail scan checkpoint test should find first record boundary");
+    const auto checkpoint_size = static_cast<std::uint64_t>(first_record_end + 1);
+    require(checkpoint_size < verified.valid_size, "tail scan checkpoint test should create a smaller logical_size");
+
+    {
+        std::ofstream out(*shard_path, std::ios::app | std::ios::binary);
+        out << "BROKEN_TAIL";
+    }
+
+    log_engine::LogManager writer;
+    const auto active_segment = log_engine::layout::describe_path(config, shard_path->string());
+    require(active_segment.has_value(), "tail scan checkpoint test should describe active shard log");
+    co_await writer.store_checkpoint(
+        *active_segment,
+        log_engine::CheckpointState{
+            .logical_size = checkpoint_size,
+            .sequence = 1,
+            .rotation_index = 0,
+        });
+
+    log_engine::LogManager manager;
+    const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
+    require(recovery.logical_size == verified.valid_size, "tail scan checkpoint recovery should preserve valid records after checkpoint");
+    require(recovery.sequence == verified.next_sequence, "tail scan checkpoint recovery should advance sequence through valid tail records");
+    co_return;
+}
+
+seastar::future<> test_corrupted_checkpoint_falls_back_to_scan(const std::string& root_dir) {
+    const auto log_dir = (fs::path(root_dir) / "corrupted-checkpoint-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "corrupted-checkpoint-archive").string();
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 2;
+    config.checkpoint_enabled = true;
+    config.truncate_on_start = false;
+    config.record_sequence_enabled = false;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    co_await engine.info("corrupted-checkpoint-a", "route-cc");
+    co_await engine.info("corrupted-checkpoint-b", "route-cc");
+    co_await engine.stop();
+
+    const auto shard_path = find_non_empty_shard_log(log_dir);
+    require(shard_path.has_value(), "corrupted checkpoint test should find a non-empty shard log");
+    const auto verified = log_engine::scan_log_content(read_file(*shard_path));
 
     {
         std::ofstream out(log_engine::layout::checkpoint_path(shard_path->string()), std::ios::binary | std::ios::trunc);
-        out << "logical_size=" << stale_size << "\n";
-        out << "sequence=1\n";
+        out << "format_version=2\n";
+        out << "logical_size=1\n";
+        out << "sequence=999\n";
         out << "rotation_index=0\n";
+        out << "checkpoint_crc=0\n";
     }
 
     log_engine::LogManager manager;
     const auto active_segment = log_engine::layout::describe_path(config, shard_path->string());
-    require(active_segment.has_value(), "stale checkpoint test should describe active shard log");
+    require(active_segment.has_value(), "corrupted checkpoint test should describe active shard log");
     const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
-    require(recovery.logical_size == verified.valid_size, "stale checkpoint should not truncate newer valid records");
-    require(recovery.sequence == verified.next_sequence, "stale checkpoint should fall back to verified sequence");
+    require(recovery.logical_size == verified.valid_size, "corrupted checkpoint should fall back to scanned size");
+    require(recovery.sequence == verified.next_sequence, "corrupted checkpoint should fall back to scanned sequence");
     co_return;
 }
 
@@ -849,6 +969,14 @@ seastar::future<> test_prepare_cleans_temporary_sidecars(const std::string& root
 seastar::future<> test_crc_class_roundtrip();
 seastar::future<> test_crash_during_write_recovery(const std::string& root_dir);
 seastar::future<> test_checkpoint_clean_shutdown_restore(const std::string& root_dir);
+seastar::future<> test_agent_offset_roundtrip(const std::string& root_dir);
+seastar::future<> test_agent_tail_file_complete_lines_and_resume(const std::string& root_dir);
+seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string& root_dir);
+seastar::future<> test_agent_disk_quota_and_http_helpers(const std::string& root_dir);
+seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_dir);
+seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
+seastar::future<> test_agent_http_sink_fake_server();
+seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir);
 
 int main(int argc, char** argv) {
     seastar::app_template app;
@@ -875,7 +1003,8 @@ int main(int argc, char** argv) {
         co_await test_recovery_scan(root_dir);
         co_await test_recovery_scan_large_file_streaming(root_dir);
         co_await test_partial_checkpoint_ignored(root_dir);
-        co_await test_stale_checkpoint_ignored(root_dir);
+        co_await test_checkpoint_tail_scan_preserves_valid_records_after_checkpoint(root_dir);
+        co_await test_corrupted_checkpoint_falls_back_to_scan(root_dir);
         co_await test_recovery_after_rotate(root_dir, false, false);
         co_await test_recovery_after_rotate(root_dir, true, false);
         co_await test_recovery_after_rotate(root_dir, false, true);
@@ -886,6 +1015,14 @@ int main(int argc, char** argv) {
         co_await test_query_records_proto_defaults();
         co_await test_crash_during_write_recovery(root_dir);
         co_await test_checkpoint_clean_shutdown_restore(root_dir);
+        co_await test_agent_offset_roundtrip(root_dir);
+        co_await test_agent_tail_file_complete_lines_and_resume(root_dir);
+        co_await test_agent_tail_file_truncate_resets_offset(root_dir);
+        co_await test_agent_disk_quota_and_http_helpers(root_dir);
+        co_await test_agent_per_shard_delivery_offsets(root_dir);
+        co_await test_agent_glob_and_dynamic_backpressure(root_dir);
+        co_await test_agent_http_sink_fake_server();
+        co_await test_agent_file_to_http_sink_delivery_flow(root_dir);
         co_return;
     });
 }
@@ -1143,5 +1280,288 @@ seastar::future<> test_checkpoint_clean_shutdown_restore(const std::string& root
         require(seqs[i] == i, "checkpoint recovery should preserve contiguous sequence numbering");
     }
 
+    co_return;
+}
+
+seastar::future<> test_agent_offset_roundtrip(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-offsets";
+    reset_directory(dir);
+    const auto source_path = (dir / "source.offset").string();
+    const auto delivery_path = (dir / "delivery.offset").string();
+
+    log_engine::agent::SourceOffset source;
+    source.path = "/var/log/app.log";
+    source.inode = 12345;
+    source.offset = 67890;
+    log_engine::agent::store_source_offset(source_path, source);
+    const auto loaded_source = log_engine::agent::load_source_offset(source_path);
+    require(loaded_source.has_value(), "agent source offset should load");
+    require(loaded_source->path == source.path, "agent source offset path mismatch");
+    require(loaded_source->inode == source.inode, "agent source offset inode mismatch");
+    require(loaded_source->offset == source.offset, "agent source offset value mismatch");
+
+    log_engine::agent::DeliveryOffset delivery;
+    delivery.shard = 2;
+    delivery.next_sequence = 99;
+    log_engine::agent::store_delivery_offset(delivery_path, delivery);
+    const auto loaded_delivery = log_engine::agent::load_delivery_offset(delivery_path);
+    require(loaded_delivery.has_value(), "agent delivery offset should load");
+    require(loaded_delivery->shard == delivery.shard, "agent delivery offset shard mismatch");
+    require(loaded_delivery->next_sequence == delivery.next_sequence, "agent delivery offset sequence mismatch");
+    co_return;
+}
+
+seastar::future<> test_agent_tail_file_complete_lines_and_resume(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-tail";
+    reset_directory(dir);
+    const auto source = (dir / "app.log").string();
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << "first\nsecond\npartial";
+    }
+
+    const auto first = log_engine::agent::tail_file_once(source, std::nullopt, 10);
+    require(first.lines.size() == 2, "agent tail should return complete lines only");
+    require(first.lines[0] == "first", "agent tail first line mismatch");
+    require(first.lines[1] == "second", "agent tail second line mismatch");
+
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::app);
+        out << "-done\nthird\n";
+    }
+    const auto second = log_engine::agent::tail_file_once(source, first.next_offset, 10);
+    require(second.lines.size() == 2, "agent tail should resume from committed offset");
+    require(second.lines[0] == "partial-done", "agent tail should keep incomplete trailing line for next read");
+    require(second.lines[1] == "third", "agent tail should read appended complete line");
+    require(second.next_offset.offset > first.next_offset.offset, "agent tail offset should advance");
+    co_return;
+}
+
+seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-tail-truncate";
+    reset_directory(dir);
+    const auto source = (dir / "app.log").string();
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << "before\n";
+    }
+
+    const auto first = log_engine::agent::tail_file_once(source, std::nullopt, 10);
+    require(first.lines.size() == 1, "agent truncate setup should read first line");
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << "after\n";
+    }
+    const auto second = log_engine::agent::tail_file_once(source, first.next_offset, 10);
+    require(second.file_rotated_or_truncated, "agent tail should detect truncate");
+    require(second.lines.size() == 1, "agent tail should reread from beginning after truncate");
+    require(second.lines[0] == "after", "agent tail truncate line mismatch");
+    co_return;
+}
+
+seastar::future<> test_agent_disk_quota_and_http_helpers(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-quota";
+    reset_directory(dir);
+    {
+        std::ofstream out(dir / "buffer.log", std::ios::binary | std::ios::trunc);
+        out << std::string(20, 'x');
+    }
+
+    log_engine::agent::DiskQuota quota;
+    quota.max_buffer_bytes = 10;
+    quota.resume_buffer_bytes = 5;
+    require(log_engine::agent::directory_size_bytes(dir.string()) >= 20, "agent quota should sum directory size");
+    require(log_engine::agent::disk_quota_exceeded(dir.string(), quota), "agent quota should detect exceeded high watermark");
+    require(!log_engine::agent::disk_quota_can_resume(dir.string(), quota), "agent quota should not resume above low watermark");
+
+    const auto endpoint = log_engine::agent::parse_http_endpoint("http://localhost:18081/v1/logs");
+    require(endpoint.has_value(), "agent HTTP endpoint should parse");
+    require(endpoint->host == "localhost", "agent HTTP endpoint host mismatch");
+    require(endpoint->port == 18081, "agent HTTP endpoint port mismatch");
+    require(endpoint->path == "/v1/logs", "agent HTTP endpoint path mismatch");
+    require(!log_engine::agent::parse_http_endpoint("https://localhost/v1/logs"), "agent HTTP endpoint should reject https MVP URL");
+
+    const auto body = log_engine::agent::render_json_batch({"alpha", "quote\"line", "new\nline"});
+    require(body.find("\"records\"") != std::string::npos, "agent JSON batch should contain records key");
+    require(body.find("quote\\\"line") != std::string::npos, "agent JSON batch should escape quotes");
+    require(body.find("new\\nline") != std::string::npos, "agent JSON batch should escape newlines");
+    co_return;
+}
+
+seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-delivery-offsets";
+    reset_directory(dir);
+    const auto path = (dir / "delivery.offset").string();
+
+    std::vector<log_engine::agent::DeliveryOffset> offsets = {
+        {.shard = 2, .next_sequence = 42},
+        {.shard = 0, .next_sequence = 7},
+        {.shard = 1, .next_sequence = 19},
+    };
+    log_engine::agent::store_delivery_offsets(path, offsets);
+    const auto loaded = log_engine::agent::load_delivery_offsets(path);
+    require(loaded.size() == 3, "agent should load per-shard delivery offsets");
+    require(loaded[0].shard == 0 && loaded[0].next_sequence == 7, "agent shard 0 delivery offset mismatch");
+    require(loaded[1].shard == 1 && loaded[1].next_sequence == 19, "agent shard 1 delivery offset mismatch");
+    require(loaded[2].shard == 2 && loaded[2].next_sequence == 42, "agent shard 2 delivery offset mismatch");
+
+    const auto legacy_path = (dir / "legacy.offset").string();
+    {
+        std::ofstream out(legacy_path, std::ios::binary | std::ios::trunc);
+        out << "shard=3\nnext_sequence=88\n";
+    }
+    const auto legacy = log_engine::agent::load_delivery_offsets(legacy_path);
+    require(legacy.size() == 1, "agent should keep legacy delivery offset compatibility");
+    require(legacy[0].shard == 3 && legacy[0].next_sequence == 88, "agent legacy delivery offset mismatch");
+    co_return;
+}
+
+seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-glob";
+    reset_directory(dir);
+    {
+        std::ofstream out(dir / "b.log", std::ios::binary | std::ios::trunc);
+        out << "b\n";
+    }
+    {
+        std::ofstream out(dir / "a.log", std::ios::binary | std::ios::trunc);
+        out << "a\n";
+    }
+    {
+        std::ofstream out(dir / "ignored.txt", std::ios::binary | std::ios::trunc);
+        out << "ignored\n";
+    }
+
+    const auto paths = log_engine::agent::expand_glob_paths((dir / "*.log").string());
+    require(paths.size() == 2, "agent glob should find matching log files");
+    require(fs::path(paths[0]).filename() == "a.log", "agent glob should return sorted paths");
+    require(fs::path(paths[1]).filename() == "b.log", "agent glob should return second sorted path");
+
+    log_engine::agent::BackpressureState backlog;
+    backlog.sink_backlog_records = 10;
+    backlog.max_sink_backlog_records = 10;
+    const auto backlog_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, backlog);
+    require(backlog_decision.pause && backlog_decision.reason == "sink_backlog", "agent backpressure should pause on sink backlog");
+
+    log_engine::agent::BackpressureState failures;
+    failures.recent_sink_failures = 3;
+    failures.max_recent_sink_failures = 3;
+    const auto failure_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, failures);
+    require(failure_decision.pause && failure_decision.reason == "sink_failures", "agent backpressure should pause on sink failures");
+
+    log_engine::agent::BackpressureState latency;
+    latency.last_sink_latency_ms = 5000;
+    latency.max_sink_latency_ms = 1000;
+    const auto latency_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, latency);
+    require(latency_decision.pause && latency_decision.reason == "sink_latency", "agent backpressure should pause on sink latency");
+    co_return;
+}
+
+seastar::future<> test_agent_http_sink_fake_server() {
+    FakeHttpSink ok_sink;
+    run_fake_http_sink_once(ok_sink, 19081);
+    while (!ok_sink.ready.load(std::memory_order_acquire)) {
+        co_await seastar::sleep(std::chrono::milliseconds(5));
+    }
+    const auto endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19081/sink");
+    require(endpoint.has_value(), "agent async HTTP sink test should parse endpoint");
+    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_json_batch({"http-a", "http-b"}));
+    ok_sink.worker.join();
+    require(ok_sink.received_body.find("http-a") != std::string::npos, "agent async HTTP sink should deliver first record");
+    require(ok_sink.received_body.find("http-b") != std::string::npos, "agent async HTTP sink should deliver second record");
+
+    FakeHttpSink fail_sink;
+    fail_sink.status = 503;
+    run_fake_http_sink_once(fail_sink, 19082);
+    while (!fail_sink.ready.load(std::memory_order_acquire)) {
+        co_await seastar::sleep(std::chrono::milliseconds(5));
+    }
+    const auto fail_endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19082/sink");
+    require(fail_endpoint.has_value(), "agent async HTTP sink failure test should parse endpoint");
+    bool threw = false;
+    try {
+        co_await log_engine::agent::post_http_batch_async(*fail_endpoint, log_engine::agent::render_json_batch({"http-fail"}));
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    fail_sink.worker.join();
+    require(threw, "agent async HTTP sink should reject non-2xx ACK");
+    co_return;
+}
+
+seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-flow";
+    const auto log_dir = (dir / "logs").string();
+    const auto archive_dir = (dir / "archive").string();
+    reset_directory(dir);
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    const auto source_path = (dir / "source.log").string();
+    {
+        std::ofstream out(source_path, std::ios::binary | std::ios::trunc);
+        out << "flow-a\nflow-b\npartial";
+    }
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 2;
+    config.ack_mode = log_engine::AckMode::sync_ack;
+    config.empty_route_policy = log_engine::EmptyRoutePolicy::local;
+    config.truncate_on_start = true;
+    config.record_crc_enabled = true;
+    config.record_sequence_enabled = true;
+    config.record_shard_id_enabled = true;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+
+    const auto tailed = log_engine::agent::tail_file_once(source_path, std::nullopt, 10);
+    require(tailed.lines.size() == 2, "agent flow should tail only complete source lines");
+    std::vector<log_engine::LogMessage> messages;
+    for (const auto& line : tailed.lines) {
+        messages.push_back(log_engine::LogMessage{.payload = line});
+    }
+    co_await engine.append_batch(std::move(messages));
+    co_await engine.stop();
+
+    const auto records = read_back_records(config, true, 10);
+    require(records.size() == 2, "agent flow should persist tailed records");
+    require(records[0].payload == "flow-a", "agent flow first persisted payload mismatch");
+    require(records[1].payload == "flow-b", "agent flow second persisted payload mismatch");
+    require(records[0].has_sequence && records[1].has_sequence, "agent flow records should carry sequences");
+
+    FakeHttpSink sink;
+    run_fake_http_sink_once(sink, 19083);
+    while (!sink.ready.load(std::memory_order_acquire)) {
+        co_await seastar::sleep(std::chrono::milliseconds(5));
+    }
+    const auto endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19083/sink");
+    require(endpoint.has_value(), "agent flow should parse HTTP sink endpoint");
+
+    std::vector<std::string> payloads;
+    payloads.reserve(records.size());
+    std::uint64_t next_sequence = 0;
+    for (const auto& record : records) {
+        payloads.push_back(record.payload);
+        next_sequence = std::max(next_sequence, record.sequence + 1);
+    }
+    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_json_batch(payloads));
+    sink.worker.join();
+    require(sink.received_body.find("flow-a") != std::string::npos, "agent flow sink should receive first payload");
+    require(sink.received_body.find("flow-b") != std::string::npos, "agent flow sink should receive second payload");
+
+    const auto delivery_path = (dir / "delivery.offset").string();
+    log_engine::agent::store_delivery_offsets(delivery_path, {
+        log_engine::agent::DeliveryOffset{.shard = 0, .next_sequence = next_sequence},
+    });
+    const auto offsets = log_engine::agent::load_delivery_offsets(delivery_path);
+    require(offsets.size() == 1, "agent flow should persist delivery offset");
+    require(offsets[0].shard == 0, "agent flow delivery offset shard mismatch");
+    require(offsets[0].next_sequence == 2, "agent flow delivery offset should advance after ACK");
+
+    const auto resume = log_engine::agent::tail_file_once(source_path, tailed.next_offset, 10);
+    require(resume.lines.empty(), "agent flow should not commit partial source line");
     co_return;
 }

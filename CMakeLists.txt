@@ -59,6 +59,7 @@ add_custom_command(
     VERBATIM)
 
 add_library(log_engine_core
+    src/agent_support.cc
     src/append_writer.cc
     src/async_writer.cc
     src/compat_glog.cc
@@ -116,6 +117,14 @@ add_executable(log_engine_read
 
 target_link_libraries(log_engine_read
     PRIVATE
+        log_engine_core)
+
+add_executable(log_engine_agent
+    src/agent.cc)
+
+target_link_libraries(log_engine_agent
+    PRIVATE
+        Boost::program_options
         log_engine_core)
 
 add_executable(log_engine_query_server

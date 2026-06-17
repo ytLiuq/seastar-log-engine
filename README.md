@@ -81,6 +81,64 @@ docker build --target test .
 ./script/bench_soak.sh --target log_engine --duration-seconds 300 --messages 50000 --payload-size 2048 --batch-size 8192 --inflight 1 --shards 1 --ack-mode write_ack
 ```
 
+运行日志 agent MVP：
+
+```bash
+./build/log_engine_agent --config config/agent.conf -c 2
+```
+
+写入一条日志：
+
+```bash
+curl -X POST http://127.0.0.1:18081/v1/logs \
+  -H 'Content-Type: application/json' \
+  -d '{"service":"order","level":"info","message":"created order"}'
+```
+
+查看 agent 状态：
+
+```bash
+curl http://127.0.0.1:18081/v1/status
+```
+
+作为文件采集 agent 使用：
+
+```bash
+./build/log_engine_agent \
+  --config config/agent.conf \
+  --file-source-glob '/var/log/app/*.log' \
+  --sink-kind http \
+  --sink-http-url http://127.0.0.1:9000/v1/logs \
+  --max-buffer-bytes 1073741824 \
+  --resume-buffer-bytes 805306368
+```
+
+这个模式会 tail 本地文件，只提交已经换行结束的完整日志行；成功写入本地日志引擎后推进 `source-offset-path.*`，成功投递 sink 后按 shard 推进 `delivery-offset-path`。如果本地缓冲目录达到 `max-buffer-bytes`，或者 sink backlog / 失败数 / 延迟超过动态阈值，输入源会暂停，避免继续放大积压。
+
+Agent 输入源：
+
+- `--file-source-path /var/log/app.log`
+- `--file-source-glob '/var/log/app/*.log'`
+- `--stdin-source-enabled true`
+- `--unix-socket-source-path /tmp/seastar-log-agent.sock`
+- `--tcp-source-port 19000`
+- `--udp-source-port 19001`
+
+Agent sink：
+
+- `--sink-kind stdout`：直接输出到 stdout，适合调试和容器日志管道。
+- `--sink-kind http --sink-http-url http://host:port/path`：批量 POST JSON。
+- `--sink-kind kafka/object_store`：配置边界已预留，当前构建不会链接外部客户端，启动后会明确报错。
+
+容器运行：
+
+```bash
+docker build --target agent-runtime -t seastar-log-engine:agent .
+docker compose up --build
+```
+
+`docker-compose.yml` 默认以非 root 用户运行，挂载 `agent-data` 保存本地日志和 checkpoint，并通过 `/healthz` 做健康检查。
+
 ## Layout
 
 - `include/log_engine`: 头文件

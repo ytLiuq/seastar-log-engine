@@ -387,6 +387,7 @@ seastar::future<> AsyncWriter::recover_from_checkpoint() {
 }
 
 seastar::future<> AsyncWriter::persist_checkpoint() {
+    co_await _append_writer.force_flush(true);
     co_await _log_manager.store_checkpoint(
         _active_segment,
         CheckpointState{

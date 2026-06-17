@@ -96,6 +96,21 @@ bool parse_bool_or_default(std::string_view value, bool fallback) {
     throw std::invalid_argument("invalid bool query parameter");
 }
 
+bool has_query_param(const seastar::httpd::const_req& req, const seastar::sstring& key) {
+    return req.query_parameters.find(key) != req.query_parameters.end();
+}
+
+seastar::sstring get_query_param_or(
+    const seastar::httpd::const_req& req,
+    const seastar::sstring& key,
+    const seastar::sstring& fallback) {
+    const auto it = req.query_parameters.find(key);
+    if (it == req.query_parameters.end()) {
+        return fallback;
+    }
+    return it->second;
+}
+
 class StopSignal {
 public:
     StopSignal() {
@@ -292,35 +307,35 @@ struct QueryContext {
 
 log_engine::ReadQuery read_query_from_http(const seastar::httpd::const_req& req) {
     log_engine::ReadQuery query;
-    if (req.has_query_param("shard")) {
+    if (has_query_param(req, "shard")) {
         const auto value = parse_integer<unsigned>(req.get_query_param("shard"));
         if (!value) {
             throw std::invalid_argument("invalid shard");
         }
         query.shard = *value;
     }
-    if (req.has_query_param("seq_from")) {
+    if (has_query_param(req, "seq_from")) {
         const auto value = parse_integer<std::uint64_t>(req.get_query_param("seq_from"));
         if (!value) {
             throw std::invalid_argument("invalid seq_from");
         }
         query.seq_from = *value;
     }
-    if (req.has_query_param("seq_to")) {
+    if (has_query_param(req, "seq_to")) {
         const auto value = parse_integer<std::uint64_t>(req.get_query_param("seq_to"));
         if (!value) {
             throw std::invalid_argument("invalid seq_to");
         }
         query.seq_to = *value;
     }
-    if (req.has_query_param("time_from")) {
+    if (has_query_param(req, "time_from")) {
         query.time_from = req.get_query_param("time_from");
     }
-    if (req.has_query_param("time_to")) {
+    if (has_query_param(req, "time_to")) {
         query.time_to = req.get_query_param("time_to");
     }
-    query.limit = parse_integer<std::size_t>(req.get_query_param("limit", "100")).value_or(100);
-    query.include_archive = parse_bool_or_default(req.get_query_param("include_archive", "true"), true);
+    query.limit = parse_integer<std::size_t>(get_query_param_or(req, "limit", "100")).value_or(100);
+    query.include_archive = parse_bool_or_default(get_query_param_or(req, "include_archive", "true"), true);
     return query;
 }
 
@@ -422,7 +437,7 @@ void set_query_routes(seastar::httpd::routes& routes, const QueryContext& contex
     }, "json"));
 
     routes.add(operation_type::GET, url("/v1/route"), new function_handler([&context](const_req req, seastar::http::reply& rep) {
-        if (!req.has_query_param("key")) {
+        if (!has_query_param(req, "key")) {
             rep.set_status(seastar::http::reply::status_type::bad_request);
             return seastar::sstring("{\"error\":\"missing key query parameter\"}");
         }

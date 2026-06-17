@@ -5,11 +5,19 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <zlib.h>
 
@@ -39,6 +47,47 @@ std::atomic<int> g_last_recovery_fallback_reason{
     static_cast<int>(RecoveryFallbackReason::none)};
 std::unique_ptr<seastar::metrics::metric_groups> g_log_manager_metrics;
 
+constexpr std::string_view kCheckpointFormatVersion = "2";
+
+std::string checkpoint_body(const CheckpointState& checkpoint) {
+    std::ostringstream out;
+    out << "format_version=" << kCheckpointFormatVersion << "\n";
+    out << "logical_size=" << checkpoint.logical_size << "\n";
+    out << "sequence=" << checkpoint.sequence << "\n";
+    out << "rotation_index=" << checkpoint.rotation_index << "\n";
+    return out.str();
+}
+
+void fsync_path(const std::filesystem::path& path, int flags) {
+    const int fd = ::open(path.c_str(), flags);
+    if (fd < 0) {
+        throw std::system_error(errno, std::generic_category(), "failed to open for fsync: " + path.string());
+    }
+    const int result = ::fsync(fd);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (result != 0) {
+        throw std::system_error(saved_errno, std::generic_category(), "failed to fsync: " + path.string());
+    }
+}
+
+void fsync_file(const std::filesystem::path& path) {
+    fsync_path(path, O_RDONLY);
+}
+
+void fsync_directory(const std::filesystem::path& path) {
+    fsync_path(path, O_RDONLY | O_DIRECTORY);
+}
+
+std::optional<std::uint64_t> parse_u64(std::string_view value) {
+    std::uint64_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
 std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescriptor& active_segment) {
     const auto path = layout::checkpoint_path(active_segment);
     if (!std::filesystem::exists(path)) {
@@ -49,37 +98,71 @@ std::optional<CheckpointState> read_checkpoint_file(const layout::SegmentDescrip
     if (!in.good()) {
         return std::nullopt;
     }
+    const std::string content{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 
     CheckpointState checkpoint;
+    bool saw_version = false;
     bool saw_logical_size = false;
     bool saw_sequence = false;
     bool saw_rotation_index = false;
+    bool saw_checkpoint_crc = false;
+    std::uint32_t checkpoint_crc = 0;
+    std::string signed_body;
     std::string line;
-    while (std::getline(in, line)) {
+    std::istringstream lines(content);
+    while (std::getline(lines, line)) {
         const auto pos = line.find('=');
         if (pos == std::string::npos) {
             continue;
         }
         const auto key = line.substr(0, pos);
         const auto value = line.substr(pos + 1);
-        std::uint64_t parsed = 0;
-        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
-        if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        if (key == "checkpoint_crc") {
+            const auto parsed = parse_u64(value);
+            if (!parsed || *parsed > std::numeric_limits<std::uint32_t>::max()) {
+                return std::nullopt;
+            }
+            checkpoint_crc = static_cast<std::uint32_t>(*parsed);
+            saw_checkpoint_crc = true;
             continue;
         }
-        if (key == "logical_size") {
-            checkpoint.logical_size = parsed;
+
+        signed_body += line;
+        signed_body += '\n';
+
+        if (key == "format_version") {
+            if (value != kCheckpointFormatVersion) {
+                return std::nullopt;
+            }
+            saw_version = true;
+        } else if (key == "logical_size") {
+            const auto parsed = parse_u64(value);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            checkpoint.logical_size = *parsed;
             saw_logical_size = true;
         } else if (key == "sequence") {
-            checkpoint.sequence = parsed;
+            const auto parsed = parse_u64(value);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            checkpoint.sequence = *parsed;
             saw_sequence = true;
         } else if (key == "rotation_index") {
-            checkpoint.rotation_index = parsed;
+            const auto parsed = parse_u64(value);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            checkpoint.rotation_index = *parsed;
             saw_rotation_index = true;
         }
     }
 
-    if (!saw_logical_size || !saw_sequence || !saw_rotation_index) {
+    if (!saw_version || !saw_logical_size || !saw_sequence || !saw_rotation_index || !saw_checkpoint_crc) {
+        return std::nullopt;
+    }
+    if (crc32(signed_body) != checkpoint_crc) {
         return std::nullopt;
     }
     return checkpoint;
@@ -134,13 +217,23 @@ struct StreamedVerifiedLogState {
     std::string trailing_bytes;
 };
 
-StreamedVerifiedLogState scan_log_file_streaming(const std::string& path, std::size_t trailing_capacity) {
+StreamedVerifiedLogState scan_log_file_streaming(
+    const std::string& path,
+    std::uint64_t start_offset,
+    std::uint64_t next_sequence,
+    std::size_t trailing_capacity) {
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
         throw std::runtime_error("failed to open active log for recovery: " + path);
     }
+    in.seekg(static_cast<std::streamoff>(start_offset));
+    if (!in.good()) {
+        throw std::runtime_error("failed to seek active log for recovery: " + path);
+    }
 
     StreamedVerifiedLogState state;
+    state.verified.valid_size = start_offset;
+    state.verified.next_sequence = next_sequence;
     std::array<char, 64 * 1024> buffer{};
     std::string pending_line;
     pending_line.reserve(4096);
@@ -221,6 +314,31 @@ StreamedVerifiedLogState scan_log_file_streaming(const std::string& path, std::s
     return state;
 }
 
+StreamedVerifiedLogState scan_log_file_streaming(const std::string& path, std::size_t trailing_capacity) {
+    return scan_log_file_streaming(path, 0, 0, trailing_capacity);
+}
+
+std::string read_tail_before_offset(const std::string& path, std::uint64_t offset, std::size_t tail_size) {
+    if (tail_size == 0) {
+        return {};
+    }
+    if (offset < tail_size) {
+        throw std::runtime_error("checkpoint tail size is larger than checkpoint logical size");
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        throw std::runtime_error("failed to open active log for checkpoint tail recovery: " + path);
+    }
+    in.seekg(static_cast<std::streamoff>(offset - tail_size));
+    std::string tail(tail_size, '\0');
+    in.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+    if (static_cast<std::size_t>(in.gcount()) != tail.size()) {
+        throw std::runtime_error("failed to read checkpoint tail from active log: " + path);
+    }
+    return tail;
+}
+
 }
 
 const char* recovery_fallback_reason_to_string(RecoveryFallbackReason reason) noexcept {
@@ -282,15 +400,17 @@ seastar::future<> LogManager::store_checkpoint(const layout::SegmentDescriptor& 
             const auto tmp_path = final_path + ".tmp";
             {
                 std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-                out << "logical_size=" << checkpoint.logical_size << "\n";
-                out << "sequence=" << checkpoint.sequence << "\n";
-                out << "rotation_index=" << checkpoint.rotation_index << "\n";
+                const auto body = checkpoint_body(checkpoint);
+                out << body;
+                out << "checkpoint_crc=" << crc32(body) << "\n";
                 out.flush();
                 if (!out.good()) {
                     throw std::runtime_error("failed to write checkpoint");
                 }
             }
+            fsync_file(tmp_path);
             std::filesystem::rename(tmp_path, final_path);
+            fsync_directory(std::filesystem::path(final_path).parent_path());
             ++g_checkpoint_write_successes;
         } catch (...) {
             remove_file_if_exists(layout::checkpoint_path(active_segment) + ".tmp");
@@ -315,36 +435,59 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
             return recovery;
         }
 
+        const auto checkpoint_path = layout::checkpoint_path(active_segment);
+        const bool checkpoint_file_exists = fs::exists(checkpoint_path);
+        const auto checkpoint = read_checkpoint_file(active_segment);
+        if (checkpoint) {
+            const auto file_size = fs::file_size(active_segment.path);
+            if (file_size >= checkpoint->logical_size) {
+                const auto trailing_capacity = alignment == 0 ? std::size_t{0} : alignment;
+                const auto streamed = scan_log_file_streaming(
+                    active_segment.path,
+                    checkpoint->logical_size,
+                    checkpoint->sequence,
+                    trailing_capacity);
+                const auto& verified = streamed.verified;
+                recovery.logical_size = verified.valid_size;
+                recovery.sequence = verified.next_sequence;
+                recovery.rotation_index = checkpoint->rotation_index;
+                const auto tail_size = alignment == 0 ? 0 : static_cast<std::size_t>(recovery.logical_size % alignment);
+                if (tail_size > 0) {
+                    if (streamed.trailing_bytes.size() >= tail_size) {
+                        recovery.tail_buffer = streamed.trailing_bytes.substr(streamed.trailing_bytes.size() - tail_size);
+                    } else {
+                        recovery.tail_buffer = read_tail_before_offset(active_segment.path, recovery.logical_size, tail_size);
+                    }
+                }
+                return recovery;
+            }
+
+            ++g_recovery_fallbacks;
+            ++g_recovery_fallback_stale_checkpoint;
+            record_recovery_fallback();
+            g_last_recovery_fallback_reason.store(
+                static_cast<int>(RecoveryFallbackReason::stale_checkpoint),
+                std::memory_order_relaxed);
+            mgrlog.warn(
+                "recovery fallback: checkpoint logical_size={} exceeds active log file size={}",
+                checkpoint->logical_size,
+                file_size);
+        } else if (checkpoint_file_exists) {
+            ++g_recovery_fallbacks;
+            ++g_recovery_fallback_incomplete_checkpoint;
+            record_recovery_fallback();
+            g_last_recovery_fallback_reason.store(
+                static_cast<int>(RecoveryFallbackReason::incomplete_checkpoint),
+                std::memory_order_relaxed);
+            mgrlog.warn("recovery fallback: checkpoint file {} exists but is incomplete, corrupted, or unsupported", checkpoint_path);
+        }
+
         const auto trailing_capacity = alignment == 0 ? std::size_t{0} : alignment;
         const auto streamed = scan_log_file_streaming(active_segment.path, trailing_capacity);
         const auto& verified = streamed.verified;
         auto valid_size = verified.valid_size;
         auto sequence = verified.next_sequence;
         auto rotation_index = std::uint64_t{0};
-
-        const auto checkpoint_path = layout::checkpoint_path(active_segment);
-        const bool checkpoint_file_exists = fs::exists(checkpoint_path);
-        const auto checkpoint = read_checkpoint_file(active_segment);
-        if (checkpoint && checkpoint->logical_size == verified.valid_size) {
-            sequence = checkpoint->sequence;
-            rotation_index = checkpoint->rotation_index;
-        } else if (checkpoint_file_exists) {
-            ++g_recovery_fallbacks;
-            record_recovery_fallback();
-            if (!checkpoint) {
-                ++g_recovery_fallback_incomplete_checkpoint;
-                g_last_recovery_fallback_reason.store(
-                    static_cast<int>(RecoveryFallbackReason::incomplete_checkpoint),
-                    std::memory_order_relaxed);
-                mgrlog.warn("recovery fallback: checkpoint file {} exists but is incomplete or truncated", checkpoint_path);
-            } else {
-                ++g_recovery_fallback_stale_checkpoint;
-                g_last_recovery_fallback_reason.store(
-                    static_cast<int>(RecoveryFallbackReason::stale_checkpoint),
-                    std::memory_order_relaxed);
-                mgrlog.warn("recovery fallback: checkpoint logical_size={} does not match verified active log size={}", checkpoint->logical_size, verified.valid_size);
-            }
-        }
 
         recovery.logical_size = valid_size;
         recovery.sequence = sequence;
