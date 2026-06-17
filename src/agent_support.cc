@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <glob.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,6 +33,81 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr std::string_view kBase64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string trim_copy(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    return std::string(value);
+}
+
+std::string lower_ascii(std::string_view value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (const char ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            lowered.push_back(static_cast<char>(ch - 'A' + 'a'));
+        } else {
+            lowered.push_back(ch);
+        }
+    }
+    return lowered;
+}
+
+bool valid_http_header_name(std::string_view name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (const char ch : name) {
+        const bool alpha = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        const bool digit = ch >= '0' && ch <= '9';
+        const bool token_char = ch == '!' || ch == '#' || ch == '$' || ch == '%' || ch == '&' ||
+            ch == '\'' || ch == '*' || ch == '+' || ch == '-' || ch == '.' || ch == '^' ||
+            ch == '_' || ch == '`' || ch == '|' || ch == '~';
+        if (!alpha && !digit && !token_char) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool valid_http_header_value(std::string_view value) {
+    for (const char ch : value) {
+        if (ch == '\r' || ch == '\n' || ch == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool reserved_http_header_name(std::string_view name) {
+    const auto lowered = lower_ascii(name);
+    return lowered == "host" ||
+        lowered == "content-length" ||
+        lowered == "content-type" ||
+        lowered == "connection";
+}
+
+std::string render_http_request(const HttpEndpoint& endpoint, std::string body, const std::vector<HttpHeader>& headers) {
+    std::string request =
+        "POST " + endpoint.path + " HTTP/1.1\r\n" +
+        "Host: " + endpoint.host + "\r\n" +
+        "Content-Type: application/json\r\n";
+    for (const auto& header : headers) {
+        request += header.name;
+        request += ": ";
+        request += header.value;
+        request += "\r\n";
+    }
+    request +=
+        "Content-Length: " + std::to_string(body.size()) + "\r\n" +
+        "Connection: close\r\n\r\n";
+    request += std::move(body);
+    return request;
+}
 
 std::uint64_t parse_u64(std::string_view value, const char* field) {
     std::uint64_t parsed = 0;
@@ -631,6 +707,36 @@ std::vector<int> parse_http_status_codes(std::string_view value) {
     return statuses;
 }
 
+std::vector<HttpHeader> parse_http_headers(std::string_view value) {
+    std::vector<HttpHeader> headers;
+    while (!value.empty()) {
+        const auto separator = value.find(';');
+        auto token = separator == std::string_view::npos ? value : value.substr(0, separator);
+        const auto colon = token.find(':');
+        if (colon != std::string_view::npos) {
+            auto name = trim_copy(token.substr(0, colon));
+            auto header_value = trim_copy(token.substr(colon + 1));
+            if (!valid_http_header_name(name) || reserved_http_header_name(name)) {
+                throw std::invalid_argument("invalid HTTP sink header name");
+            }
+            if (!valid_http_header_value(header_value)) {
+                throw std::invalid_argument("invalid HTTP sink header value");
+            }
+            headers.push_back(HttpHeader{
+                .name = std::move(name),
+                .value = std::move(header_value),
+            });
+        } else if (!trim_copy(token).empty()) {
+            throw std::invalid_argument("invalid HTTP sink header list");
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(separator + 1);
+    }
+    return headers;
+}
+
 std::string render_json_batch(const std::vector<std::string>& records) {
     std::string body = "{\"records\":[";
     for (std::size_t i = 0; i < records.size(); ++i) {
@@ -700,13 +806,7 @@ void post_http_batch(const HttpEndpoint& endpoint, std::string_view body) {
     }
     SocketFd socket(connected_fd);
 
-    const auto request =
-        "POST " + endpoint.path + " HTTP/1.1\r\n" +
-        "Host: " + endpoint.host + "\r\n" +
-        "Content-Type: application/json\r\n" +
-        "Content-Length: " + std::to_string(body.size()) + "\r\n" +
-        "Connection: close\r\n\r\n" +
-        std::string(body);
+    const auto request = render_http_request(endpoint, std::string(body), {});
 
     std::size_t sent = 0;
     while (sent < request.size()) {
@@ -756,13 +856,7 @@ static seastar::future<> post_http_batch_async_impl(const HttpEndpoint& endpoint
     auto out = socket.output();
     auto in = socket.input();
 
-    const auto request =
-        "POST " + endpoint.path + " HTTP/1.1\r\n" +
-        "Host: " + endpoint.host + "\r\n" +
-        "Content-Type: application/json\r\n" +
-        "Content-Length: " + std::to_string(body.size()) + "\r\n" +
-        "Connection: close\r\n\r\n" +
-        std::move(body);
+    const auto request = render_http_request(endpoint, std::move(body), options.headers);
 
     co_await out.write(request);
     co_await out.flush();

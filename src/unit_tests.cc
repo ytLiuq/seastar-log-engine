@@ -80,6 +80,7 @@ std::vector<log_engine::ParsedRecord> read_back_records(const log_engine::Engine
 struct FakeHttpSink {
     std::thread worker;
     std::atomic<bool> ready{false};
+    std::string received_headers;
     std::string received_body;
     int status = 200;
     std::uint64_t response_delay_ms = 0;
@@ -115,6 +116,9 @@ void run_fake_http_sink_once(FakeHttpSink& sink, std::uint16_t port) {
                 request.append(buffer, static_cast<std::size_t>(rc));
             }
             const auto header_end = request.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                sink.received_headers = request.substr(0, header_end);
+            }
             std::size_t content_length = 0;
             const auto length_pos = request.find("Content-Length:");
             if (length_pos != std::string::npos) {
@@ -1571,6 +1575,17 @@ seastar::future<> test_agent_http_sink_fake_server() {
     const auto retryable_codes = log_engine::agent::parse_http_status_codes("503, 429,503");
     require(retryable_codes.size() == 2, "agent HTTP retryable status parser should dedupe");
     require(retryable_codes[0] == 429 && retryable_codes[1] == 503, "agent HTTP retryable status parser should sort");
+    const auto headers = log_engine::agent::parse_http_headers("Authorization: Bearer token; X-Agent: edge-a");
+    require(headers.size() == 2, "agent HTTP header parser should parse custom headers");
+    require(headers[0].name == "Authorization" && headers[0].value == "Bearer token", "agent HTTP header parser first header mismatch");
+    require(headers[1].name == "X-Agent" && headers[1].value == "edge-a", "agent HTTP header parser second header mismatch");
+    bool reserved_header_rejected = false;
+    try {
+        (void)log_engine::agent::parse_http_headers("Content-Length: 1");
+    } catch (const std::invalid_argument&) {
+        reserved_header_rejected = true;
+    }
+    require(reserved_header_rejected, "agent HTTP header parser should reject reserved headers");
 
     FakeHttpSink ok_sink;
     run_fake_http_sink_once(ok_sink, 19081);
@@ -1584,8 +1599,18 @@ seastar::future<> test_agent_http_sink_fake_server() {
     ok_batch.first_sequence = 20;
     ok_batch.next_sequence = 22;
     ok_batch.records = {"http-a", "http-b"};
-    co_await log_engine::agent::post_http_batch_async(*endpoint, log_engine::agent::render_delivery_batch_json("agent-test", ok_batch));
+    log_engine::agent::HttpPostOptions ok_post_options;
+    ok_post_options.headers = {
+        log_engine::agent::HttpHeader{.name = "Authorization", .value = "Bearer token"},
+        log_engine::agent::HttpHeader{.name = "X-Agent", .value = "edge-a"},
+    };
+    co_await log_engine::agent::post_http_batch_async(
+        *endpoint,
+        log_engine::agent::render_delivery_batch_json("agent-test", ok_batch),
+        ok_post_options);
     ok_sink.worker.join();
+    require(ok_sink.received_headers.find("Authorization: Bearer token") != std::string::npos, "agent async HTTP sink should send configured auth header");
+    require(ok_sink.received_headers.find("X-Agent: edge-a") != std::string::npos, "agent async HTTP sink should send configured custom header");
     require(ok_sink.received_body.find("\"agent_id\":\"agent-test\"") != std::string::npos, "agent async HTTP sink should include agent id");
     require(ok_sink.received_body.find("\"shard\":1") != std::string::npos, "agent async HTTP sink should include shard");
     require(ok_sink.received_body.find("\"first_sequence\":20") != std::string::npos, "agent async HTTP sink should include first sequence");

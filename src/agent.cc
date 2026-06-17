@@ -826,6 +826,7 @@ int main(int argc, char** argv) {
         ("source-max-lines", bpo::value<std::size_t>()->default_value(1024), "Max source lines per poll")
         ("sink-kind", bpo::value<std::string>()->default_value("none"), "Sink kind: none, http, stdout, kafka, object_store")
         ("sink-http-url", bpo::value<std::string>()->default_value(""), "Optional HTTP sink URL, e.g. http://127.0.0.1:9000/ingest")
+        ("sink-http-headers", bpo::value<std::string>()->default_value(""), "Semicolon-separated HTTP sink headers, e.g. Authorization: Bearer token; X-Agent: edge")
         ("sink-http-timeout-ms", bpo::value<std::uint64_t>()->default_value(5000), "HTTP sink request timeout in milliseconds, 0 disables timeout")
         ("sink-http-retryable-statuses", bpo::value<std::string>()->default_value("408,425,429,500,502,503,504"), "Comma-separated HTTP sink status codes treated as retryable")
         ("delivery-offset-path", bpo::value<std::string>()->default_value("agent-delivery.offset"), "HTTP sink delivery offset checkpoint")
@@ -910,6 +911,12 @@ int main(int argc, char** argv) {
                 options, file_values, "sink-kind", options["sink-kind"].as<std::string>()));
             runtime_options.sink_http_url = log_engine::resolve_string_option(
                 options, file_values, "sink-http-url", options["sink-http-url"].as<std::string>());
+            runtime_options.sink_http_options.headers = log_engine::agent::parse_http_headers(
+                log_engine::resolve_string_option(
+                    options,
+                    file_values,
+                    "sink-http-headers",
+                    options["sink-http-headers"].as<std::string>()));
             runtime_options.sink_http_options.timeout_ms = log_engine::resolve_u64_option(
                 options, file_values, "sink-http-timeout-ms", options["sink-http-timeout-ms"].as<std::uint64_t>());
             runtime_options.sink_http_options.retryable_status_codes = log_engine::agent::parse_http_status_codes(

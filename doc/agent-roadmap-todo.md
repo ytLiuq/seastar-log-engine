@@ -11,6 +11,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Added `log_engine_agent_replay`, an offline replay helper that exports unacknowledged local-engine records from per-shard delivery offsets as idempotent JSON batches.
 - 2026-06-17: Added detailed recovery mode counters for checkpoint recovery, full-scan recovery, and missing active-log recovery; exposed them through metrics and `/v1/status`.
 - 2026-06-17: Added HTTP sink request timeout and configurable retryable HTTP status codes.
+- 2026-06-17: Added configurable HTTP sink headers with validation for reserved and malformed header names.
 
 ## Current Baseline
 
@@ -48,7 +49,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
   - future `ObjectStoreSink`
 
 - HTTP sink improvements:
-  - Support configurable headers.
+  - [x] Support configurable headers.
   - [x] Support request timeout.
   - [x] Support retryable status codes.
   - Support TLS later, either through Seastar TLS support or a clearly documented proxy mode.

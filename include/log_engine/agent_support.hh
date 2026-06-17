@@ -64,9 +64,15 @@ struct HttpEndpoint {
     std::string path = "/";
 };
 
+struct HttpHeader {
+    std::string name;
+    std::string value;
+};
+
 struct HttpPostOptions {
     std::uint64_t timeout_ms = 5000;
     std::vector<int> retryable_status_codes = {408, 425, 429, 500, 502, 503, 504};
+    std::vector<HttpHeader> headers;
 };
 
 class RetryableHttpStatusError : public std::runtime_error {
@@ -110,6 +116,7 @@ std::vector<std::string> expand_glob_paths(std::string_view pattern);
 
 std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url);
 std::vector<int> parse_http_status_codes(std::string_view value);
+std::vector<HttpHeader> parse_http_headers(std::string_view value);
 std::string render_json_batch(const std::vector<std::string>& records);
 std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
 void post_http_batch(const HttpEndpoint& endpoint, std::string_view body);
