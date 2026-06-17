@@ -109,6 +109,8 @@ curl http://127.0.0.1:18081/v1/status
   --file-source-glob '/var/log/app/*.log' \
   --sink-kind http \
   --sink-http-url http://127.0.0.1:9000/v1/logs \
+  --sink-http-timeout-ms 5000 \
+  --sink-http-retryable-statuses 408,425,429,500,502,503,504 \
   --max-buffer-bytes 1073741824 \
   --resume-buffer-bytes 805306368
 ```
@@ -139,7 +141,7 @@ Agent 输入源：
 Agent sink：
 
 - `--sink-kind stdout`：直接输出到 stdout，适合调试和容器日志管道。
-- `--sink-kind http --sink-http-url http://host:port/path`：批量 POST JSON。
+- `--sink-kind http --sink-http-url http://host:port/path`：批量 POST JSON；`--sink-http-timeout-ms` 控制请求超时，`--sink-http-retryable-statuses` 控制哪些非 2xx 状态进入重试退避。
 - `--sink-kind kafka/object_store`：配置边界已预留，当前构建不会链接外部客户端，启动后会明确报错。
 
 容器运行：

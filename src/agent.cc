@@ -277,6 +277,7 @@ struct AgentRuntimeOptions {
     std::size_t source_max_lines = 1024;
     SinkKind sink_kind = SinkKind::none;
     std::string sink_http_url;
+    log_engine::agent::HttpPostOptions sink_http_options;
     std::string delivery_offset_path = "agent-delivery.offset";
     std::string pending_delivery_path = "agent-delivery.pending";
     std::size_t sink_batch_size = 100;
@@ -627,7 +628,8 @@ seastar::future<> deliver_batch(
         }
         return log_engine::agent::post_http_batch_async(
             *endpoint,
-            log_engine::agent::render_delivery_batch_json(options.agent_id, batch));
+            log_engine::agent::render_delivery_batch_json(options.agent_id, batch),
+            options.sink_http_options);
     case SinkKind::kafka:
         throw std::runtime_error("sink-kind=kafka is configured but Kafka sink is not linked in this build");
     case SinkKind::object_store:
@@ -824,6 +826,8 @@ int main(int argc, char** argv) {
         ("source-max-lines", bpo::value<std::size_t>()->default_value(1024), "Max source lines per poll")
         ("sink-kind", bpo::value<std::string>()->default_value("none"), "Sink kind: none, http, stdout, kafka, object_store")
         ("sink-http-url", bpo::value<std::string>()->default_value(""), "Optional HTTP sink URL, e.g. http://127.0.0.1:9000/ingest")
+        ("sink-http-timeout-ms", bpo::value<std::uint64_t>()->default_value(5000), "HTTP sink request timeout in milliseconds, 0 disables timeout")
+        ("sink-http-retryable-statuses", bpo::value<std::string>()->default_value("408,425,429,500,502,503,504"), "Comma-separated HTTP sink status codes treated as retryable")
         ("delivery-offset-path", bpo::value<std::string>()->default_value("agent-delivery.offset"), "HTTP sink delivery offset checkpoint")
         ("pending-delivery-path", bpo::value<std::string>()->default_value("agent-delivery.pending"), "Durable pending sink batch file")
         ("sink-batch-size", bpo::value<std::size_t>()->default_value(100), "HTTP sink batch size")
@@ -906,6 +910,14 @@ int main(int argc, char** argv) {
                 options, file_values, "sink-kind", options["sink-kind"].as<std::string>()));
             runtime_options.sink_http_url = log_engine::resolve_string_option(
                 options, file_values, "sink-http-url", options["sink-http-url"].as<std::string>());
+            runtime_options.sink_http_options.timeout_ms = log_engine::resolve_u64_option(
+                options, file_values, "sink-http-timeout-ms", options["sink-http-timeout-ms"].as<std::uint64_t>());
+            runtime_options.sink_http_options.retryable_status_codes = log_engine::agent::parse_http_status_codes(
+                log_engine::resolve_string_option(
+                    options,
+                    file_values,
+                    "sink-http-retryable-statuses",
+                    options["sink-http-retryable-statuses"].as<std::string>()));
             runtime_options.delivery_offset_path = log_engine::resolve_string_option(
                 options, file_values, "delivery-offset-path", options["delivery-offset-path"].as<std::string>());
             runtime_options.pending_delivery_path = log_engine::resolve_string_option(

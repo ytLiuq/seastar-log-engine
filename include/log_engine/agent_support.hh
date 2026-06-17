@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -63,6 +64,20 @@ struct HttpEndpoint {
     std::string path = "/";
 };
 
+struct HttpPostOptions {
+    std::uint64_t timeout_ms = 5000;
+    std::vector<int> retryable_status_codes = {408, 425, 429, 500, 502, 503, 504};
+};
+
+class RetryableHttpStatusError : public std::runtime_error {
+public:
+    RetryableHttpStatusError(int status, std::string status_line);
+    int status() const noexcept;
+
+private:
+    int _status = 0;
+};
+
 struct ReplayOptions {
     std::string delivery_offset_path;
     std::size_t batch_size = 100;
@@ -94,10 +109,12 @@ TailBatch tail_file_once(
 std::vector<std::string> expand_glob_paths(std::string_view pattern);
 
 std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url);
+std::vector<int> parse_http_status_codes(std::string_view value);
 std::string render_json_batch(const std::vector<std::string>& records);
 std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
 void post_http_batch(const HttpEndpoint& endpoint, std::string_view body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body);
+seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body, const HttpPostOptions& options);
 void write_stdout_batch(const std::vector<std::string>& records);
 
 }  // namespace log_engine::agent

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/dns.hh>
 
@@ -200,6 +202,15 @@ private:
 };
 
 }  // namespace
+
+RetryableHttpStatusError::RetryableHttpStatusError(int status, std::string status_line)
+    : std::runtime_error("retryable HTTP sink status: " + status_line)
+    , _status(status) {
+}
+
+int RetryableHttpStatusError::status() const noexcept {
+    return _status;
+}
 
 std::optional<SourceOffset> load_source_offset(const std::string& path) {
     const auto values = load_kv_file(path);
@@ -590,6 +601,36 @@ std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url) {
     return endpoint;
 }
 
+std::vector<int> parse_http_status_codes(std::string_view value) {
+    std::vector<int> statuses;
+    while (!value.empty()) {
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == ',')) {
+            value.remove_prefix(1);
+        }
+        if (value.empty()) {
+            break;
+        }
+        const auto comma = value.find(',');
+        auto token = comma == std::string_view::npos ? value : value.substr(0, comma);
+        while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+            token.remove_suffix(1);
+        }
+        int status = 0;
+        const auto result = std::from_chars(token.data(), token.data() + token.size(), status);
+        if (result.ec != std::errc{} || result.ptr != token.data() + token.size() || status < 100 || status > 599) {
+            throw std::invalid_argument("invalid HTTP status code list");
+        }
+        statuses.push_back(status);
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(comma + 1);
+    }
+    std::sort(statuses.begin(), statuses.end());
+    statuses.erase(std::unique(statuses.begin(), statuses.end()), statuses.end());
+    return statuses;
+}
+
 std::string render_json_batch(const std::vector<std::string>& records) {
     std::string body = "{\"records\":[";
     for (std::size_t i = 0; i < records.size(); ++i) {
@@ -705,7 +746,11 @@ void post_http_batch(const HttpEndpoint& endpoint, std::string_view body) {
     }
 }
 
-seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body) {
+static seastar::future<> post_http_batch_async_impl(const HttpEndpoint& endpoint, std::string body, const HttpPostOptions& options) {
+    auto retryable_status_codes = options.retryable_status_codes;
+    std::sort(retryable_status_codes.begin(), retryable_status_codes.end());
+    retryable_status_codes.erase(std::unique(retryable_status_codes.begin(), retryable_status_codes.end()), retryable_status_codes.end());
+
     const auto address = co_await seastar::net::dns::resolve_name(endpoint.host);
     auto socket = co_await seastar::engine().net().connect(seastar::socket_address(address, endpoint.port));
     auto out = socket.output();
@@ -739,8 +784,25 @@ seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::strin
     int status = 0;
     const auto result = std::from_chars(status_text.data(), status_text.data() + status_text.size(), status);
     if (result.ec != std::errc{} || status < 200 || status >= 300) {
+        if (std::binary_search(retryable_status_codes.begin(), retryable_status_codes.end(), status)) {
+            throw RetryableHttpStatusError(status, std::string(status_line));
+        }
         throw std::runtime_error("HTTP sink returned non-2xx status: " + std::string(status_line));
     }
+}
+
+seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body, const HttpPostOptions& options) {
+    if (options.timeout_ms == 0) {
+        return post_http_batch_async_impl(endpoint, std::move(body), options);
+    }
+    return seastar::with_timeout(
+        seastar::lowres_clock::now() + std::chrono::milliseconds(options.timeout_ms),
+        post_http_batch_async_impl(endpoint, std::move(body), options));
+}
+
+seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body) {
+    HttpPostOptions options;
+    return post_http_batch_async(endpoint, std::move(body), options);
 }
 
 void write_stdout_batch(const std::vector<std::string>& records) {

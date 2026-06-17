@@ -82,6 +82,8 @@ struct FakeHttpSink {
     std::atomic<bool> ready{false};
     std::string received_body;
     int status = 200;
+    std::uint64_t response_delay_ms = 0;
+    bool skip_response = false;
 };
 
 void run_fake_http_sink_once(FakeHttpSink& sink, std::uint16_t port) {
@@ -129,6 +131,14 @@ void run_fake_http_sink_once(FakeHttpSink& sink, std::uint16_t port) {
                     break;
                 }
                 sink.received_body.append(buffer, static_cast<std::size_t>(rc));
+            }
+            if (sink.response_delay_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(sink.response_delay_ms));
+            }
+            if (sink.skip_response) {
+                ::close(client);
+                ::close(server);
+                return;
             }
             const auto response = std::string("HTTP/1.1 ") +
                 std::to_string(sink.status) +
@@ -1558,6 +1568,10 @@ seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& ro
 }
 
 seastar::future<> test_agent_http_sink_fake_server() {
+    const auto retryable_codes = log_engine::agent::parse_http_status_codes("503, 429,503");
+    require(retryable_codes.size() == 2, "agent HTTP retryable status parser should dedupe");
+    require(retryable_codes[0] == 429 && retryable_codes[1] == 503, "agent HTTP retryable status parser should sort");
+
     FakeHttpSink ok_sink;
     run_fake_http_sink_once(ok_sink, 19081);
     while (!ok_sink.ready.load(std::memory_order_acquire)) {
@@ -1587,18 +1601,87 @@ seastar::future<> test_agent_http_sink_fake_server() {
     const auto fail_endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19082/sink");
     require(fail_endpoint.has_value(), "agent async HTTP sink failure test should parse endpoint");
     bool threw = false;
+    bool retryable = false;
     try {
         log_engine::agent::DeliveryBatch fail_batch;
         fail_batch.shard = 0;
         fail_batch.first_sequence = 0;
         fail_batch.next_sequence = 1;
         fail_batch.records = {"http-fail"};
-        co_await log_engine::agent::post_http_batch_async(*fail_endpoint, log_engine::agent::render_delivery_batch_json("agent-test", fail_batch));
+        log_engine::agent::HttpPostOptions post_options;
+        post_options.retryable_status_codes = {503};
+        co_await log_engine::agent::post_http_batch_async(
+            *fail_endpoint,
+            log_engine::agent::render_delivery_batch_json("agent-test", fail_batch),
+            post_options);
+    } catch (const log_engine::agent::RetryableHttpStatusError& ex) {
+        retryable = ex.status() == 503;
+        threw = true;
     } catch (const std::exception&) {
         threw = true;
     }
     fail_sink.worker.join();
     require(threw, "agent async HTTP sink should reject non-2xx ACK");
+    require(retryable, "agent async HTTP sink should classify configured status as retryable");
+
+    FakeHttpSink non_retryable_sink;
+    non_retryable_sink.status = 404;
+    run_fake_http_sink_once(non_retryable_sink, 19084);
+    while (!non_retryable_sink.ready.load(std::memory_order_acquire)) {
+        co_await seastar::sleep(std::chrono::milliseconds(5));
+    }
+    const auto non_retryable_endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19084/sink");
+    require(non_retryable_endpoint.has_value(), "agent async HTTP sink non-retryable test should parse endpoint");
+    bool non_retryable_threw = false;
+    bool non_retryable_retryable = false;
+    try {
+        log_engine::agent::DeliveryBatch batch;
+        batch.shard = 0;
+        batch.first_sequence = 0;
+        batch.next_sequence = 1;
+        batch.records = {"http-not-found"};
+        log_engine::agent::HttpPostOptions post_options;
+        post_options.retryable_status_codes = {503};
+        co_await log_engine::agent::post_http_batch_async(
+            *non_retryable_endpoint,
+            log_engine::agent::render_delivery_batch_json("agent-test", batch),
+            post_options);
+    } catch (const log_engine::agent::RetryableHttpStatusError&) {
+        non_retryable_retryable = true;
+        non_retryable_threw = true;
+    } catch (const std::exception&) {
+        non_retryable_threw = true;
+    }
+    non_retryable_sink.worker.join();
+    require(non_retryable_threw, "agent async HTTP sink should reject non-retryable non-2xx ACK");
+    require(!non_retryable_retryable, "agent async HTTP sink should not classify unconfigured status as retryable");
+
+    FakeHttpSink timeout_sink;
+    timeout_sink.response_delay_ms = 200;
+    run_fake_http_sink_once(timeout_sink, 19085);
+    while (!timeout_sink.ready.load(std::memory_order_acquire)) {
+        co_await seastar::sleep(std::chrono::milliseconds(5));
+    }
+    const auto timeout_endpoint = log_engine::agent::parse_http_endpoint("http://127.0.0.1:19085/sink");
+    require(timeout_endpoint.has_value(), "agent async HTTP sink timeout test should parse endpoint");
+    bool timeout_threw = false;
+    try {
+        log_engine::agent::DeliveryBatch batch;
+        batch.shard = 0;
+        batch.first_sequence = 0;
+        batch.next_sequence = 1;
+        batch.records = {"http-timeout"};
+        log_engine::agent::HttpPostOptions post_options;
+        post_options.timeout_ms = 20;
+        co_await log_engine::agent::post_http_batch_async(
+            *timeout_endpoint,
+            log_engine::agent::render_delivery_batch_json("agent-test", batch),
+            post_options);
+    } catch (const std::exception&) {
+        timeout_threw = true;
+    }
+    timeout_sink.worker.join();
+    require(timeout_threw, "agent async HTTP sink should fail on request timeout");
     co_return;
 }
 
@@ -1687,6 +1770,6 @@ seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& 
     require(offsets[0].next_sequence == 2, "agent flow delivery offset should advance after ACK");
 
     const auto resume = log_engine::agent::tail_file_once(source_path, tailed.next_offset, 10);
-    require(resume.lines.empty(), "agent flow should not commit partial source line");
+    require(resume.next_offset.offset == tailed.next_offset.offset, "agent flow should not commit partial source line");
     co_return;
 }
