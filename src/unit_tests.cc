@@ -883,6 +883,54 @@ seastar::future<> test_corrupted_checkpoint_falls_back_to_scan(const std::string
     co_return;
 }
 
+seastar::future<> test_stale_checkpoint_falls_back_to_scan(const std::string& root_dir) {
+    const auto log_dir = (fs::path(root_dir) / "stale-checkpoint-logs").string();
+    const auto archive_dir = (fs::path(root_dir) / "stale-checkpoint-archive").string();
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 2;
+    config.checkpoint_enabled = true;
+    config.truncate_on_start = false;
+    config.record_sequence_enabled = false;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    co_await engine.info("stale-checkpoint-a", "route-sc");
+    co_await engine.info("stale-checkpoint-b", "route-sc");
+    co_await engine.stop();
+
+    const auto shard_path = find_non_empty_shard_log(log_dir);
+    require(shard_path.has_value(), "stale checkpoint test should find a non-empty shard log");
+    const auto verified = log_engine::scan_log_content(read_file(*shard_path));
+
+    log_engine::LogManager writer;
+    const auto active_segment = log_engine::layout::describe_path(config, shard_path->string());
+    require(active_segment.has_value(), "stale checkpoint test should describe active shard log");
+    co_await writer.store_checkpoint(
+        *active_segment,
+        log_engine::CheckpointState{
+            .logical_size = static_cast<std::uint64_t>(fs::file_size(*shard_path) + 128),
+            .sequence = 999,
+            .rotation_index = 0,
+        });
+
+    log_engine::reset_log_manager_stats();
+    log_engine::LogManager manager;
+    const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
+    require(recovery.logical_size == verified.valid_size, "stale checkpoint should fall back to scanned size");
+    require(recovery.sequence == verified.next_sequence, "stale checkpoint should fall back to scanned sequence");
+    const auto stats = log_engine::get_log_manager_stats();
+    require(stats.recovery_fallbacks == 1, "stale checkpoint should increment recovery fallback counter");
+    require(stats.recovery_fallback_stale_checkpoint == 1, "stale checkpoint should increment stale checkpoint counter");
+    require(stats.recovery_full_scans == 1, "stale checkpoint should increment full scan counter");
+    require(log_engine::get_last_recovery_fallback_reason() == log_engine::RecoveryFallbackReason::stale_checkpoint, "stale checkpoint should set last fallback reason");
+    co_return;
+}
+
 seastar::future<> test_recovery_after_rotate(
     const std::string& root_dir,
     bool checkpoint_enabled,
@@ -999,6 +1047,8 @@ seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string&
 seastar::future<> test_agent_disk_quota_and_http_helpers(const std::string& root_dir);
 seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string& root_dir);
+seastar::future<> test_agent_crash_before_sink_ack_replays_pending_batch(const std::string& root_dir);
+seastar::future<> test_agent_crash_after_sink_ack_before_offset_persistence_bounds_duplicate_window(const std::string& root_dir);
 seastar::future<> test_agent_replay_batches_from_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
 seastar::future<> test_agent_http_sink_fake_server();
@@ -1031,6 +1081,7 @@ int main(int argc, char** argv) {
         co_await test_partial_checkpoint_ignored(root_dir);
         co_await test_checkpoint_tail_scan_preserves_valid_records_after_checkpoint(root_dir);
         co_await test_corrupted_checkpoint_falls_back_to_scan(root_dir);
+        co_await test_stale_checkpoint_falls_back_to_scan(root_dir);
         co_await test_recovery_after_rotate(root_dir, false, false);
         co_await test_recovery_after_rotate(root_dir, true, false);
         co_await test_recovery_after_rotate(root_dir, false, true);
@@ -1047,6 +1098,8 @@ int main(int argc, char** argv) {
         co_await test_agent_disk_quota_and_http_helpers(root_dir);
         co_await test_agent_per_shard_delivery_offsets(root_dir);
         co_await test_agent_pending_delivery_batch_roundtrip(root_dir);
+        co_await test_agent_crash_before_sink_ack_replays_pending_batch(root_dir);
+        co_await test_agent_crash_after_sink_ack_before_offset_persistence_bounds_duplicate_window(root_dir);
         co_await test_agent_replay_batches_from_delivery_offsets(root_dir);
         co_await test_agent_glob_and_dynamic_backpressure(root_dir);
         co_await test_agent_http_sink_fake_server();
@@ -1490,6 +1543,114 @@ seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string&
 
     log_engine::agent::remove_pending_delivery_batch(path);
     require(!log_engine::agent::load_pending_delivery_batch(path).has_value(), "agent pending delivery batch should be removable");
+    co_return;
+}
+
+seastar::future<> test_agent_crash_before_sink_ack_replays_pending_batch(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-crash-before-ack";
+    reset_directory(dir);
+    const auto pending_path = (dir / "delivery.pending").string();
+    const auto delivery_path = (dir / "delivery.offset").string();
+
+    log_engine::agent::DeliveryBatch batch;
+    batch.shard = 0;
+    batch.first_sequence = 5;
+    batch.next_sequence = 7;
+    batch.records = {"before-ack-a", "before-ack-b"};
+    log_engine::agent::store_pending_delivery_batch(pending_path, batch);
+
+    const auto restarted_pending = log_engine::agent::load_pending_delivery_batch(pending_path);
+    require(restarted_pending.has_value(), "agent restart should reload pending batch before sink ACK");
+    require(restarted_pending->shard == batch.shard, "agent pending batch shard should survive restart");
+    require(restarted_pending->first_sequence == batch.first_sequence, "agent pending batch first sequence should survive restart");
+    require(restarted_pending->next_sequence == batch.next_sequence, "agent pending batch next sequence should survive restart");
+    require(restarted_pending->records == batch.records, "agent pending batch records should survive restart");
+
+    const auto offsets_before_ack = log_engine::agent::load_delivery_offsets(delivery_path);
+    require(offsets_before_ack.empty(), "agent should not advance delivery offset before sink ACK");
+
+    log_engine::agent::store_delivery_offsets(delivery_path, {
+        log_engine::agent::DeliveryOffset{.shard = batch.shard, .next_sequence = batch.next_sequence},
+    });
+    log_engine::agent::remove_pending_delivery_batch(pending_path);
+
+    require(!log_engine::agent::load_pending_delivery_batch(pending_path).has_value(), "agent should remove pending batch after ACK and offset persistence");
+    const auto offsets_after_ack = log_engine::agent::load_delivery_offsets(delivery_path);
+    require(offsets_after_ack.size() == 1, "agent should persist delivery offset after ACK");
+    require(offsets_after_ack[0].shard == batch.shard, "agent ACK offset shard mismatch");
+    require(offsets_after_ack[0].next_sequence == batch.next_sequence, "agent ACK offset sequence mismatch");
+    co_return;
+}
+
+seastar::future<> test_agent_crash_after_sink_ack_before_offset_persistence_bounds_duplicate_window(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-crash-after-ack-before-offset";
+    const auto log_dir = (dir / "logs").string();
+    const auto archive_dir = (dir / "archive").string();
+    reset_directory(dir);
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+    const auto pending_path = (dir / "delivery.pending").string();
+    const auto delivery_path = (dir / "delivery.offset").string();
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 3;
+    config.ack_mode = log_engine::AckMode::sync_ack;
+    config.empty_route_policy = log_engine::EmptyRoutePolicy::local;
+    config.truncate_on_start = true;
+    config.record_crc_enabled = true;
+    config.record_sequence_enabled = true;
+    config.record_shard_id_enabled = true;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    std::vector<log_engine::LogMessage> messages;
+    messages.push_back(log_engine::LogMessage{.payload = "acked-then-crash-a"});
+    messages.push_back(log_engine::LogMessage{.payload = "acked-then-crash-b"});
+    co_await engine.append_batch(std::move(messages));
+    co_await engine.stop();
+
+    const auto records = read_back_records(config, true, 10);
+    require(records.size() == 2, "agent duplicate-window setup should persist two records");
+    require(records[0].has_sequence && records[1].has_sequence, "agent duplicate-window records should carry sequences");
+
+    log_engine::agent::DeliveryBatch acked_batch;
+    acked_batch.shard = 0;
+    acked_batch.first_sequence = records.front().sequence;
+    acked_batch.next_sequence = records.back().sequence + 1;
+    for (const auto& record : records) {
+        acked_batch.records.push_back(record.payload);
+    }
+    log_engine::agent::store_pending_delivery_batch(pending_path, acked_batch);
+
+    const auto pending_after_crash = log_engine::agent::load_pending_delivery_batch(pending_path);
+    require(pending_after_crash.has_value(), "agent should retain pending batch if crash happens after sink ACK but before offset persistence");
+    require(log_engine::agent::load_delivery_offsets(delivery_path).empty(), "agent should not claim ACKed offset if offset persistence did not happen");
+
+    log_engine::agent::ReplayOptions replay;
+    replay.delivery_offset_path = delivery_path;
+    replay.batch_size = 10;
+    replay.include_archive = true;
+    replay.shard = 0;
+    const auto replay_batches = log_engine::agent::build_replay_batches(config, replay);
+    require(replay_batches.size() == 1, "agent should replay unadvanced delivery window after restart");
+    require(replay_batches[0].first_sequence == acked_batch.first_sequence, "agent replay duplicate window should start at unpersisted offset");
+    require(replay_batches[0].next_sequence == acked_batch.next_sequence, "agent replay duplicate window should be bounded by ACKed batch range");
+    require(replay_batches[0].records == acked_batch.records, "agent replay duplicate window should contain only the unpersisted ACKed batch");
+
+    const auto body = log_engine::agent::render_delivery_batch_json("agent-dup-window", replay_batches[0]);
+    require(body.find("\"agent_id\":\"agent-dup-window\"") != std::string::npos, "agent duplicate replay should include agent id for sink dedup");
+    require(body.find("\"shard\":0") != std::string::npos, "agent duplicate replay should include shard for sink dedup");
+    require(body.find("\"first_sequence\":" + std::to_string(acked_batch.first_sequence)) != std::string::npos, "agent duplicate replay should include first sequence for sink dedup");
+    require(body.find("\"next_sequence\":" + std::to_string(acked_batch.next_sequence)) != std::string::npos, "agent duplicate replay should include next sequence for sink dedup");
+
+    log_engine::agent::store_delivery_offsets(delivery_path, {
+        log_engine::agent::DeliveryOffset{.shard = acked_batch.shard, .next_sequence = acked_batch.next_sequence},
+    });
+    log_engine::agent::remove_pending_delivery_batch(pending_path);
+    const auto after_commit_replay_batches = log_engine::agent::build_replay_batches(config, replay);
+    require(after_commit_replay_batches.empty(), "agent should not replay ACKed records after offset persistence");
     co_return;
 }
 

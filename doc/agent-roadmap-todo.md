@@ -13,6 +13,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Added HTTP sink request timeout and configurable retryable HTTP status codes.
 - 2026-06-17: Added configurable HTTP sink headers with validation for reserved and malformed header names.
 - 2026-06-17: Made file-source rotation/truncation observable with `source_rotations` status output and rename-rotation unit coverage.
+- 2026-06-17: Closed P0 reliability coverage with stale checkpoint fallback, ACK-window replay tests, and documented at-least-once dedup semantics.
 
 ## Current Baseline
 
@@ -31,13 +32,13 @@ This document tracks follow-up work after the current agent/checkpoint iteration
   - [x] Add a replay helper that can explicitly export unsent local-engine records from delivery offsets for offline recovery.
 
 - Harden crash/restart behavior:
-  - Add an integration test that kills the agent between local append and sink ACK.
-  - Add an integration test that kills the agent after sink ACK but before offset persistence.
-  - Verify duplicate window is bounded and explain sink-side dedup expectations.
+  - [x] Add an integration test that kills the agent between local append and sink ACK.
+  - [x] Add an integration test that kills the agent after sink ACK but before offset persistence.
+  - [x] Verify duplicate window is bounded and explain sink-side dedup expectations.
 
 - Improve checkpoint durability:
   - Keep current checkpoint CRC and fsync behavior.
-  - Add fault-injection tests for partial checkpoint write, stale checkpoint, corrupted checkpoint CRC, and corrupted active log tail.
+  - [x] Add fault-injection tests for partial checkpoint write, stale checkpoint, corrupted checkpoint CRC, and corrupted active log tail.
   - [x] Expose the last recovery fallback reason through `/v1/status`.
   - [x] Track detailed recovery mode counters in metrics.
 
