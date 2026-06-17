@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <stdexcept>
 #include <optional>
 #include <string>
@@ -11,6 +12,7 @@
 #include <seastar/core/future.hh>
 
 #include "log_engine/config.hh"
+#include "log_engine/record_codec.hh"
 
 namespace log_engine::agent {
 
@@ -30,6 +32,15 @@ struct DeliveryBatch {
     std::uint64_t first_sequence = 0;
     std::uint64_t next_sequence = 0;
     std::vector<std::string> records;
+};
+
+struct AgentRecordEnvelope {
+    std::string agent_id;
+    std::string source_id;
+    std::optional<std::uint64_t> source_offset;
+    std::string ingest_timestamp;
+    std::map<std::string, std::string> attributes;
+    std::string message;
 };
 
 struct TailBatch {
@@ -102,6 +113,10 @@ std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path
 void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch);
 void remove_pending_delivery_batch(const std::string& path);
 std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, const ReplayOptions& options);
+DeliveryBatch build_delivery_batch_from_records(
+    const std::vector<ParsedRecord>& records,
+    unsigned fallback_shard,
+    std::uint64_t fallback_first_sequence);
 
 std::uint64_t directory_size_bytes(const std::string& path);
 bool disk_quota_exceeded(const std::string& path, const DiskQuota& quota);
@@ -119,6 +134,7 @@ std::vector<int> parse_http_status_codes(std::string_view value);
 std::vector<HttpHeader> parse_http_headers(std::string_view value);
 std::string render_json_batch(const std::vector<std::string>& records);
 std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
+std::string render_agent_record_envelope(const AgentRecordEnvelope& record);
 void post_http_batch(const HttpEndpoint& endpoint, std::string_view body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body, const HttpPostOptions& options);

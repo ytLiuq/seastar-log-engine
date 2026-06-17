@@ -14,6 +14,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Added configurable HTTP sink headers with validation for reserved and malformed header names.
 - 2026-06-17: Made file-source rotation/truncation observable with `source_rotations` status output and rename-rotation unit coverage.
 - 2026-06-17: Closed P0 reliability coverage with stale checkpoint fallback, ACK-window replay tests, and documented at-least-once dedup semantics.
+- 2026-06-17: Closed P2 record layout/query milestone with a backward-compatible agent metadata envelope, metadata filters, sink-batch query export, and binary-layout evaluation notes.
 
 ## Current Baseline
 
@@ -98,21 +99,24 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P2 Record Layout And Query
 
 - Add an agent-oriented record schema:
-  - `source_id`
-  - `source_offset`
-  - `agent_id`
-  - `ingest_timestamp`
-  - `attributes`
+  - [x] `source_id`
+  - [x] `source_offset`
+  - [x] `agent_id`
+  - [x] `ingest_timestamp`
+  - [x] `attributes`
+  - Implemented as a backward-compatible JSON envelope inside the existing payload. The reader normalizes the message into `ParsedRecord::payload` and exposes metadata fields separately.
 
 - Add query support for agent metadata:
-  - Filter by source.
-  - Filter by shard and sequence range.
-  - Export records in sink batch format for replay.
+  - [x] Filter by source.
+  - [x] Filter by agent id.
+  - [x] Filter by shard and sequence range.
+  - [x] Export records in sink batch format for replay.
 
 - Evaluate binary record layout:
-  - Reduce parsing overhead versus text records.
-  - Preserve CRC and sequence verification.
-  - Keep a migration path from the current text layout.
+  - [x] Reduce parsing overhead versus text records.
+  - [x] Preserve CRC and sequence verification.
+  - [x] Keep a migration path from the current text layout.
+  - Current decision: do not rewrite the low-level record format in this milestone. See `doc/agent-record-layout-evaluation.md` for the compatibility rationale and future binary layout sketch.
 
 ## P2 Deployment
 

@@ -26,6 +26,7 @@
 
 #include "log_engine/config_loader.hh"
 #include "log_engine/health_monitor.hh"
+#include "log_engine/agent_support.hh"
 #include "log_engine/log_manager.hh"
 #include "log_engine/log_reader.hh"
 #include "log_engine/routing.hh"
@@ -218,15 +219,35 @@ struct QueryContext {
 
     std::string render_records_json(const log_engine::ReadQuery& query) const {
         const auto records = query_records(query);
-        std::string out = "{\"records\":[";
+        std::string out = "{";
+        if (query.export_sink_batch) {
+            const auto batch = log_engine::agent::build_delivery_batch_from_records(
+                records,
+                query.shard.value_or(0),
+                query.seq_from.value_or(0));
+            out += "\"sink_batch_json\":\"";
+            out += json_escape(log_engine::agent::render_delivery_batch_json(query.agent_id.value_or("query-export"), batch));
+            out += "\",";
+        }
+        out += "\"records\":[";
         bool first = true;
         for (const auto& record : records) {
             if (!first) {
                 out += ',';
             }
             first = false;
+            std::string attributes = "{";
+            bool first_attribute = true;
+            for (const auto& [key, value] : record.attributes) {
+                if (!first_attribute) {
+                    attributes += ',';
+                }
+                first_attribute = false;
+                attributes += fmt::format("\"{}\":\"{}\"", json_escape(key), json_escape(value));
+            }
+            attributes += "}";
             out += fmt::format(
-                "{{\"crc\":{},\"timestamp\":\"{}\",\"shard\":{},\"has_sequence\":{},\"sequence\":{},\"level\":\"{}\",\"payload\":\"{}\",\"raw_line\":\"{}\"}}",
+                "{{\"crc\":{},\"timestamp\":\"{}\",\"shard\":{},\"has_sequence\":{},\"sequence\":{},\"level\":\"{}\",\"payload\":\"{}\",\"raw_line\":\"{}\",\"agent_id\":\"{}\",\"source_id\":\"{}\",\"has_source_offset\":{},\"source_offset\":{},\"ingest_timestamp\":\"{}\",\"attributes\":{}}}",
                 record.crc,
                 json_escape(record.timestamp),
                 record.shard,
@@ -234,7 +255,13 @@ struct QueryContext {
                 record.sequence,
                 log_engine::level_to_string(record.level),
                 json_escape(record.payload),
-                json_escape(record.raw_line));
+                json_escape(record.raw_line),
+                json_escape(record.agent_id),
+                json_escape(record.source_id),
+                record.source_offset.has_value() ? "true" : "false",
+                record.source_offset.value_or(0),
+                json_escape(record.ingest_timestamp),
+                attributes);
         }
         out += "]}";
         return out;
@@ -301,6 +328,22 @@ struct QueryContext {
             out->set_level(log_engine::level_to_string(record.level));
             out->set_payload(record.payload);
             out->set_raw_line(record.raw_line);
+            out->set_agent_id(record.agent_id);
+            out->set_source_id(record.source_id);
+            if (record.source_offset) {
+                out->set_source_offset(*record.source_offset);
+            }
+            out->set_ingest_timestamp(record.ingest_timestamp);
+            for (const auto& [key, value] : record.attributes) {
+                (*out->mutable_attributes())[key] = value;
+            }
+        }
+        if (query.export_sink_batch) {
+            const auto batch = log_engine::agent::build_delivery_batch_from_records(
+                records,
+                query.shard.value_or(0),
+                query.seq_from.value_or(0));
+            reply->set_sink_batch_json(log_engine::agent::render_delivery_batch_json(query.agent_id.value_or("query-export"), batch));
         }
     }
 };
@@ -334,6 +377,13 @@ log_engine::ReadQuery read_query_from_http(const seastar::httpd::const_req& req)
     if (has_query_param(req, "time_to")) {
         query.time_to = req.get_query_param("time_to");
     }
+    if (has_query_param(req, "source_id")) {
+        query.source_id = std::string(req.get_query_param("source_id"));
+    }
+    if (has_query_param(req, "agent_id")) {
+        query.agent_id = std::string(req.get_query_param("agent_id"));
+    }
+    query.export_sink_batch = parse_bool_or_default(get_query_param_or(req, "export_sink_batch", "false"), false);
     query.limit = parse_integer<std::size_t>(get_query_param_or(req, "limit", "100")).value_or(100);
     query.include_archive = parse_bool_or_default(get_query_param_or(req, "include_archive", "true"), true);
     return query;
@@ -356,6 +406,13 @@ log_engine::ReadQuery read_query_from_proto(const QueryRecordsRequest& req) {
     if (req.has_time_to()) {
         query.time_to = req.time_to();
     }
+    if (req.has_source_id()) {
+        query.source_id = req.source_id();
+    }
+    if (req.has_agent_id()) {
+        query.agent_id = req.agent_id();
+    }
+    query.export_sink_batch = req.has_export_sink_batch() ? req.export_sink_batch() : false;
     query.limit = req.limit() == 0 ? 100 : static_cast<std::size_t>(req.limit());
     query.include_archive = req.has_include_archive() ? req.include_archive() : true;
     return query;

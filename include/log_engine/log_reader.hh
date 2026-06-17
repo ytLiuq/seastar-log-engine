@@ -19,8 +19,11 @@ struct ReadQuery {
     std::optional<std::uint64_t> seq_to;
     std::optional<std::string> time_from;
     std::optional<std::string> time_to;
+    std::optional<std::string> source_id;
+    std::optional<std::string> agent_id;
     std::size_t limit = 100;
     bool include_archive = true;
+    bool export_sink_batch = false;
 };
 
 struct ReaderStats {

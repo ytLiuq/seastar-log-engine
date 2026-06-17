@@ -524,6 +524,26 @@ std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, cons
     return batches;
 }
 
+DeliveryBatch build_delivery_batch_from_records(
+    const std::vector<ParsedRecord>& records,
+    unsigned fallback_shard,
+    std::uint64_t fallback_first_sequence) {
+    DeliveryBatch batch;
+    batch.shard = records.empty() ? fallback_shard : records.front().shard;
+    batch.first_sequence = records.empty() || !records.front().has_sequence ? fallback_first_sequence : records.front().sequence;
+    batch.next_sequence = batch.first_sequence;
+    batch.records.reserve(records.size());
+    for (const auto& record : records) {
+        batch.records.push_back(record.payload);
+        if (record.has_sequence) {
+            batch.next_sequence = std::max(batch.next_sequence, record.sequence + 1);
+        } else {
+            ++batch.next_sequence;
+        }
+    }
+    return batch;
+}
+
 std::uint64_t directory_size_bytes(const std::string& path) {
     if (path.empty() || !fs::exists(path)) {
         return 0;
@@ -773,6 +793,49 @@ std::string render_delivery_batch_json(std::string_view agent_id, const Delivery
         body += "\"}";
     }
     body += "]}";
+    return body;
+}
+
+std::string render_agent_record_envelope(const AgentRecordEnvelope& record) {
+    std::string body = "{\"message\":\"";
+    body += json_escape(record.message);
+    body += "\"";
+    if (!record.agent_id.empty()) {
+        body += ",\"agent_id\":\"";
+        body += json_escape(record.agent_id);
+        body += "\"";
+    }
+    if (!record.source_id.empty()) {
+        body += ",\"source_id\":\"";
+        body += json_escape(record.source_id);
+        body += "\"";
+    }
+    if (record.source_offset) {
+        body += ",\"source_offset\":";
+        body += std::to_string(*record.source_offset);
+    }
+    if (!record.ingest_timestamp.empty()) {
+        body += ",\"ingest_timestamp\":\"";
+        body += json_escape(record.ingest_timestamp);
+        body += "\"";
+    }
+    if (!record.attributes.empty()) {
+        body += ",\"attributes\":{";
+        bool first = true;
+        for (const auto& [key, value] : record.attributes) {
+            if (!first) {
+                body += ',';
+            }
+            first = false;
+            body += "\"";
+            body += json_escape(key);
+            body += "\":\"";
+            body += json_escape(value);
+            body += "\"";
+        }
+        body += "}";
+    }
+    body += "}";
     return body;
 }
 

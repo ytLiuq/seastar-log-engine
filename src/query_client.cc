@@ -95,15 +95,29 @@ void print_route(const RouteReply& reply) {
 }
 
 void print_records(const QueryRecordsReply& reply) {
-    fmt::print("{{\"records\":[");
+    fmt::print("{{");
+    if (!reply.sink_batch_json().empty()) {
+        fmt::print("\"sink_batch_json\":\"{}\",", json_escape(reply.sink_batch_json()));
+    }
+    fmt::print("\"records\":[");
     bool first = true;
     for (const auto& record : reply.records()) {
         if (!first) {
             fmt::print(",");
         }
         first = false;
+        std::string attributes = "{";
+        bool first_attribute = true;
+        for (const auto& [key, value] : record.attributes()) {
+            if (!first_attribute) {
+                attributes += ',';
+            }
+            first_attribute = false;
+            attributes += fmt::format("\"{}\":\"{}\"", json_escape(key), json_escape(value));
+        }
+        attributes += "}";
         fmt::print(
-            "{{\"crc\":{},\"timestamp\":\"{}\",\"shard\":{},\"has_sequence\":{},\"sequence\":{},\"level\":\"{}\",\"payload\":\"{}\",\"raw_line\":\"{}\"}}",
+            "{{\"crc\":{},\"timestamp\":\"{}\",\"shard\":{},\"has_sequence\":{},\"sequence\":{},\"level\":\"{}\",\"payload\":\"{}\",\"raw_line\":\"{}\",\"agent_id\":\"{}\",\"source_id\":\"{}\",\"has_source_offset\":{},\"source_offset\":{},\"ingest_timestamp\":\"{}\",\"attributes\":{}}}",
             record.crc(),
             json_escape(record.timestamp()),
             record.shard(),
@@ -111,7 +125,13 @@ void print_records(const QueryRecordsReply& reply) {
             record.sequence(),
             json_escape(record.level()),
             json_escape(record.payload()),
-            json_escape(record.raw_line()));
+            json_escape(record.raw_line()),
+            json_escape(record.agent_id()),
+            json_escape(record.source_id()),
+            record.has_source_offset() ? "true" : "false",
+            record.source_offset(),
+            json_escape(record.ingest_timestamp()),
+            attributes);
     }
     fmt::print("]}}\n");
 }
@@ -131,6 +151,9 @@ int main(int argc, char** argv) {
         ("seq-to", bpo::value<std::uint64_t>(), "Optional maximum sequence filter")
         ("time-from", bpo::value<std::string>(), "Optional minimum timestamp filter")
         ("time-to", bpo::value<std::string>(), "Optional maximum timestamp filter")
+        ("source-id", bpo::value<std::string>(), "Optional agent source_id filter")
+        ("agent-id", bpo::value<std::string>(), "Optional agent_id filter")
+        ("export-sink-batch", bpo::value<bool>()->default_value(false), "Include sink batch JSON in records reply")
         ("limit", bpo::value<std::size_t>()->default_value(100), "Records query limit")
         ("include-archive", bpo::value<bool>()->default_value(true), "Include archive files in records query")
         ("help", "Show help");
@@ -189,6 +212,13 @@ int main(int argc, char** argv) {
         if (vm.count("time-to")) {
             req.set_time_to(vm["time-to"].as<std::string>());
         }
+        if (vm.count("source-id")) {
+            req.set_source_id(vm["source-id"].as<std::string>());
+        }
+        if (vm.count("agent-id")) {
+            req.set_agent_id(vm["agent-id"].as<std::string>());
+        }
+        req.set_export_sink_batch(vm["export-sink-batch"].as<bool>());
         req.set_limit(vm["limit"].as<std::size_t>());
         req.set_include_archive(vm["include-archive"].as<bool>());
 

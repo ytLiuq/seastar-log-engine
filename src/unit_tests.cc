@@ -29,6 +29,7 @@ seastar::future<> test_recovery_scan_large_file_streaming(const std::string& roo
 seastar::future<> test_health_counter_window_eviction();
 seastar::future<> test_limit_zero_returns_no_records(const std::string& root_dir);
 seastar::future<> test_query_records_proto_defaults();
+seastar::future<> test_agent_metadata_query_and_sink_batch_export(const std::string& root_dir);
 
 namespace {
 namespace fs = std::filesystem;
@@ -1090,6 +1091,7 @@ int main(int argc, char** argv) {
         co_await test_crc_class_roundtrip();
         co_await test_limit_zero_returns_no_records(root_dir);
         co_await test_query_records_proto_defaults();
+        co_await test_agent_metadata_query_and_sink_batch_export(root_dir);
         co_await test_crash_during_write_recovery(root_dir);
         co_await test_checkpoint_clean_shutdown_restore(root_dir);
         co_await test_agent_offset_roundtrip(root_dir);

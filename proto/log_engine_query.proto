@@ -59,6 +59,9 @@ message QueryRecordsRequest {
   optional string time_to = 5;
   uint64 limit = 6;
   optional bool include_archive = 7;
+  optional string source_id = 8;
+  optional string agent_id = 9;
+  optional bool export_sink_batch = 10;
 }
 
 message QueryRecord {
@@ -70,10 +73,16 @@ message QueryRecord {
   string level = 6;
   string payload = 7;
   string raw_line = 8;
+  string agent_id = 9;
+  string source_id = 10;
+  optional uint64 source_offset = 11;
+  string ingest_timestamp = 12;
+  map<string, string> attributes = 13;
 }
 
 message QueryRecordsReply {
   repeated QueryRecord records = 1;
+  string sink_batch_json = 2;
 }
 
 service QueryService {

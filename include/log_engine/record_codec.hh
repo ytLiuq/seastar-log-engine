@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,11 @@ struct ParsedRecord {
     LogLevel level = LogLevel::info;
     std::string payload;
     std::string raw_line;
+    std::string agent_id;
+    std::string source_id;
+    std::optional<std::uint64_t> source_offset;
+    std::string ingest_timestamp;
+    std::map<std::string, std::string> attributes;
 };
 
 seastar::sstring encode_record(

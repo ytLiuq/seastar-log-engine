@@ -77,6 +77,12 @@ bool matches_record_query(const ParsedRecord& record, const ReadQuery& query) {
     if (query.time_to && (record.timestamp.empty() || record.timestamp > *query.time_to)) {
         return false;
     }
+    if (query.source_id && record.source_id != *query.source_id) {
+        return false;
+    }
+    if (query.agent_id && record.agent_id != *query.agent_id) {
+        return false;
+    }
     return true;
 }
 

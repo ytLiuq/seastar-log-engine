@@ -204,6 +204,241 @@ std::optional<std::string_view> extract_field(std::string_view body, std::string
     return std::nullopt;
 }
 
+std::optional<std::string> extract_json_string(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
+        ++pos;
+    }
+    if (pos >= body.size() || body[pos] != '"') {
+        return std::nullopt;
+    }
+    ++pos;
+
+    std::string value;
+    while (pos < body.size()) {
+        const char ch = body[pos++];
+        if (ch == '"') {
+            return value;
+        }
+        if (ch == '\\' && pos < body.size()) {
+            const char escaped = body[pos++];
+            switch (escaped) {
+            case 'n':
+                value.push_back('\n');
+                break;
+            case 'r':
+                value.push_back('\r');
+                break;
+            case 't':
+                value.push_back('\t');
+                break;
+            case '\\':
+            case '"':
+            case '/':
+                value.push_back(escaped);
+                break;
+            default:
+                value.push_back(escaped);
+                break;
+            }
+        } else {
+            value.push_back(ch);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> extract_json_u64(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
+        ++pos;
+    }
+    const auto begin = body.data() + pos;
+    const auto end = body.data() + body.size();
+    std::uint64_t value = 0;
+    const auto result = std::from_chars(begin, end, value, 10);
+    if (result.ec != std::errc{} || result.ptr == begin) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<std::string_view> extract_json_object(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
+        ++pos;
+    }
+    if (pos >= body.size() || body[pos] != '{') {
+        return std::nullopt;
+    }
+    const auto begin = pos;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (; pos < body.size(); ++pos) {
+        const char ch = body[pos];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_string && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                return body.substr(begin + 1, pos - begin - 1);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::string, std::size_t>> parse_json_string_at(std::string_view value, std::size_t pos) {
+    if (pos >= value.size() || value[pos] != '"') {
+        return std::nullopt;
+    }
+    ++pos;
+    std::string decoded;
+    while (pos < value.size()) {
+        const char ch = value[pos++];
+        if (ch == '"') {
+            return std::make_pair(std::move(decoded), pos);
+        }
+        if (ch == '\\' && pos < value.size()) {
+            const char escaped = value[pos++];
+            switch (escaped) {
+            case 'n':
+                decoded.push_back('\n');
+                break;
+            case 'r':
+                decoded.push_back('\r');
+                break;
+            case 't':
+                decoded.push_back('\t');
+                break;
+            case '\\':
+            case '"':
+            case '/':
+                decoded.push_back(escaped);
+                break;
+            default:
+                decoded.push_back(escaped);
+                break;
+            }
+        } else {
+            decoded.push_back(ch);
+        }
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, std::string> parse_flat_json_string_map(std::string_view object_body) {
+    std::map<std::string, std::string> values;
+    std::size_t pos = 0;
+    while (pos < object_body.size()) {
+        while (pos < object_body.size() && (object_body[pos] == ' ' || object_body[pos] == '\t' || object_body[pos] == ',')) {
+            ++pos;
+        }
+        if (pos >= object_body.size()) {
+            break;
+        }
+        const auto key = parse_json_string_at(object_body, pos);
+        if (!key) {
+            break;
+        }
+        pos = key->second;
+        while (pos < object_body.size() && (object_body[pos] == ' ' || object_body[pos] == '\t')) {
+            ++pos;
+        }
+        if (pos >= object_body.size() || object_body[pos] != ':') {
+            break;
+        }
+        ++pos;
+        while (pos < object_body.size() && (object_body[pos] == ' ' || object_body[pos] == '\t')) {
+            ++pos;
+        }
+        const auto parsed_value = parse_json_string_at(object_body, pos);
+        if (!parsed_value) {
+            break;
+        }
+        values[key->first] = parsed_value->first;
+        pos = parsed_value->second;
+    }
+    return values;
+}
+
+void populate_agent_metadata_from_payload(ParsedRecord& record) {
+    if (record.payload.empty() || record.payload.front() != '{') {
+        return;
+    }
+    auto message = extract_json_string(record.payload, "message");
+    const auto agent_id = extract_json_string(record.payload, "agent_id");
+    const auto source_id = extract_json_string(record.payload, "source_id");
+    const auto source_offset = extract_json_u64(record.payload, "source_offset");
+    const auto ingest_timestamp = extract_json_string(record.payload, "ingest_timestamp");
+    const auto attributes = extract_json_object(record.payload, "attributes");
+
+    if (!message && !agent_id && !source_id && !source_offset && !ingest_timestamp && !attributes) {
+        return;
+    }
+    if (message) {
+        record.payload = std::move(*message);
+    }
+    if (agent_id) {
+        record.agent_id = std::move(*agent_id);
+    }
+    if (source_id) {
+        record.source_id = std::move(*source_id);
+    }
+    if (source_offset) {
+        record.source_offset = *source_offset;
+    }
+    if (ingest_timestamp) {
+        record.ingest_timestamp = std::move(*ingest_timestamp);
+    }
+    if (attributes) {
+        record.attributes = parse_flat_json_string_map(*attributes);
+    }
+}
+
 std::size_t decimal_length(std::uint64_t value) noexcept {
     std::size_t digits = 1;
     while (value >= 10) {
@@ -709,6 +944,7 @@ std::optional<ParsedRecord> parse_record_line(std::string_view line) {
     } else {
         record.payload.assign(body.data(), body.size());
     }
+    populate_agent_metadata_from_payload(record);
     return record;
 }
 

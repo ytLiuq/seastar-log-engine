@@ -140,13 +140,24 @@ log_engine::LogLevel parse_level_or_default(std::string_view value) {
 
 log_engine::LogMessage parse_ingest_message(std::string_view body) {
     log_engine::LogMessage message;
+    log_engine::agent::AgentRecordEnvelope envelope;
     if (auto payload = extract_json_string(body, "payload")) {
-        message.payload = std::move(*payload);
+        envelope.message = std::move(*payload);
     } else if (auto text = extract_json_string(body, "message")) {
-        message.payload = std::move(*text);
+        envelope.message = std::move(*text);
     } else {
-        message.payload = std::string(body);
+        envelope.message = std::string(body);
     }
+    if (auto agent_id = extract_json_string(body, "agent_id")) {
+        envelope.agent_id = std::move(*agent_id);
+    }
+    if (auto source_id = extract_json_string(body, "source_id")) {
+        envelope.source_id = std::move(*source_id);
+    }
+    if (auto ingest_timestamp = extract_json_string(body, "ingest_timestamp")) {
+        envelope.ingest_timestamp = std::move(*ingest_timestamp);
+    }
+    message.payload = log_engine::agent::render_agent_record_envelope(envelope);
     if (auto level = extract_json_string(body, "level")) {
         message.level = parse_level_or_default(*level);
     }
@@ -321,12 +332,23 @@ void set_nonblocking(int fd) {
     }
 }
 
-std::vector<log_engine::LogMessage> lines_to_messages(const std::vector<std::string>& lines) {
+std::vector<log_engine::LogMessage> lines_to_messages(
+    const std::vector<std::string>& lines,
+    const AgentRuntimeOptions& options,
+    const std::string& source_id,
+    std::uint64_t first_source_offset) {
     std::vector<log_engine::LogMessage> messages;
     messages.reserve(lines.size());
+    std::uint64_t source_offset = first_source_offset;
     for (const auto& line : lines) {
         log_engine::LogMessage message;
-        message.payload = line;
+        log_engine::agent::AgentRecordEnvelope envelope;
+        envelope.agent_id = options.agent_id;
+        envelope.source_id = source_id;
+        envelope.source_offset = source_offset;
+        envelope.message = line;
+        message.payload = log_engine::agent::render_agent_record_envelope(envelope);
+        source_offset += line.size() + 1;
         messages.push_back(std::move(message));
     }
     return messages;
@@ -353,6 +375,8 @@ log_engine::agent::BackpressureDecision evaluate_agent_backpressure(
 void append_source_lines(
     AgentContext& context,
     const AgentRuntimeOptions& options,
+    const std::string& source_id,
+    std::uint64_t first_source_offset,
     const std::vector<std::string>& lines) {
     if (lines.empty()) {
         return;
@@ -368,8 +392,21 @@ void append_source_lines(
     }
 
     context.stats.source_read.fetch_add(lines.size(), std::memory_order_relaxed);
-    context.engine.append_batch(lines_to_messages(lines)).get();
+    context.engine.append_batch(lines_to_messages(lines, options, source_id, first_source_offset)).get();
     context.stats.source_committed.fetch_add(lines.size(), std::memory_order_relaxed);
+}
+
+std::uint64_t append_stream_source_lines(
+    AgentContext& context,
+    const AgentRuntimeOptions& options,
+    const std::string& source_id,
+    std::uint64_t next_source_offset,
+    const std::vector<std::string>& lines) {
+    append_source_lines(context, options, source_id, next_source_offset, lines);
+    for (const auto& line : lines) {
+        next_source_offset += line.size() + 1;
+    }
+    return next_source_offset;
 }
 
 seastar::future<> run_file_source_loop(
@@ -410,7 +447,11 @@ seastar::future<> run_file_source_loop(
                         offset = batch.next_offset;
                         continue;
                     }
-                    append_source_lines(context, options, batch.lines);
+                    auto first_source_offset = batch.next_offset.offset;
+                    for (const auto& line : batch.lines) {
+                        first_source_offset -= line.size() + 1;
+                    }
+                    append_source_lines(context, options, path, first_source_offset, batch.lines);
                     log_engine::agent::store_source_offset(source_offset_path_for(options, path), batch.next_offset);
                     offset = batch.next_offset;
                     consumed = true;
@@ -439,15 +480,16 @@ seastar::future<> run_stdin_source_loop(
         std::vector<std::string> lines;
         lines.reserve(options.source_max_lines);
         std::string line;
+        std::uint64_t next_source_offset = 0;
         while (!stopping.load(std::memory_order_relaxed) && std::getline(std::cin, line)) {
             lines.push_back(line);
             if (lines.size() >= options.source_max_lines) {
-                append_source_lines(context, options, lines);
+                next_source_offset = append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
                 lines.clear();
             }
         }
         if (!lines.empty()) {
-            append_source_lines(context, options, lines);
+            append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
         }
     });
 }
@@ -456,10 +498,12 @@ void consume_line_stream_fd(
     int fd,
     AgentContext& context,
     const AgentRuntimeOptions& options,
+    std::string source_id,
     std::atomic<bool>& stopping) {
     FdGuard guard(fd);
     std::string pending;
     char buffer[4096];
+    std::uint64_t next_source_offset = 0;
     while (!stopping.load(std::memory_order_relaxed)) {
         const auto rc = ::recv(guard.get(), buffer, sizeof(buffer), 0);
         if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -484,12 +528,12 @@ void consume_line_stream_fd(
             lines.push_back(std::move(line));
             start = newline + 1;
             if (lines.size() >= options.source_max_lines) {
-                append_source_lines(context, options, lines);
+                next_source_offset = append_stream_source_lines(context, options, source_id, next_source_offset, lines);
                 lines.clear();
             }
         }
         if (!lines.empty()) {
-            append_source_lines(context, options, lines);
+            next_source_offset = append_stream_source_lines(context, options, source_id, next_source_offset, lines);
         }
         pending.erase(0, start);
     }
@@ -518,6 +562,7 @@ seastar::future<> run_tcp_source_loop(
         if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(server.get(), 16) != 0) {
             throw std::runtime_error("failed to bind/listen TCP source socket");
         }
+        std::uint64_t connection_id = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
             const int client = ::accept(server.get(), nullptr, nullptr);
             if (client < 0) {
@@ -528,7 +573,12 @@ seastar::future<> run_tcp_source_loop(
             }
             set_nonblocking(client);
             try {
-                consume_line_stream_fd(client, context, options, stopping);
+                consume_line_stream_fd(
+                    client,
+                    context,
+                    options,
+                    fmt::format("tcp:{}:{}", options.tcp_source_port, connection_id++),
+                    stopping);
             } catch (...) {
                 ++context.stats.rejected;
                 ::close(client);
@@ -559,6 +609,7 @@ seastar::future<> run_udp_source_loop(
             throw std::runtime_error("failed to bind UDP source socket");
         }
         char buffer[65535];
+        std::uint64_t next_source_offset = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
             const auto rc = ::recv(server.get(), buffer, sizeof(buffer), 0);
             if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -568,7 +619,10 @@ seastar::future<> run_udp_source_loop(
             if (rc <= 0) {
                 continue;
             }
-            append_source_lines(context, options, {std::string(buffer, static_cast<std::size_t>(rc))});
+            std::vector<std::string> records;
+            records.push_back(std::string(buffer, static_cast<std::size_t>(rc)));
+            append_source_lines(context, options, fmt::format("udp:{}", options.udp_source_port), next_source_offset, records);
+            next_source_offset += static_cast<std::uint64_t>(rc);
         }
     });
 }
@@ -597,6 +651,7 @@ seastar::future<> run_unix_socket_source_loop(
         if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(server.get(), 16) != 0) {
             throw std::runtime_error("failed to bind/listen Unix source socket");
         }
+        std::uint64_t connection_id = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
             const int client = ::accept(server.get(), nullptr, nullptr);
             if (client < 0) {
@@ -607,7 +662,12 @@ seastar::future<> run_unix_socket_source_loop(
             }
             set_nonblocking(client);
             try {
-                consume_line_stream_fd(client, context, options, stopping);
+                consume_line_stream_fd(
+                    client,
+                    context,
+                    options,
+                    fmt::format("unix:{}:{}", options.unix_socket_path, connection_id++),
+                    stopping);
             } catch (...) {
                 ++context.stats.rejected;
                 ::close(client);
