@@ -12,6 +12,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Added detailed recovery mode counters for checkpoint recovery, full-scan recovery, and missing active-log recovery; exposed them through metrics and `/v1/status`.
 - 2026-06-17: Added HTTP sink request timeout and configurable retryable HTTP status codes.
 - 2026-06-17: Added configurable HTTP sink headers with validation for reserved and malformed header names.
+- 2026-06-17: Made file-source rotation/truncation observable with `source_rotations` status output and rename-rotation unit coverage.
 
 ## Current Baseline
 
@@ -67,8 +68,8 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P1 Input Sources
 
 - File source:
-  - Track one source offset per file when using glob.
-  - Detect rename-based rotation and truncation more explicitly.
+  - [x] Track one source offset per file when using glob.
+  - [x] Detect rename-based rotation and truncation more explicitly.
   - Add multiline log support with a configurable start-line pattern.
 
 - Socket sources:

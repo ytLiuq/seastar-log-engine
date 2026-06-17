@@ -1384,6 +1384,23 @@ seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string&
     require(second.file_rotated_or_truncated, "agent tail should detect truncate");
     require(second.lines.size() == 1, "agent tail should reread from beginning after truncate");
     require(second.lines[0] == "after", "agent tail truncate line mismatch");
+
+    const auto rotated_source = (dir / "rotate.log").string();
+    {
+        std::ofstream out(rotated_source, std::ios::binary | std::ios::trunc);
+        out << "old\n";
+    }
+    const auto before_rotate = log_engine::agent::tail_file_once(rotated_source, std::nullopt, 10);
+    require(before_rotate.lines.size() == 1, "agent rotation setup should read old line");
+    fs::rename(rotated_source, dir / "rotate.log.1");
+    {
+        std::ofstream out(rotated_source, std::ios::binary | std::ios::trunc);
+        out << "new\n";
+    }
+    const auto after_rotate = log_engine::agent::tail_file_once(rotated_source, before_rotate.next_offset, 10);
+    require(after_rotate.file_rotated_or_truncated, "agent tail should detect rename-based rotation");
+    require(after_rotate.lines.size() == 1, "agent tail should read new file after rotation");
+    require(after_rotate.lines[0] == "new", "agent tail rotation line mismatch");
     co_return;
 }
 

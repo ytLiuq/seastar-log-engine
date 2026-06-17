@@ -194,6 +194,7 @@ struct AgentStats {
     std::atomic<std::uint64_t> rejected{0};
     std::atomic<std::uint64_t> source_read{0};
     std::atomic<std::uint64_t> source_committed{0};
+    std::atomic<std::uint64_t> source_rotations{0};
     std::atomic<std::uint64_t> sink_sent{0};
     std::atomic<std::uint64_t> sink_failed{0};
     std::atomic<std::uint64_t> sink_retries{0};
@@ -214,12 +215,13 @@ struct AgentContext {
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
             stats.source_read.load(std::memory_order_relaxed),
             stats.source_committed.load(std::memory_order_relaxed),
+            stats.source_rotations.load(std::memory_order_relaxed),
             stats.sink_sent.load(std::memory_order_relaxed),
             stats.sink_failed.load(std::memory_order_relaxed),
             stats.sink_retries.load(std::memory_order_relaxed),
@@ -401,6 +403,9 @@ seastar::future<> run_file_source_loop(
                     }
                     const auto previous = offset.path.empty() ? std::optional<log_engine::agent::SourceOffset>{} : std::optional(offset);
                     auto batch = log_engine::agent::tail_file_once(path, previous, options.source_max_lines);
+                    if (batch.file_rotated_or_truncated) {
+                        ++context.stats.source_rotations;
+                    }
                     if (batch.lines.empty()) {
                         offset = batch.next_offset;
                         continue;
