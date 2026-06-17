@@ -72,103 +72,6 @@ std::string json_escape(std::string_view value) {
     return escaped;
 }
 
-std::optional<std::string> extract_json_string(std::string_view body, std::string_view key) {
-    const auto quoted_key = fmt::format("\"{}\"", key);
-    auto pos = body.find(quoted_key);
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = body.find(':', pos + quoted_key.size());
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    ++pos;
-    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\n' || body[pos] == '\r')) {
-        ++pos;
-    }
-    if (pos >= body.size() || body[pos] != '"') {
-        return std::nullopt;
-    }
-    ++pos;
-
-    std::string value;
-    while (pos < body.size()) {
-        const char ch = body[pos++];
-        if (ch == '"') {
-            return value;
-        }
-        if (ch != '\\') {
-            value.push_back(ch);
-            continue;
-        }
-        if (pos >= body.size()) {
-            break;
-        }
-        const char escaped = body[pos++];
-        switch (escaped) {
-        case '"':
-        case '\\':
-        case '/':
-            value.push_back(escaped);
-            break;
-        case 'n':
-            value.push_back('\n');
-            break;
-        case 'r':
-            value.push_back('\r');
-            break;
-        case 't':
-            value.push_back('\t');
-            break;
-        default:
-            value.push_back(escaped);
-            break;
-        }
-    }
-    return std::nullopt;
-}
-
-log_engine::LogLevel parse_level_or_default(std::string_view value) {
-    if (value == "warn" || value == "warning") {
-        return log_engine::LogLevel::warn;
-    }
-    if (value == "error" || value == "err") {
-        return log_engine::LogLevel::error;
-    }
-    return log_engine::LogLevel::info;
-}
-
-log_engine::LogMessage parse_ingest_message(std::string_view body) {
-    log_engine::LogMessage message;
-    log_engine::agent::AgentRecordEnvelope envelope;
-    if (auto payload = extract_json_string(body, "payload")) {
-        envelope.message = std::move(*payload);
-    } else if (auto text = extract_json_string(body, "message")) {
-        envelope.message = std::move(*text);
-    } else {
-        envelope.message = std::string(body);
-    }
-    if (auto agent_id = extract_json_string(body, "agent_id")) {
-        envelope.agent_id = std::move(*agent_id);
-    }
-    if (auto source_id = extract_json_string(body, "source_id")) {
-        envelope.source_id = std::move(*source_id);
-    }
-    if (auto ingest_timestamp = extract_json_string(body, "ingest_timestamp")) {
-        envelope.ingest_timestamp = std::move(*ingest_timestamp);
-    }
-    message.payload = log_engine::agent::render_agent_record_envelope(envelope);
-    if (auto level = extract_json_string(body, "level")) {
-        message.level = parse_level_or_default(*level);
-    }
-    if (auto route_key = extract_json_string(body, "route_key")) {
-        message.route_key = std::move(*route_key);
-    } else if (auto service = extract_json_string(body, "service")) {
-        message.route_key = std::move(*service);
-    }
-    return message;
-}
-
 class StopSignal {
 public:
     StopSignal() {
@@ -206,6 +109,9 @@ struct AgentStats {
     std::atomic<std::uint64_t> source_read{0};
     std::atomic<std::uint64_t> source_committed{0};
     std::atomic<std::uint64_t> source_rotations{0};
+    std::atomic<std::uint64_t> source_dropped{0};
+    std::atomic<std::uint64_t> udp_dropped{0};
+    std::atomic<std::uint64_t> malformed_ingest{0};
     std::atomic<std::uint64_t> sink_sent{0};
     std::atomic<std::uint64_t> sink_failed{0};
     std::atomic<std::uint64_t> sink_retries{0};
@@ -226,13 +132,16 @@ struct AgentContext {
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"source_dropped\":{},\"udp_dropped\":{},\"malformed_ingest\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
             stats.source_read.load(std::memory_order_relaxed),
             stats.source_committed.load(std::memory_order_relaxed),
             stats.source_rotations.load(std::memory_order_relaxed),
+            stats.source_dropped.load(std::memory_order_relaxed),
+            stats.udp_dropped.load(std::memory_order_relaxed),
+            stats.malformed_ingest.load(std::memory_order_relaxed),
             stats.sink_sent.load(std::memory_order_relaxed),
             stats.sink_failed.load(std::memory_order_relaxed),
             stats.sink_retries.load(std::memory_order_relaxed),
@@ -285,6 +194,9 @@ struct AgentRuntimeOptions {
     std::string unix_socket_path;
     std::uint16_t tcp_source_port = 0;
     std::uint16_t udp_source_port = 0;
+    log_engine::agent::SourceLimits source_limits;
+    std::uint64_t max_socket_connections = 0;
+    log_engine::agent::MultilineOptions multiline_options;
     std::string source_offset_path = "agent-source.offset";
     std::size_t source_poll_ms = 1000;
     std::size_t source_max_lines = 1024;
@@ -381,6 +293,10 @@ void append_source_lines(
     if (lines.empty()) {
         return;
     }
+    const auto records = log_engine::agent::apply_multiline_records(lines, options.multiline_options);
+    if (records.empty()) {
+        return;
+    }
     const auto backpressure = evaluate_agent_backpressure(context, options);
     if (backpressure.pause) {
         if (backpressure.reason == "disk_quota") {
@@ -391,9 +307,28 @@ void append_source_lines(
         throw std::runtime_error("agent source paused by backpressure: " + backpressure.reason);
     }
 
-    context.stats.source_read.fetch_add(lines.size(), std::memory_order_relaxed);
-    context.engine.append_batch(lines_to_messages(lines, options, source_id, first_source_offset)).get();
-    context.stats.source_committed.fetch_add(lines.size(), std::memory_order_relaxed);
+    std::vector<std::string> accepted_records;
+    accepted_records.reserve(records.size());
+    std::size_t buffered_bytes = 0;
+    for (const auto& record : records) {
+        buffered_bytes += record.size();
+        const auto limit = log_engine::agent::evaluate_source_limits(record.size(), buffered_bytes, options.source_limits);
+        if (!limit.accept) {
+            ++context.stats.source_dropped;
+            if (source_id.rfind("udp:", 0) == 0) {
+                ++context.stats.udp_dropped;
+            }
+            continue;
+        }
+        accepted_records.push_back(record);
+    }
+    if (accepted_records.empty()) {
+        return;
+    }
+
+    context.stats.source_read.fetch_add(accepted_records.size(), std::memory_order_relaxed);
+    context.engine.append_batch(lines_to_messages(accepted_records, options, source_id, first_source_offset)).get();
+    context.stats.source_committed.fetch_add(accepted_records.size(), std::memory_order_relaxed);
 }
 
 std::uint64_t append_stream_source_lines(
@@ -571,6 +506,11 @@ seastar::future<> run_tcp_source_loop(
                 }
                 continue;
             }
+            if (options.max_socket_connections > 0 && connection_id >= options.max_socket_connections) {
+                ++context.stats.source_dropped;
+                ::close(client);
+                continue;
+            }
             set_nonblocking(client);
             try {
                 consume_line_stream_fd(
@@ -658,6 +598,11 @@ seastar::future<> run_unix_socket_source_loop(
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     seastar::sleep(std::chrono::milliseconds(50)).get();
                 }
+                continue;
+            }
+            if (options.max_socket_connections > 0 && connection_id >= options.max_socket_connections) {
+                ++context.stats.source_dropped;
+                ::close(client);
                 continue;
             }
             set_nonblocking(client);
@@ -819,10 +764,23 @@ void set_agent_routes(seastar::httpd::routes& routes, AgentContext& context) {
                 return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(response));
             }
 
-            auto message = parse_ingest_message(std::string_view(body.data(), body.size()));
-            return context.engine.append(std::move(message)).then([&context, &response] {
-                ++context.stats.accepted;
-                response->write_body("json", "{\"accepted\":1}");
+            log_engine::agent::IngestParseOptions parse_options;
+            parse_options.default_agent_id = "http-ingest";
+            parse_options.default_source_id = "http";
+            auto parsed = log_engine::agent::parse_ingest_body(std::string_view(body.data(), body.size()), parse_options);
+            if (parsed.messages.empty()) {
+                ++context.stats.rejected;
+                context.stats.malformed_ingest.fetch_add(parsed.malformed_records + 1, std::memory_order_relaxed);
+                response->set_status(seastar::http::reply::status_type::bad_request);
+                response->write_body("json", "{\"error\":\"no valid records\"}");
+                return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(response));
+            }
+
+            const auto accepted = parsed.messages.size();
+            context.stats.malformed_ingest.fetch_add(parsed.malformed_records, std::memory_order_relaxed);
+            return context.engine.append_batch(std::move(parsed.messages)).then([&context, &response, accepted] {
+                context.stats.accepted.fetch_add(accepted, std::memory_order_relaxed);
+                response->write_body("json", fmt::format("{{\"accepted\":{}}}", accepted));
                 return std::move(response);
             }).handle_exception([&context, &response](std::exception_ptr ep) {
                 ++context.stats.rejected;
@@ -886,6 +844,12 @@ int main(int argc, char** argv) {
         ("unix-socket-source-path", bpo::value<std::string>()->default_value(""), "Unix stream socket source path")
         ("tcp-source-port", bpo::value<std::uint16_t>()->default_value(0), "TCP newline-delimited source port")
         ("udp-source-port", bpo::value<std::uint16_t>()->default_value(0), "UDP datagram source port")
+        ("source-max-message-bytes", bpo::value<std::size_t>()->default_value(0), "Drop source records larger than this many bytes, 0 disables")
+        ("source-max-buffer-bytes", bpo::value<std::size_t>()->default_value(0), "Drop source batches when buffered source bytes exceed this value, 0 disables")
+        ("max-socket-connections", bpo::value<std::uint64_t>()->default_value(0), "Maximum accepted TCP/Unix source connections per process, 0 disables")
+        ("multiline-enabled", bpo::value<bool>()->default_value(false), "Merge continuation lines before appending source records")
+        ("multiline-start-pattern", bpo::value<std::string>()->default_value(""), "Line prefix that starts a multiline record")
+        ("multiline-max-lines", bpo::value<std::size_t>()->default_value(128), "Maximum physical lines per multiline record")
         ("source-offset-path", bpo::value<std::string>()->default_value("agent-source.offset"), "File source offset checkpoint")
         ("source-poll-ms", bpo::value<std::size_t>()->default_value(1000), "File source poll interval")
         ("source-max-lines", bpo::value<std::size_t>()->default_value(1024), "Max source lines per poll")
@@ -966,6 +930,18 @@ int main(int argc, char** argv) {
                 options, file_values, "tcp-source-port", options["tcp-source-port"].as<std::uint16_t>()));
             runtime_options.udp_source_port = static_cast<std::uint16_t>(log_engine::resolve_u64_option(
                 options, file_values, "udp-source-port", options["udp-source-port"].as<std::uint16_t>()));
+            runtime_options.source_limits.max_message_bytes = log_engine::resolve_size_option(
+                options, file_values, "source-max-message-bytes", options["source-max-message-bytes"].as<std::size_t>());
+            runtime_options.source_limits.max_buffer_bytes = log_engine::resolve_size_option(
+                options, file_values, "source-max-buffer-bytes", options["source-max-buffer-bytes"].as<std::size_t>());
+            runtime_options.max_socket_connections = log_engine::resolve_u64_option(
+                options, file_values, "max-socket-connections", options["max-socket-connections"].as<std::uint64_t>());
+            runtime_options.multiline_options.enabled = log_engine::resolve_bool_option(
+                options, file_values, "multiline-enabled", options["multiline-enabled"].as<bool>());
+            runtime_options.multiline_options.start_pattern = log_engine::resolve_string_option(
+                options, file_values, "multiline-start-pattern", options["multiline-start-pattern"].as<std::string>());
+            runtime_options.multiline_options.max_lines = log_engine::resolve_size_option(
+                options, file_values, "multiline-max-lines", options["multiline-max-lines"].as<std::size_t>());
             runtime_options.source_offset_path = log_engine::resolve_string_option(
                 options, file_values, "source-offset-path", options["source-offset-path"].as<std::string>());
             runtime_options.source_poll_ms = log_engine::resolve_size_option(

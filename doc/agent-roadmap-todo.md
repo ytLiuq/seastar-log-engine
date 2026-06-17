@@ -15,6 +15,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Made file-source rotation/truncation observable with `source_rotations` status output and rename-rotation unit coverage.
 - 2026-06-17: Closed P0 reliability coverage with stale checkpoint fallback, ACK-window replay tests, and documented at-least-once dedup semantics.
 - 2026-06-17: Closed P2 record layout/query milestone with a backward-compatible agent metadata envelope, metadata filters, sink-batch query export, and binary-layout evaluation notes.
+- 2026-06-17: Closed the P1 input/HTTP ingest slice with multiline merge helpers, source size limits, socket connection limits, UDP/source drop counters, HTTP batch ingest parsing, and structured JSON field extraction tests.
 
 ## Current Baseline
 
@@ -72,16 +73,16 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - File source:
   - [x] Track one source offset per file when using glob.
   - [x] Detect rename-based rotation and truncation more explicitly.
-  - Add multiline log support with a configurable start-line pattern.
+  - [x] Add multiline log support with a configurable start-line pattern.
 
 - Socket sources:
-  - Add connection limits and request-size limits for TCP and Unix socket sources.
-  - Add UDP drop counters.
-  - Add tests for malformed input and oversized messages.
+  - [x] Add connection limits and request-size limits for TCP and Unix socket sources.
+  - [x] Add UDP drop counters.
+  - [x] Add tests for malformed input and oversized messages.
 
 - HTTP ingest:
-  - Add batch ingest endpoint.
-  - Add structured JSON parsing for common fields like timestamp, level, service, host, trace id, and attributes.
+  - [x] Add batch ingest endpoint.
+  - [x] Add structured JSON parsing for common fields like timestamp, level, service, host, trace id, and attributes.
 
 ## P1 Backpressure
 

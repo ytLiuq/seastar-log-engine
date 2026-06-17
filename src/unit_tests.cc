@@ -1052,6 +1052,7 @@ seastar::future<> test_agent_crash_before_sink_ack_replays_pending_batch(const s
 seastar::future<> test_agent_crash_after_sink_ack_before_offset_persistence_bounds_duplicate_window(const std::string& root_dir);
 seastar::future<> test_agent_replay_batches_from_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
+seastar::future<> test_agent_p1_input_and_http_ingest_helpers();
 seastar::future<> test_agent_http_sink_fake_server();
 seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir);
 
@@ -1104,6 +1105,7 @@ int main(int argc, char** argv) {
         co_await test_agent_crash_after_sink_ack_before_offset_persistence_bounds_duplicate_window(root_dir);
         co_await test_agent_replay_batches_from_delivery_offsets(root_dir);
         co_await test_agent_glob_and_dynamic_backpressure(root_dir);
+        co_await test_agent_p1_input_and_http_ingest_helpers();
         co_await test_agent_http_sink_fake_server();
         co_await test_agent_file_to_http_sink_delivery_flow(root_dir);
         co_return;
@@ -1748,6 +1750,60 @@ seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& ro
     latency.max_sink_latency_ms = 1000;
     const auto latency_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, latency);
     require(latency_decision.pause && latency_decision.reason == "sink_latency", "agent backpressure should pause on sink latency");
+    co_return;
+}
+
+seastar::future<> test_agent_p1_input_and_http_ingest_helpers() {
+    log_engine::agent::MultilineOptions multiline;
+    multiline.enabled = true;
+    multiline.start_pattern = "START";
+    multiline.max_lines = 4;
+    const auto records = log_engine::agent::apply_multiline_records(
+        {"START first", "  stack-a", "  stack-b", "START second"},
+        multiline);
+    require(records.size() == 2, "agent multiline should merge continuation lines");
+    require(records[0] == "START first\n  stack-a\n  stack-b", "agent multiline first record mismatch");
+    require(records[1] == "START second", "agent multiline second record mismatch");
+
+    log_engine::agent::SourceLimits limits;
+    limits.max_message_bytes = 5;
+    limits.max_buffer_bytes = 10;
+    require(log_engine::agent::evaluate_source_limits(5, 10, limits).accept, "agent source limits should accept boundary values");
+    const auto too_large = log_engine::agent::evaluate_source_limits(6, 6, limits);
+    require(!too_large.accept && too_large.reason == "message_too_large", "agent source limits should reject oversized message");
+    const auto too_buffered = log_engine::agent::evaluate_source_limits(4, 11, limits);
+    require(!too_buffered.accept && too_buffered.reason == "buffer_too_large", "agent source limits should reject oversized buffer");
+
+    log_engine::agent::IngestParseOptions options;
+    options.default_agent_id = "agent-default";
+    options.default_source_id = "http";
+    const auto parsed = log_engine::agent::parse_ingest_body(
+        "{\"records\":["
+        "{\"message\":\"hello\",\"level\":\"warn\",\"service\":\"svc-a\",\"host\":\"edge-1\",\"trace_id\":\"trace-a\",\"attributes\":{\"env\":\"prod\"}},"
+        "{\"payload\":\"boom\",\"level\":\"error\",\"route_key\":\"route-b\",\"source_id\":\"custom-source\"}"
+        "]}",
+        options);
+    require(parsed.malformed_records == 0, "agent HTTP batch ingest should parse valid records");
+    require(parsed.messages.size() == 2, "agent HTTP batch ingest should produce two messages");
+    require(parsed.messages[0].level == log_engine::LogLevel::warn, "agent HTTP ingest should parse warn level");
+    require(parsed.messages[0].route_key == "svc-a", "agent HTTP ingest should route by service");
+    require(parsed.messages[1].level == log_engine::LogLevel::error, "agent HTTP ingest should parse error level");
+    require(parsed.messages[1].route_key == "route-b", "agent HTTP ingest should preserve route key");
+
+    const auto first_record = log_engine::parse_record_line("payload=" + parsed.messages[0].payload);
+    require(first_record.has_value(), "agent HTTP ingest envelope should be parseable");
+    require(first_record->payload == "hello", "agent HTTP ingest should normalize message");
+    require(first_record->agent_id == "agent-default", "agent HTTP ingest should apply default agent id");
+    require(first_record->source_id == "http", "agent HTTP ingest should apply default source id");
+    require(first_record->attributes.at("service") == "svc-a", "agent HTTP ingest should expose service attribute");
+    require(first_record->attributes.at("host") == "edge-1", "agent HTTP ingest should expose host attribute");
+    require(first_record->attributes.at("trace_id") == "trace-a", "agent HTTP ingest should expose trace id attribute");
+    require(first_record->attributes.at("env") == "prod", "agent HTTP ingest should preserve explicit attributes");
+
+    const auto second_record = log_engine::parse_record_line("payload=" + parsed.messages[1].payload);
+    require(second_record.has_value(), "agent HTTP ingest second envelope should be parseable");
+    require(second_record->payload == "boom", "agent HTTP ingest should normalize payload");
+    require(second_record->source_id == "custom-source", "agent HTTP ingest should preserve explicit source id");
     co_return;
 }
 

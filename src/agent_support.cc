@@ -91,6 +91,270 @@ bool reserved_http_header_name(std::string_view name) {
         lowered == "connection";
 }
 
+bool is_json_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+std::optional<std::string> parse_json_string_at(std::string_view body, std::size_t& pos) {
+    if (pos >= body.size() || body[pos] != '"') {
+        return std::nullopt;
+    }
+    ++pos;
+    std::string value;
+    while (pos < body.size()) {
+        const char ch = body[pos++];
+        if (ch == '"') {
+            return value;
+        }
+        if (ch != '\\') {
+            value.push_back(ch);
+            continue;
+        }
+        if (pos >= body.size()) {
+            return std::nullopt;
+        }
+        const char escaped = body[pos++];
+        switch (escaped) {
+        case '"':
+        case '\\':
+        case '/':
+            value.push_back(escaped);
+            break;
+        case 'n':
+            value.push_back('\n');
+            break;
+        case 'r':
+            value.push_back('\r');
+            break;
+        case 't':
+            value.push_back('\t');
+            break;
+        default:
+            value.push_back(escaped);
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> extract_json_string(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < body.size() && is_json_space(body[pos])) {
+        ++pos;
+    }
+    return parse_json_string_at(body, pos);
+}
+
+std::optional<std::string_view> extract_json_object_body(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < body.size() && is_json_space(body[pos])) {
+        ++pos;
+    }
+    if (pos >= body.size() || body[pos] != '{') {
+        return std::nullopt;
+    }
+    const auto begin = pos;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (; pos < body.size(); ++pos) {
+        const char ch = body[pos];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_string && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                return body.substr(begin + 1, pos - begin - 1);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, std::string> parse_flat_json_string_map(std::string_view object_body) {
+    std::map<std::string, std::string> values;
+    std::size_t pos = 0;
+    while (pos < object_body.size()) {
+        while (pos < object_body.size() && (is_json_space(object_body[pos]) || object_body[pos] == ',')) {
+            ++pos;
+        }
+        if (pos >= object_body.size()) {
+            break;
+        }
+        auto key = parse_json_string_at(object_body, pos);
+        if (!key) {
+            break;
+        }
+        while (pos < object_body.size() && is_json_space(object_body[pos])) {
+            ++pos;
+        }
+        if (pos >= object_body.size() || object_body[pos] != ':') {
+            break;
+        }
+        ++pos;
+        while (pos < object_body.size() && is_json_space(object_body[pos])) {
+            ++pos;
+        }
+        auto value = parse_json_string_at(object_body, pos);
+        if (!value) {
+            break;
+        }
+        values[*key] = *value;
+    }
+    return values;
+}
+
+std::vector<std::string_view> extract_json_records_array(std::string_view body) {
+    const std::string needle = "\"records\"";
+    auto pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    ++pos;
+    while (pos < body.size() && is_json_space(body[pos])) {
+        ++pos;
+    }
+    if (pos >= body.size() || body[pos] != '[') {
+        return {};
+    }
+    ++pos;
+
+    std::vector<std::string_view> records;
+    while (pos < body.size()) {
+        while (pos < body.size() && (is_json_space(body[pos]) || body[pos] == ',')) {
+            ++pos;
+        }
+        if (pos >= body.size() || body[pos] == ']') {
+            break;
+        }
+        if (body[pos] != '{') {
+            return {};
+        }
+        const auto begin = pos;
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (; pos < body.size(); ++pos) {
+            const char ch = body[pos];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (in_string && ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (ch == '{') {
+                ++depth;
+            } else if (ch == '}') {
+                --depth;
+                if (depth == 0) {
+                    records.push_back(body.substr(begin, pos - begin + 1));
+                    ++pos;
+                    break;
+                }
+            }
+        }
+    }
+    return records;
+}
+
+LogMessage parse_ingest_record(std::string_view body, const IngestParseOptions& options) {
+    LogMessage message;
+    AgentRecordEnvelope envelope;
+    envelope.agent_id = options.default_agent_id;
+    envelope.source_id = options.default_source_id;
+    if (auto payload = extract_json_string(body, "payload")) {
+        envelope.message = std::move(*payload);
+    } else if (auto text = extract_json_string(body, "message")) {
+        envelope.message = std::move(*text);
+    } else {
+        envelope.message = std::string(body);
+    }
+    if (auto agent_id = extract_json_string(body, "agent_id")) {
+        envelope.agent_id = std::move(*agent_id);
+    }
+    if (auto source_id = extract_json_string(body, "source_id")) {
+        envelope.source_id = std::move(*source_id);
+    }
+    if (auto ingest_timestamp = extract_json_string(body, "ingest_timestamp")) {
+        envelope.ingest_timestamp = std::move(*ingest_timestamp);
+    } else if (auto timestamp = extract_json_string(body, "timestamp")) {
+        envelope.ingest_timestamp = std::move(*timestamp);
+    }
+    if (auto attributes = extract_json_object_body(body, "attributes")) {
+        envelope.attributes = parse_flat_json_string_map(*attributes);
+    }
+    for (const auto& key : {"service", "host", "trace_id"}) {
+        if (auto value = extract_json_string(body, key)) {
+            envelope.attributes.try_emplace(key, std::move(*value));
+        }
+    }
+    message.payload = render_agent_record_envelope(envelope);
+    if (auto level = extract_json_string(body, "level")) {
+        const auto lowered = lower_ascii(*level);
+        if (lowered == "warn" || lowered == "warning") {
+            message.level = LogLevel::warn;
+        } else if (lowered == "error" || lowered == "err") {
+            message.level = LogLevel::error;
+        }
+    }
+    if (auto route_key = extract_json_string(body, "route_key")) {
+        message.route_key = std::move(*route_key);
+    } else if (auto service = extract_json_string(body, "service")) {
+        message.route_key = std::move(*service);
+    }
+    return message;
+}
+
+bool matches_multiline_start(std::string_view line, std::string_view pattern) {
+    return pattern.empty() || line.substr(0, pattern.size()) == pattern;
+}
+
 std::string render_http_request(const HttpEndpoint& endpoint, std::string body, const std::vector<HttpHeader>& headers) {
     std::string request =
         "POST " + endpoint.path + " HTTP/1.1\r\n" +
@@ -659,6 +923,47 @@ std::vector<std::string> expand_glob_paths(std::string_view pattern) {
     return paths;
 }
 
+std::vector<std::string> apply_multiline_records(const std::vector<std::string>& lines, const MultilineOptions& options) {
+    if (!options.enabled || lines.empty()) {
+        return lines;
+    }
+
+    std::vector<std::string> records;
+    std::string current;
+    std::size_t current_lines = 0;
+    for (const auto& line : lines) {
+        const bool starts_record = matches_multiline_start(line, options.start_pattern);
+        const bool overflow = options.max_lines > 0 && current_lines >= options.max_lines;
+        if (!current.empty() && (starts_record || overflow)) {
+            records.push_back(std::move(current));
+            current.clear();
+            current_lines = 0;
+        }
+        if (!current.empty()) {
+            current.push_back('\n');
+        }
+        current += line;
+        ++current_lines;
+    }
+    if (!current.empty()) {
+        records.push_back(std::move(current));
+    }
+    return records;
+}
+
+SourceLimitDecision evaluate_source_limits(
+    std::size_t message_bytes,
+    std::size_t buffered_bytes,
+    const SourceLimits& limits) {
+    if (limits.max_message_bytes > 0 && message_bytes > limits.max_message_bytes) {
+        return SourceLimitDecision{.accept = false, .reason = "message_too_large"};
+    }
+    if (limits.max_buffer_bytes > 0 && buffered_bytes > limits.max_buffer_bytes) {
+        return SourceLimitDecision{.accept = false, .reason = "buffer_too_large"};
+    }
+    return SourceLimitDecision{};
+}
+
 std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url) {
     constexpr std::string_view prefix = "http://";
     if (url.substr(0, prefix.size()) != prefix) {
@@ -755,6 +1060,25 @@ std::vector<HttpHeader> parse_http_headers(std::string_view value) {
         value.remove_prefix(separator + 1);
     }
     return headers;
+}
+
+IngestParseResult parse_ingest_body(std::string_view body, const IngestParseOptions& options) {
+    IngestParseResult result;
+    auto records = extract_json_records_array(body);
+    if (records.empty()) {
+        result.messages.push_back(parse_ingest_record(body, options));
+        return result;
+    }
+
+    result.messages.reserve(records.size());
+    for (const auto record : records) {
+        try {
+            result.messages.push_back(parse_ingest_record(record, options));
+        } catch (...) {
+            ++result.malformed_records;
+        }
+    }
+    return result;
 }
 
 std::string render_json_batch(const std::vector<std::string>& records) {

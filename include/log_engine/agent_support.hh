@@ -43,10 +43,36 @@ struct AgentRecordEnvelope {
     std::string message;
 };
 
+struct IngestParseOptions {
+    std::string default_agent_id;
+    std::string default_source_id;
+};
+
+struct IngestParseResult {
+    std::vector<LogMessage> messages;
+    std::size_t malformed_records = 0;
+};
+
 struct TailBatch {
     SourceOffset next_offset;
     std::vector<std::string> lines;
     bool file_rotated_or_truncated = false;
+};
+
+struct MultilineOptions {
+    bool enabled = false;
+    std::string start_pattern;
+    std::size_t max_lines = 128;
+};
+
+struct SourceLimitDecision {
+    bool accept = true;
+    std::string reason;
+};
+
+struct SourceLimits {
+    std::size_t max_message_bytes = 0;
+    std::size_t max_buffer_bytes = 0;
 };
 
 struct DiskQuota {
@@ -128,10 +154,16 @@ TailBatch tail_file_once(
     const std::optional<SourceOffset>& previous,
     std::size_t max_lines);
 std::vector<std::string> expand_glob_paths(std::string_view pattern);
+std::vector<std::string> apply_multiline_records(const std::vector<std::string>& lines, const MultilineOptions& options);
+SourceLimitDecision evaluate_source_limits(
+    std::size_t message_bytes,
+    std::size_t buffered_bytes,
+    const SourceLimits& limits);
 
 std::optional<HttpEndpoint> parse_http_endpoint(std::string_view url);
 std::vector<int> parse_http_status_codes(std::string_view value);
 std::vector<HttpHeader> parse_http_headers(std::string_view value);
+IngestParseResult parse_ingest_body(std::string_view body, const IngestParseOptions& options);
 std::string render_json_batch(const std::vector<std::string>& records);
 std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
 std::string render_agent_record_envelope(const AgentRecordEnvelope& record);
