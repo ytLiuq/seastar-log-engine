@@ -69,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY --from=build /workspace/seastar-log-engine/build/log_engine_agent /usr/local/bin/log_engine_agent
+COPY --from=build /workspace/seastar-log-engine/build/log_engine_agent_replay /usr/local/bin/log_engine_agent_replay
 COPY config/agent.conf /etc/seastar-log-agent/agent.conf
 
 RUN mkdir -p /var/lib/seastar-log-agent/logs /var/lib/seastar-log-agent/archive \

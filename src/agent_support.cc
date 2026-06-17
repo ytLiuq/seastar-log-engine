@@ -22,6 +22,8 @@
 #include <seastar/net/api.hh>
 #include <seastar/net/dns.hh>
 
+#include "log_engine/log_reader.hh"
+
 namespace log_engine::agent {
 
 namespace {
@@ -365,6 +367,74 @@ void remove_pending_delivery_batch(const std::string& path) {
     std::error_code ec;
     fs::remove(path, ec);
     fs::remove(path + ".tmp", ec);
+}
+
+std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, const ReplayOptions& options) {
+    std::map<unsigned, std::uint64_t> next_by_shard;
+    for (const auto& offset : load_delivery_offsets(options.delivery_offset_path)) {
+        next_by_shard[offset.shard] = offset.next_sequence;
+    }
+
+    std::vector<unsigned> shards;
+    if (options.shard) {
+        shards.push_back(*options.shard);
+    } else if (!next_by_shard.empty()) {
+        for (const auto& [shard, _] : next_by_shard) {
+            shards.push_back(shard);
+        }
+    } else {
+        for (const auto& entry : fs::directory_iterator(config.log_dir, fs::directory_options::skip_permission_denied)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto name = entry.path().filename().string();
+            const auto prefix = config.shard_file_prefix + "-";
+            if (name.rfind(prefix, 0) != 0 || entry.path().extension() != ".log") {
+                continue;
+            }
+            const auto shard_text = name.substr(prefix.size(), name.size() - prefix.size() - entry.path().extension().string().size());
+            try {
+                shards.push_back(static_cast<unsigned>(parse_u64(shard_text, "shard")));
+            } catch (...) {
+            }
+        }
+        std::sort(shards.begin(), shards.end());
+        shards.erase(std::unique(shards.begin(), shards.end()), shards.end());
+    }
+
+    std::vector<DeliveryBatch> batches;
+    for (const auto shard : shards) {
+        ReadQuery query;
+        query.include_archive = options.include_archive;
+        query.limit = options.batch_size;
+        query.shard = shard;
+        query.seq_from = next_by_shard.contains(shard) ? next_by_shard[shard] : 0;
+
+        const auto segments = collect_segments(config, query);
+        const auto records = read_records(segments, query);
+        if (records.empty()) {
+            continue;
+        }
+
+        DeliveryBatch batch;
+        batch.shard = shard;
+        batch.first_sequence = query.seq_from.value_or(0);
+        batch.next_sequence = batch.first_sequence;
+        batch.records.reserve(records.size());
+        for (const auto& record : records) {
+            batch.records.push_back(record.payload);
+            if (record.has_sequence) {
+                if (batch.records.size() == 1) {
+                    batch.first_sequence = record.sequence;
+                }
+                batch.next_sequence = std::max(batch.next_sequence, record.sequence + 1);
+            } else {
+                ++batch.next_sequence;
+            }
+        }
+        batches.push_back(std::move(batch));
+    }
+    return batches;
 }
 
 std::uint64_t directory_size_bytes(const std::string& path) {

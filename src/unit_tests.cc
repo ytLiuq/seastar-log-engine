@@ -975,6 +975,7 @@ seastar::future<> test_agent_tail_file_truncate_resets_offset(const std::string&
 seastar::future<> test_agent_disk_quota_and_http_helpers(const std::string& root_dir);
 seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string& root_dir);
+seastar::future<> test_agent_replay_batches_from_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
 seastar::future<> test_agent_http_sink_fake_server();
 seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir);
@@ -1022,6 +1023,7 @@ int main(int argc, char** argv) {
         co_await test_agent_disk_quota_and_http_helpers(root_dir);
         co_await test_agent_per_shard_delivery_offsets(root_dir);
         co_await test_agent_pending_delivery_batch_roundtrip(root_dir);
+        co_await test_agent_replay_batches_from_delivery_offsets(root_dir);
         co_await test_agent_glob_and_dynamic_backpressure(root_dir);
         co_await test_agent_http_sink_fake_server();
         co_await test_agent_file_to_http_sink_delivery_flow(root_dir);
@@ -1447,6 +1449,60 @@ seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string&
 
     log_engine::agent::remove_pending_delivery_batch(path);
     require(!log_engine::agent::load_pending_delivery_batch(path).has_value(), "agent pending delivery batch should be removable");
+    co_return;
+}
+
+seastar::future<> test_agent_replay_batches_from_delivery_offsets(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-replay";
+    const auto log_dir = (dir / "logs").string();
+    const auto archive_dir = (dir / "archive").string();
+    reset_directory(dir);
+    reset_directory(log_dir);
+    reset_directory(archive_dir);
+
+    log_engine::EngineConfig config;
+    config.log_dir = log_dir;
+    config.archive_dir = archive_dir;
+    config.batch_size = 3;
+    config.ack_mode = log_engine::AckMode::sync_ack;
+    config.empty_route_policy = log_engine::EmptyRoutePolicy::local;
+    config.truncate_on_start = true;
+    config.record_crc_enabled = true;
+    config.record_sequence_enabled = true;
+    config.record_shard_id_enabled = true;
+
+    log_engine::LogEngine engine;
+    co_await engine.start(config);
+    std::vector<log_engine::LogMessage> messages;
+    messages.push_back(log_engine::LogMessage{.payload = "replay-0"});
+    messages.push_back(log_engine::LogMessage{.payload = "replay-1"});
+    messages.push_back(log_engine::LogMessage{.payload = "replay-2"});
+    co_await engine.append_batch(std::move(messages));
+    co_await engine.stop();
+
+    const auto delivery_path = (dir / "delivery.offset").string();
+    std::vector<log_engine::agent::DeliveryOffset> offsets;
+    offsets.push_back(log_engine::agent::DeliveryOffset{.shard = 0, .next_sequence = 1});
+    log_engine::agent::store_delivery_offsets(delivery_path, offsets);
+
+    log_engine::agent::ReplayOptions options;
+    options.delivery_offset_path = delivery_path;
+    options.batch_size = 10;
+    options.include_archive = true;
+    options.shard = 0;
+    const auto batches = log_engine::agent::build_replay_batches(config, options);
+    require(batches.size() == 1, "agent replay should produce one shard batch");
+    require(batches[0].shard == 0, "agent replay shard mismatch");
+    require(batches[0].first_sequence == 1, "agent replay first sequence should start from delivery offset");
+    require(batches[0].next_sequence == 3, "agent replay next sequence mismatch");
+    require(batches[0].records.size() == 2, "agent replay should export only unsent records");
+    require(batches[0].records[0] == "replay-1", "agent replay first payload mismatch");
+    require(batches[0].records[1] == "replay-2", "agent replay second payload mismatch");
+
+    const auto body = log_engine::agent::render_delivery_batch_json("agent-replay", batches[0]);
+    require(body.find("\"agent_id\":\"agent-replay\"") != std::string::npos, "agent replay JSON should include agent id");
+    require(body.find("\"first_sequence\":1") != std::string::npos, "agent replay JSON should include replay first sequence");
+    require(body.find("replay-2") != std::string::npos, "agent replay JSON should include unsent payload");
     co_return;
 }
 

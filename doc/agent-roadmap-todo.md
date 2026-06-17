@@ -2,20 +2,29 @@
 
 This document tracks follow-up work after the current agent/checkpoint iteration.
 
+## Completed
+
+- 2026-06-17: Added durable pending delivery batches. The agent persists a batch to `pending-delivery-path` before sink delivery, reloads it on restart, advances per-shard delivery offsets only after sink ACK, and removes the pending file after ACK.
+- 2026-06-17: Added sink idempotency metadata to HTTP delivery batches: `agent_id`, `shard`, `first_sequence`, `next_sequence`, and per-record `sequence`.
+- 2026-06-17: Exposed `last_recovery_fallback_reason` through `/v1/status`.
+- 2026-06-17: Added unit coverage for pending delivery batch roundtrip, async HTTP sink metadata, and file-to-HTTP delivery offset flow.
+- 2026-06-17: Added `log_engine_agent_replay`, an offline replay helper that exports unacknowledged local-engine records from per-shard delivery offsets as idempotent JSON batches.
+
 ## Current Baseline
 
 - Checkpoint recovery uses a checksummed v2 checkpoint file plus tail scan after the checkpoint offset.
 - Startup can recover valid records after the checkpoint and stop at a corrupted tail.
 - Agent MVP supports HTTP ingest, file tailing, glob file inputs, stdin, Unix socket, TCP, UDP, stdout sink, HTTP sink, disk quota checks, dynamic backpressure inputs, Docker runtime image, and Docker Compose deployment.
-- Delivery state can be tracked per shard, and unit tests cover source offsets, delivery offsets, file tailing, glob expansion, backpressure decisions, async HTTP sink behavior, and a file-to-HTTP delivery flow.
+- Delivery state can be tracked per shard, pending sink batches are persisted before delivery, and unit tests cover source offsets, delivery offsets, pending delivery batches, file tailing, glob expansion, backpressure decisions, async HTTP sink behavior, and a file-to-HTTP delivery flow.
 
 ## P0 Reliability
 
 - Make sink delivery fully at-least-once:
-  - Persist retry batches before sending to remote sinks.
-  - Advance per-shard delivery offsets only after sink ACK.
-  - On restart, reload delivery offsets and replay records from the local engine.
-  - Add idempotency fields to sink batches, such as `agent_id`, `shard`, `first_sequence`, and `next_sequence`.
+  - [x] Persist retry batches before sending to remote sinks.
+  - [x] Advance per-shard delivery offsets only after sink ACK.
+  - [x] On restart, reload pending delivery batch and delivery offsets before scanning new records.
+  - [x] Add idempotency fields to sink batches, such as `agent_id`, `shard`, `first_sequence`, and `next_sequence`.
+  - [x] Add a replay helper that can explicitly export unsent local-engine records from delivery offsets for offline recovery.
 
 - Harden crash/restart behavior:
   - Add an integration test that kills the agent between local append and sink ACK.
@@ -25,7 +34,8 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - Improve checkpoint durability:
   - Keep current checkpoint CRC and fsync behavior.
   - Add fault-injection tests for partial checkpoint write, stale checkpoint, corrupted checkpoint CRC, and corrupted active log tail.
-  - Track recovery mode in metrics and expose it through `/v1/status`.
+  - [x] Expose the last recovery fallback reason through `/v1/status`.
+  - [ ] Track detailed recovery mode counters in metrics.
 
 ## P1 Sink Architecture
 

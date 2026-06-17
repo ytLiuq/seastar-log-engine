@@ -127,6 +127,14 @@ target_link_libraries(log_engine_agent
         Boost::program_options
         log_engine_core)
 
+add_executable(log_engine_agent_replay
+    src/agent_replay.cc)
+
+target_link_libraries(log_engine_agent_replay
+    PRIVATE
+        Boost::program_options
+        log_engine_core)
+
 add_executable(log_engine_query_server
     src/query_server.cc
     ${LOG_ENGINE_QUERY_PROTO_SRCS})

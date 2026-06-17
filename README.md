@@ -115,6 +115,18 @@ curl http://127.0.0.1:18081/v1/status
 
 这个模式会 tail 本地文件，只提交已经换行结束的完整日志行；成功写入本地日志引擎后推进 `source-offset-path.*`。sink 投递前会把当前批次写到 `pending-delivery-path`，批次 JSON 带 `agent_id`、`shard`、`first_sequence`、`next_sequence`，成功收到 sink ACK 后再按 shard 推进 `delivery-offset-path` 并删除 pending 文件；如果进程在 ACK 前崩溃，重启后会优先重放 pending 批次。如果本地缓冲目录达到 `max-buffer-bytes`，或者 sink backlog / 失败数 / 延迟超过动态阈值，输入源会暂停，避免继续放大积压。
 
+离线导出未 ACK 批次：
+
+```bash
+./build/log_engine_agent_replay \
+  --config config/agent.conf \
+  --agent-id edge-a \
+  --delivery-offset-path agent-delivery.offset \
+  --batch-size 100
+```
+
+该命令会从 `delivery-offset-path` 记录的 per-shard sequence 开始读取本地 log engine，按 JSON lines 输出带幂等字段的补投批次，可用于人工排查或接入外部补投脚本。
+
 Agent 输入源：
 
 - `--file-source-path /var/log/app.log`

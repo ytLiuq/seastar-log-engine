@@ -9,6 +9,8 @@
 
 #include <seastar/core/future.hh>
 
+#include "log_engine/config.hh"
+
 namespace log_engine::agent {
 
 struct SourceOffset {
@@ -61,6 +63,13 @@ struct HttpEndpoint {
     std::string path = "/";
 };
 
+struct ReplayOptions {
+    std::string delivery_offset_path;
+    std::size_t batch_size = 100;
+    bool include_archive = true;
+    std::optional<unsigned> shard;
+};
+
 std::optional<SourceOffset> load_source_offset(const std::string& path);
 void store_source_offset(const std::string& path, const SourceOffset& offset);
 
@@ -71,6 +80,7 @@ void store_delivery_offsets(const std::string& path, const std::vector<DeliveryO
 std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path);
 void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch);
 void remove_pending_delivery_batch(const std::string& path);
+std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, const ReplayOptions& options);
 
 std::uint64_t directory_size_bytes(const std::string& path);
 bool disk_quota_exceeded(const std::string& path, const DiskQuota& quota);
