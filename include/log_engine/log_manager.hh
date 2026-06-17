@@ -31,6 +31,9 @@ struct LogManagerStats {
     std::uint64_t checkpoint_write_successes = 0;
     std::uint64_t checkpoint_write_failures = 0;
     std::uint64_t recovery_fallbacks = 0;
+    std::uint64_t recovery_from_checkpoints = 0;
+    std::uint64_t recovery_full_scans = 0;
+    std::uint64_t recovery_empty_files = 0;
     std::uint64_t gzip_archive_successes = 0;
     std::uint64_t gzip_archive_failures = 0;
     std::uint64_t recovery_fallback_incomplete_checkpoint = 0;

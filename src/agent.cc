@@ -214,7 +214,7 @@ struct AgentContext {
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
@@ -230,6 +230,9 @@ struct AgentContext {
             manager_stats.checkpoint_write_successes,
             manager_stats.checkpoint_write_failures,
             manager_stats.recovery_fallbacks,
+            manager_stats.recovery_from_checkpoints,
+            manager_stats.recovery_full_scans,
+            manager_stats.recovery_empty_files,
             log_engine::recovery_fallback_reason_to_string(log_engine::get_last_recovery_fallback_reason()));
     }
 };

@@ -39,6 +39,9 @@ std::atomic<std::uint64_t> g_rotate_operations{0};
 std::atomic<std::uint64_t> g_checkpoint_write_successes{0};
 std::atomic<std::uint64_t> g_checkpoint_write_failures{0};
 std::atomic<std::uint64_t> g_recovery_fallbacks{0};
+std::atomic<std::uint64_t> g_recovery_from_checkpoints{0};
+std::atomic<std::uint64_t> g_recovery_full_scans{0};
+std::atomic<std::uint64_t> g_recovery_empty_files{0};
 std::atomic<std::uint64_t> g_gzip_archive_successes{0};
 std::atomic<std::uint64_t> g_gzip_archive_failures{0};
 std::atomic<std::uint64_t> g_recovery_fallback_incomplete_checkpoint{0};
@@ -432,6 +435,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
         namespace fs = std::filesystem;
         RecoveryState recovery;
         if (!fs::exists(active_segment.path)) {
+            ++g_recovery_empty_files;
             return recovery;
         }
 
@@ -459,6 +463,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
                         recovery.tail_buffer = read_tail_before_offset(active_segment.path, recovery.logical_size, tail_size);
                     }
                 }
+                ++g_recovery_from_checkpoints;
                 return recovery;
             }
 
@@ -484,6 +489,7 @@ seastar::future<RecoveryState> LogManager::recover_active_file(const layout::Seg
 
         const auto trailing_capacity = alignment == 0 ? std::size_t{0} : alignment;
         const auto streamed = scan_log_file_streaming(active_segment.path, trailing_capacity);
+        ++g_recovery_full_scans;
         const auto& verified = streamed.verified;
         auto valid_size = verified.valid_size;
         auto sequence = verified.next_sequence;
@@ -592,6 +598,9 @@ LogManagerStats get_log_manager_stats() noexcept {
         .checkpoint_write_successes = g_checkpoint_write_successes.load(std::memory_order_relaxed),
         .checkpoint_write_failures = g_checkpoint_write_failures.load(std::memory_order_relaxed),
         .recovery_fallbacks = g_recovery_fallbacks.load(std::memory_order_relaxed),
+        .recovery_from_checkpoints = g_recovery_from_checkpoints.load(std::memory_order_relaxed),
+        .recovery_full_scans = g_recovery_full_scans.load(std::memory_order_relaxed),
+        .recovery_empty_files = g_recovery_empty_files.load(std::memory_order_relaxed),
         .gzip_archive_successes = g_gzip_archive_successes.load(std::memory_order_relaxed),
         .gzip_archive_failures = g_gzip_archive_failures.load(std::memory_order_relaxed),
         .recovery_fallback_incomplete_checkpoint = g_recovery_fallback_incomplete_checkpoint.load(std::memory_order_relaxed),
@@ -609,6 +618,9 @@ void reset_log_manager_stats() noexcept {
     g_checkpoint_write_successes.store(0, std::memory_order_relaxed);
     g_checkpoint_write_failures.store(0, std::memory_order_relaxed);
     g_recovery_fallbacks.store(0, std::memory_order_relaxed);
+    g_recovery_from_checkpoints.store(0, std::memory_order_relaxed);
+    g_recovery_full_scans.store(0, std::memory_order_relaxed);
+    g_recovery_empty_files.store(0, std::memory_order_relaxed);
     g_gzip_archive_successes.store(0, std::memory_order_relaxed);
     g_gzip_archive_failures.store(0, std::memory_order_relaxed);
     g_recovery_fallback_incomplete_checkpoint.store(0, std::memory_order_relaxed);
@@ -630,7 +642,7 @@ void register_log_manager_metrics() {
     }
 
     std::vector<sm::metric_definition> definitions;
-    definitions.reserve(8);
+    definitions.reserve(11);
     definitions.push_back(sm::make_counter("rotate_operations", sm::description("Total archive rotation operations"), [] {
             return g_rotate_operations.load(std::memory_order_relaxed);
         })(component));
@@ -642,6 +654,15 @@ void register_log_manager_metrics() {
         })(component));
     definitions.push_back(sm::make_counter("recovery_fallbacks", sm::description("Total recovery fallback events caused by unusable checkpoint files"), [] {
             return g_recovery_fallbacks.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_from_checkpoints", sm::description("Total active log recoveries that used a valid checkpoint plus tail scan"), [] {
+            return g_recovery_from_checkpoints.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_full_scans", sm::description("Total active log recoveries that scanned from the beginning"), [] {
+            return g_recovery_full_scans.load(std::memory_order_relaxed);
+        })(component));
+    definitions.push_back(sm::make_counter("recovery_empty_files", sm::description("Total recovery attempts where the active log file did not exist"), [] {
+            return g_recovery_empty_files.load(std::memory_order_relaxed);
         })(component));
     definitions.push_back(sm::make_counter("gzip_archive_successes", sm::description("Total successful gzip archive compressions"), [] {
             return g_gzip_archive_successes.load(std::memory_order_relaxed);

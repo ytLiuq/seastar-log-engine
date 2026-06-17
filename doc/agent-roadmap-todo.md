@@ -9,6 +9,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Exposed `last_recovery_fallback_reason` through `/v1/status`.
 - 2026-06-17: Added unit coverage for pending delivery batch roundtrip, async HTTP sink metadata, and file-to-HTTP delivery offset flow.
 - 2026-06-17: Added `log_engine_agent_replay`, an offline replay helper that exports unacknowledged local-engine records from per-shard delivery offsets as idempotent JSON batches.
+- 2026-06-17: Added detailed recovery mode counters for checkpoint recovery, full-scan recovery, and missing active-log recovery; exposed them through metrics and `/v1/status`.
 
 ## Current Baseline
 
@@ -35,7 +36,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
   - Keep current checkpoint CRC and fsync behavior.
   - Add fault-injection tests for partial checkpoint write, stale checkpoint, corrupted checkpoint CRC, and corrupted active log tail.
   - [x] Expose the last recovery fallback reason through `/v1/status`.
-  - [ ] Track detailed recovery mode counters in metrics.
+  - [x] Track detailed recovery mode counters in metrics.
 
 ## P1 Sink Architecture
 

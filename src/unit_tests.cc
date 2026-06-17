@@ -810,10 +810,14 @@ seastar::future<> test_checkpoint_tail_scan_preserves_valid_records_after_checkp
             .rotation_index = 0,
         });
 
+    log_engine::reset_log_manager_stats();
     log_engine::LogManager manager;
     const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
     require(recovery.logical_size == verified.valid_size, "tail scan checkpoint recovery should preserve valid records after checkpoint");
     require(recovery.sequence == verified.next_sequence, "tail scan checkpoint recovery should advance sequence through valid tail records");
+    const auto stats = log_engine::get_log_manager_stats();
+    require(stats.recovery_from_checkpoints == 1, "checkpoint recovery should increment checkpoint recovery counter");
+    require(stats.recovery_full_scans == 0, "checkpoint recovery should not increment full scan counter");
     co_return;
 }
 
@@ -850,12 +854,18 @@ seastar::future<> test_corrupted_checkpoint_falls_back_to_scan(const std::string
         out << "checkpoint_crc=0\n";
     }
 
+    log_engine::reset_log_manager_stats();
     log_engine::LogManager manager;
     const auto active_segment = log_engine::layout::describe_path(config, shard_path->string());
     require(active_segment.has_value(), "corrupted checkpoint test should describe active shard log");
     const auto recovery = co_await manager.recover_active_file(*active_segment, 4096);
     require(recovery.logical_size == verified.valid_size, "corrupted checkpoint should fall back to scanned size");
     require(recovery.sequence == verified.next_sequence, "corrupted checkpoint should fall back to scanned sequence");
+    const auto stats = log_engine::get_log_manager_stats();
+    require(stats.recovery_fallbacks == 1, "corrupted checkpoint should increment recovery fallback counter");
+    require(stats.recovery_fallback_incomplete_checkpoint == 1, "corrupted checkpoint should increment incomplete checkpoint fallback counter");
+    require(stats.recovery_full_scans == 1, "corrupted checkpoint should increment full scan counter");
+    require(log_engine::get_last_recovery_fallback_reason() == log_engine::RecoveryFallbackReason::incomplete_checkpoint, "corrupted checkpoint should set last fallback reason");
     co_return;
 }
 
