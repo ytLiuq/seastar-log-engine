@@ -1,0 +1,32 @@
+services:
+  seastar-log-agent:
+    build:
+      context: ../..
+      target: agent-runtime
+    image: seastar-log-engine:agent
+    command:
+      - --config
+      - /etc/seastar-log-agent/agent.conf
+      - --log-dir
+      - /var/lib/seastar-log-agent/logs
+      - --archive-dir
+      - /var/lib/seastar-log-agent/archive
+      - --file-source-glob
+      - /host-logs/*.log
+      - --sink-kind
+      - stdout
+    ports:
+      - "18081:18081"
+    volumes:
+      - agent-data:/var/lib/seastar-log-agent
+      - ../../config/agent.conf:/etc/seastar-log-agent/agent.conf:ro
+      - ../../logs:/host-logs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    user: logagent
+
+volumes:
+  agent-data:

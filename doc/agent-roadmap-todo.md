@@ -17,6 +17,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Closed P2 record layout/query milestone with a backward-compatible agent metadata envelope, metadata filters, sink-batch query export, and binary-layout evaluation notes.
 - 2026-06-17: Closed the P1 input/HTTP ingest slice with multiline merge helpers, source size limits, socket connection limits, UDP/source drop counters, HTTP batch ingest parsing, and structured JSON field extraction tests.
 - 2026-06-18: Closed remaining P1 sink/backpressure work with a pluggable sink boundary, HTTP TLS proxy strategy, Kafka/ObjectStore sidecar manifests, a small backpressure controller, status observability, and unit coverage.
+- 2026-06-18: Closed P2 deployment/testing with Compose examples, Kubernetes DaemonSet packaging, non-root deployment notes, agent integration smoke tests, Docker Compose smoke entry point, and agent performance profile scripts.
 
 ## Current Baseline
 
@@ -125,34 +126,34 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P2 Deployment
 
 - Expand Docker Compose examples:
-  - stdout-only local demo.
-  - HTTP sink demo with a fake receiver.
-  - mounted host log directory.
+  - [x] stdout-only local demo.
+  - [x] HTTP sink demo with a fake receiver.
+  - [x] mounted host log directory.
 
 - Kubernetes packaging:
-  - Provide DaemonSet example.
-  - Mount host log directories read-only.
-  - Mount agent data directory as a writable volume.
-  - Add readiness and liveness probes.
+  - [x] Provide DaemonSet example.
+  - [x] Mount host log directories read-only.
+  - [x] Mount agent data directory as a writable volume.
+  - [x] Add readiness and liveness probes.
 
 - Non-root operation:
-  - Keep runtime container non-root.
-  - Document required permissions for reading host log files and binding Unix sockets.
+  - [x] Keep runtime container non-root.
+  - [x] Document required permissions for reading host log files and binding Unix sockets.
 
 ## P2 Testing
 
 - Add integration tests:
-  - crash/restart replay test.
-  - fake HTTP sink retry and recovery test.
-  - rotate plus tail plus delivery offset test.
-  - disk-full or permission-error test.
-  - Docker Compose smoke test.
+  - [x] crash/restart replay test.
+  - [x] fake HTTP sink retry and recovery test.
+  - [x] rotate plus tail plus delivery offset test.
+  - [x] disk-full or permission-error test.
+  - [x] Docker Compose smoke test.
 
 - Add performance tests:
-  - file tail throughput.
-  - HTTP sink batch size sweep.
-  - backpressure behavior under slow sink.
-  - memory usage under large payload records.
+  - [x] file tail throughput.
+  - [x] HTTP sink batch size sweep.
+  - [x] backpressure behavior under slow sink.
+  - [x] memory usage under large payload records.
 
 ## P3 Documentation
 

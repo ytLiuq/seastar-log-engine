@@ -1,0 +1,46 @@
+services:
+  fake-receiver:
+    image: python:3.12-slim
+    working_dir: /receiver
+    command: ["python", "/receiver/fake_http_sink.py", "--host", "0.0.0.0", "--port", "19090", "--out", "/tmp/receiver/requests.ndjson"]
+    volumes:
+      - ../../script/fake_http_sink.py:/receiver/fake_http_sink.py:ro
+      - receiver-data:/tmp/receiver
+    ports:
+      - "19090:19090"
+
+  seastar-log-agent:
+    build:
+      context: ../..
+      target: agent-runtime
+    image: seastar-log-engine:agent
+    depends_on:
+      - fake-receiver
+    command:
+      - --config
+      - /etc/seastar-log-agent/agent.conf
+      - --log-dir
+      - /var/lib/seastar-log-agent/logs
+      - --archive-dir
+      - /var/lib/seastar-log-agent/archive
+      - --sink-kind
+      - http
+      - --sink-http-url
+      - http://fake-receiver:19090/ingest
+      - --sink-retry-backoff-ms
+      - "200"
+    ports:
+      - "18081:18081"
+    volumes:
+      - agent-data:/var/lib/seastar-log-agent
+      - ../../config/agent.conf:/etc/seastar-log-agent/agent.conf:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    user: logagent
+
+volumes:
+  agent-data:
+  receiver-data:
