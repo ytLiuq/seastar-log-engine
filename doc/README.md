@@ -50,6 +50,15 @@
 - `script/build.sh`: 本地构建脚本
 - `doc`: benchmark 和分析文档
 
+## Agent 文档
+
+- `doc/agent-usage-guide.md`: agent 输入、sink、可靠性和限制说明
+- `doc/agent-architecture.md`: agent 数据流、checkpoint/tail scan、delivery offset 架构说明
+- `doc/agent-deployment.md`: Docker Compose、Kubernetes、非 root 部署说明
+- `doc/agent-sink-strategy.md`: HTTP、stdout、Kafka/ObjectStore sidecar sink 策略
+- `doc/agent-vector-filebeat-comparison.md`: 与 Vector/Filebeat 的定位对比
+- `doc/agent-record-layout-evaluation.md`: agent metadata envelope 与未来 binary layout 评估
+
 ## 当前已知未收尾项
 
 - 长稳验证、故障注入闭环和多 shard 真实负载性能画像还在继续补齐

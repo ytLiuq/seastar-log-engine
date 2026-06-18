@@ -2,6 +2,11 @@
 
 This document tracks follow-up work after the current agent/checkpoint iteration.
 
+## Open Items
+
+- No open P0/P1/P2/P3 items remain in this roadmap.
+- Future work should be tracked in a new milestone instead of extending this completed checklist.
+
 ## Completed
 
 - 2026-06-17: Added durable pending delivery batches. The agent persists a batch to `pending-delivery-path` before sink delivery, reloads it on restart, advances per-shard delivery offsets only after sink ACK, and removes the pending file after ACK.
@@ -18,6 +23,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Closed the P1 input/HTTP ingest slice with multiline merge helpers, source size limits, socket connection limits, UDP/source drop counters, HTTP batch ingest parsing, and structured JSON field extraction tests.
 - 2026-06-18: Closed remaining P1 sink/backpressure work with a pluggable sink boundary, HTTP TLS proxy strategy, Kafka/ObjectStore sidecar manifests, a small backpressure controller, status observability, and unit coverage.
 - 2026-06-18: Closed P2 deployment/testing with Compose examples, Kubernetes DaemonSet packaging, non-root deployment notes, agent integration smoke tests, Docker Compose smoke entry point, and agent performance profile scripts.
+- 2026-06-18: Closed P3 documentation with an agent usage guide, architecture note, and Vector/Filebeat comparison.
 
 ## Current Baseline
 
@@ -158,18 +164,18 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P3 Documentation
 
 - Add an agent usage guide:
-  - input configuration examples.
-  - sink configuration examples.
-  - reliability semantics.
-  - known limitations.
+  - [x] input configuration examples.
+  - [x] sink configuration examples.
+  - [x] reliability semantics.
+  - [x] known limitations.
 
 - Add an architecture diagram:
-  - input source.
-  - local Seastar log engine.
-  - checkpoint and tail scan recovery.
-  - delivery offset.
-  - remote sink.
+  - [x] input source.
+  - [x] local Seastar log engine.
+  - [x] checkpoint and tail scan recovery.
+  - [x] delivery offset.
+  - [x] remote sink.
 
 - Add a Vector/Filebeat comparison note:
-  - clarify that this project is a lightweight durable edge buffer plus local log engine.
-  - avoid claiming it replaces mature production agents without Kafka/object-store/TLS/rich parsing support.
+  - [x] clarify that this project is a lightweight durable edge buffer plus local log engine.
+  - [x] avoid claiming it replaces mature production agents without Kafka/object-store/TLS/rich parsing support.
