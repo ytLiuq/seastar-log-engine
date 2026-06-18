@@ -82,12 +82,16 @@ struct DiskQuota {
 
 struct BackpressureState {
     std::uint64_t disk_bytes = 0;
+    std::uint64_t pending_bytes = 0;
     std::uint64_t sink_backlog_records = 0;
     std::uint64_t recent_sink_failures = 0;
     std::uint64_t last_sink_latency_ms = 0;
+    std::uint64_t sink_latency_average_ms = 0;
     std::uint64_t max_sink_backlog_records = 0;
     std::uint64_t max_recent_sink_failures = 0;
     std::uint64_t max_sink_latency_ms = 0;
+    std::uint64_t max_pending_bytes = 0;
+    std::uint64_t max_sink_latency_average_ms = 0;
 };
 
 struct BackpressureDecision {
@@ -110,6 +114,17 @@ struct HttpPostOptions {
     std::uint64_t timeout_ms = 5000;
     std::vector<int> retryable_status_codes = {408, 425, 429, 500, 502, 503, 504};
     std::vector<HttpHeader> headers;
+};
+
+struct KafkaSidecarOptions {
+    std::string topic = "logs";
+    std::string bootstrap_servers;
+};
+
+struct ObjectStoreOptions {
+    std::string bucket;
+    std::string prefix = "logs";
+    std::string compression = "none";
 };
 
 class RetryableHttpStatusError : public std::runtime_error {
@@ -167,6 +182,14 @@ IngestParseResult parse_ingest_body(std::string_view body, const IngestParseOpti
 std::string render_json_batch(const std::vector<std::string>& records);
 std::string render_delivery_batch_json(std::string_view agent_id, const DeliveryBatch& batch);
 std::string render_agent_record_envelope(const AgentRecordEnvelope& record);
+std::string render_kafka_sidecar_batch_json(
+    std::string_view agent_id,
+    const DeliveryBatch& batch,
+    const KafkaSidecarOptions& options);
+std::string render_object_store_manifest_json(
+    std::string_view agent_id,
+    const DeliveryBatch& batch,
+    const ObjectStoreOptions& options);
 void post_http_batch(const HttpEndpoint& endpoint, std::string_view body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body);
 seastar::future<> post_http_batch_async(const HttpEndpoint& endpoint, std::string body, const HttpPostOptions& options);

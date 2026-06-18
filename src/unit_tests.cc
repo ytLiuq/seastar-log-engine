@@ -1053,6 +1053,7 @@ seastar::future<> test_agent_crash_after_sink_ack_before_offset_persistence_boun
 seastar::future<> test_agent_replay_batches_from_delivery_offsets(const std::string& root_dir);
 seastar::future<> test_agent_glob_and_dynamic_backpressure(const std::string& root_dir);
 seastar::future<> test_agent_p1_input_and_http_ingest_helpers();
+seastar::future<> test_agent_p1_sink_strategy_and_backpressure_controller(const std::string& root_dir);
 seastar::future<> test_agent_http_sink_fake_server();
 seastar::future<> test_agent_file_to_http_sink_delivery_flow(const std::string& root_dir);
 
@@ -1106,6 +1107,7 @@ int main(int argc, char** argv) {
         co_await test_agent_replay_batches_from_delivery_offsets(root_dir);
         co_await test_agent_glob_and_dynamic_backpressure(root_dir);
         co_await test_agent_p1_input_and_http_ingest_helpers();
+        co_await test_agent_p1_sink_strategy_and_backpressure_controller(root_dir);
         co_await test_agent_http_sink_fake_server();
         co_await test_agent_file_to_http_sink_delivery_flow(root_dir);
         co_return;
@@ -1804,6 +1806,59 @@ seastar::future<> test_agent_p1_input_and_http_ingest_helpers() {
     require(second_record.has_value(), "agent HTTP ingest second envelope should be parseable");
     require(second_record->payload == "boom", "agent HTTP ingest should normalize payload");
     require(second_record->source_id == "custom-source", "agent HTTP ingest should preserve explicit source id");
+    co_return;
+}
+
+seastar::future<> test_agent_p1_sink_strategy_and_backpressure_controller(const std::string& root_dir) {
+    const auto dir = fs::path(root_dir) / "agent-p1-controller";
+    reset_directory(dir);
+    {
+        std::ofstream out(dir / "buffer.log", std::ios::binary | std::ios::trunc);
+        out << std::string(32, 'x');
+    }
+
+    log_engine::agent::DiskQuota quota;
+    quota.max_buffer_bytes = 32;
+    quota.resume_buffer_bytes = 8;
+    const auto disk_decision = log_engine::agent::evaluate_backpressure(dir.string(), quota, {});
+    require(disk_decision.pause && disk_decision.reason == "disk_quota", "agent controller should pause on disk high watermark");
+
+    log_engine::agent::BackpressureState pending;
+    pending.pending_bytes = 64;
+    pending.max_pending_bytes = 64;
+    const auto pending_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, pending);
+    require(pending_decision.pause && pending_decision.reason == "pending_bytes", "agent controller should pause on pending bytes");
+
+    log_engine::agent::BackpressureState average_latency;
+    average_latency.sink_latency_average_ms = 2000;
+    average_latency.max_sink_latency_average_ms = 1000;
+    const auto average_decision = log_engine::agent::evaluate_backpressure(dir.string(), {}, average_latency);
+    require(average_decision.pause && average_decision.reason == "sink_latency_average", "agent controller should pause on moving average latency");
+
+    log_engine::agent::DeliveryBatch batch;
+    batch.shard = 2;
+    batch.first_sequence = 10;
+    batch.next_sequence = 12;
+    batch.records = {"kafka-a", "kafka-b"};
+
+    log_engine::agent::KafkaSidecarOptions kafka;
+    kafka.topic = "edge-logs";
+    kafka.bootstrap_servers = "kafka:9092";
+    const auto kafka_body = log_engine::agent::render_kafka_sidecar_batch_json("agent-k", batch, kafka);
+    require(kafka_body.find("\"sink\":\"kafka_sidecar\"") != std::string::npos, "agent Kafka sidecar should identify sink");
+    require(kafka_body.find("\"topic\":\"edge-logs\"") != std::string::npos, "agent Kafka sidecar should include topic");
+    require(kafka_body.find("\"key\":\"2:10\"") != std::string::npos, "agent Kafka sidecar should derive idempotent key");
+    require(kafka_body.find("\"next_sequence\":\"12\"") != std::string::npos, "agent Kafka sidecar should include sequence header");
+
+    log_engine::agent::ObjectStoreOptions object_store;
+    object_store.bucket = "edge-bucket";
+    object_store.prefix = "agent";
+    object_store.compression = "gzip";
+    const auto manifest = log_engine::agent::render_object_store_manifest_json("agent-o", batch, object_store);
+    require(manifest.find("\"sink\":\"object_store\"") != std::string::npos, "agent object store manifest should identify sink");
+    require(manifest.find("\"bucket\":\"edge-bucket\"") != std::string::npos, "agent object store manifest should include bucket");
+    require(manifest.find("\"object_name\":\"agent/shard-2/10-12.json\"") != std::string::npos, "agent object store manifest should use deterministic object name");
+    require(manifest.find("\"commit_marker\":\"agent/shard-2/10-12.json.commit\"") != std::string::npos, "agent object store manifest should include commit marker");
     co_return;
 }
 

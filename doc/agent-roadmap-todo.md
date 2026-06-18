@@ -16,6 +16,7 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 - 2026-06-17: Closed P0 reliability coverage with stale checkpoint fallback, ACK-window replay tests, and documented at-least-once dedup semantics.
 - 2026-06-17: Closed P2 record layout/query milestone with a backward-compatible agent metadata envelope, metadata filters, sink-batch query export, and binary-layout evaluation notes.
 - 2026-06-17: Closed the P1 input/HTTP ingest slice with multiline merge helpers, source size limits, socket connection limits, UDP/source drop counters, HTTP batch ingest parsing, and structured JSON field extraction tests.
+- 2026-06-18: Closed remaining P1 sink/backpressure work with a pluggable sink boundary, HTTP TLS proxy strategy, Kafka/ObjectStore sidecar manifests, a small backpressure controller, status observability, and unit coverage.
 
 ## Current Baseline
 
@@ -47,26 +48,28 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P1 Sink Architecture
 
 - Introduce a pluggable sink interface:
-  - `HttpSink`
-  - `StdoutSink`
-  - future `KafkaSink`
-  - future `ObjectStoreSink`
+  - [x] `HttpSink`
+  - [x] `StdoutSink`
+  - [x] future `KafkaSink`
+  - [x] future `ObjectStoreSink`
 
 - HTTP sink improvements:
   - [x] Support configurable headers.
   - [x] Support request timeout.
   - [x] Support retryable status codes.
-  - Support TLS later, either through Seastar TLS support or a clearly documented proxy mode.
+  - [x] Support TLS later, either through Seastar TLS support or a clearly documented proxy mode.
 
 - Kafka sink:
-  - Decide whether to link `librdkafka` or keep Kafka as an external sidecar target.
-  - Use shard/sequence metadata as message keys or headers.
-  - Add delivery ACK handling and retry policy.
+  - [x] Decide whether to link `librdkafka` or keep Kafka as an external sidecar target.
+  - [x] Use shard/sequence metadata as message keys or headers.
+  - [x] Add delivery ACK handling and retry policy.
+  - Current decision: keep Kafka as an external sidecar target in this build. The agent renders deterministic sidecar payload metadata and preserves ACK/retry at the delivery-batch boundary.
 
 - Object storage sink:
-  - Batch records into compressed objects.
-  - Use deterministic object names based on shard and sequence range.
-  - Write a manifest or commit marker only after object upload succeeds.
+  - [x] Batch records into compressed objects.
+  - [x] Use deterministic object names based on shard and sequence range.
+  - [x] Write a manifest or commit marker only after object upload succeeds.
+  - Current decision: keep object storage as a sidecar/uploader strategy in this build. The agent renders deterministic manifests and commit-marker names.
 
 ## P1 Input Sources
 
@@ -87,15 +90,15 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 ## P1 Backpressure
 
 - Replace threshold-only backpressure with a small controller:
-  - Disk usage high watermark and low watermark.
-  - Pending bytes in local engine.
-  - Sink backlog size.
-  - Recent sink failure rate.
-  - Sink latency moving average.
+  - [x] Disk usage high watermark and low watermark.
+  - [x] Pending bytes in local engine.
+  - [x] Sink backlog size.
+  - [x] Recent sink failure rate.
+  - [x] Sink latency moving average.
 
 - Make source pause/resume observable:
-  - Expose current backpressure reason in `/v1/status`.
-  - Add counters for pause duration and dropped UDP records.
+  - [x] Expose current backpressure reason in `/v1/status`.
+  - [x] Add counters for pause duration and dropped UDP records.
 
 ## P2 Record Layout And Query
 

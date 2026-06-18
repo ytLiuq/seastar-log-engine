@@ -5,6 +5,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -117,6 +118,8 @@ struct AgentStats {
     std::atomic<std::uint64_t> sink_retries{0};
     std::atomic<std::uint64_t> sink_backlog_records{0};
     std::atomic<std::uint64_t> last_sink_latency_ms{0};
+    std::atomic<std::uint64_t> sink_latency_average_ms{0};
+    std::atomic<std::uint64_t> backpressure_pause_duration_ms{0};
     std::atomic<std::uint64_t> disk_backpressure{0};
     std::atomic<std::uint64_t> dynamic_backpressure{0};
 };
@@ -126,13 +129,15 @@ struct AgentContext {
     log_engine::EngineConfig engine_config;
     AgentStats stats;
     std::size_t max_request_bytes = 1024 * 1024;
+    std::string current_backpressure_reason;
+    std::chrono::steady_clock::time_point backpressure_pause_started;
 
     std::string render_status_json() const {
         const auto health_snapshot = log_engine::collect_health_snapshot();
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"source_dropped\":{},\"udp_dropped\":{},\"malformed_ingest\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"source_dropped\":{},\"udp_dropped\":{},\"malformed_ingest\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"sink_latency_average_ms\":{},\"current_backpressure_reason\":\"{}\",\"backpressure_pause_duration_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
@@ -147,6 +152,9 @@ struct AgentContext {
             stats.sink_retries.load(std::memory_order_relaxed),
             stats.sink_backlog_records.load(std::memory_order_relaxed),
             stats.last_sink_latency_ms.load(std::memory_order_relaxed),
+            stats.sink_latency_average_ms.load(std::memory_order_relaxed),
+            json_escape(current_backpressure_reason),
+            stats.backpressure_pause_duration_ms.load(std::memory_order_relaxed),
             stats.disk_backpressure.load(std::memory_order_relaxed),
             stats.dynamic_backpressure.load(std::memory_order_relaxed),
             manager_stats.checkpoint_write_successes,
@@ -203,6 +211,8 @@ struct AgentRuntimeOptions {
     SinkKind sink_kind = SinkKind::none;
     std::string sink_http_url;
     log_engine::agent::HttpPostOptions sink_http_options;
+    log_engine::agent::KafkaSidecarOptions kafka_options;
+    log_engine::agent::ObjectStoreOptions object_store_options;
     std::string delivery_offset_path = "agent-delivery.offset";
     std::string pending_delivery_path = "agent-delivery.pending";
     std::size_t sink_batch_size = 100;
@@ -211,6 +221,8 @@ struct AgentRuntimeOptions {
     std::uint64_t max_sink_backlog_records = 0;
     std::uint64_t max_recent_sink_failures = 0;
     std::uint64_t max_sink_latency_ms = 0;
+    std::uint64_t max_pending_bytes = 0;
+    std::uint64_t max_sink_latency_average_ms = 0;
     log_engine::agent::DiskQuota disk_quota;
 };
 
@@ -275,13 +287,42 @@ log_engine::agent::BackpressureDecision evaluate_agent_backpressure(
     const AgentContext& context,
     const AgentRuntimeOptions& options) {
     log_engine::agent::BackpressureState state;
+    state.pending_bytes = log_engine::agent::directory_size_bytes(context.engine_config.log_dir);
     state.sink_backlog_records = context.stats.sink_backlog_records.load(std::memory_order_relaxed);
     state.recent_sink_failures = context.stats.sink_failed.load(std::memory_order_relaxed);
     state.last_sink_latency_ms = context.stats.last_sink_latency_ms.load(std::memory_order_relaxed);
+    state.sink_latency_average_ms = context.stats.sink_latency_average_ms.load(std::memory_order_relaxed);
     state.max_sink_backlog_records = options.max_sink_backlog_records;
     state.max_recent_sink_failures = options.max_recent_sink_failures;
     state.max_sink_latency_ms = options.max_sink_latency_ms;
+    state.max_pending_bytes = options.max_pending_bytes;
+    state.max_sink_latency_average_ms = options.max_sink_latency_average_ms;
     return log_engine::agent::evaluate_backpressure(context.engine_config.log_dir, options.disk_quota, state);
+}
+
+void update_backpressure_status(AgentContext& context, const log_engine::agent::BackpressureDecision& decision) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!decision.pause) {
+        if (!context.current_backpressure_reason.empty()) {
+            context.stats.backpressure_pause_duration_ms.fetch_add(
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - context.backpressure_pause_started).count()),
+                std::memory_order_relaxed);
+        }
+        context.current_backpressure_reason.clear();
+        return;
+    }
+
+    if (context.current_backpressure_reason != decision.reason) {
+        if (!context.current_backpressure_reason.empty()) {
+            context.stats.backpressure_pause_duration_ms.fetch_add(
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - context.backpressure_pause_started).count()),
+                std::memory_order_relaxed);
+        }
+        context.current_backpressure_reason = decision.reason;
+        context.backpressure_pause_started = now;
+    }
 }
 
 void append_source_lines(
@@ -298,6 +339,7 @@ void append_source_lines(
         return;
     }
     const auto backpressure = evaluate_agent_backpressure(context, options);
+    update_backpressure_status(context, backpressure);
     if (backpressure.pause) {
         if (backpressure.reason == "disk_quota") {
             ++context.stats.disk_backpressure;
@@ -622,30 +664,120 @@ seastar::future<> run_unix_socket_source_loop(
     });
 }
 
-seastar::future<> deliver_batch(
-    const AgentRuntimeOptions& options,
-    const std::optional<log_engine::agent::HttpEndpoint>& endpoint,
-    const log_engine::agent::DeliveryBatch& batch) {
-    switch (options.sink_kind) {
-    case SinkKind::none:
+class AgentSink {
+public:
+    virtual ~AgentSink() = default;
+    virtual seastar::future<> deliver(const log_engine::agent::DeliveryBatch& batch) = 0;
+    virtual std::string name() const = 0;
+};
+
+class NullSink final : public AgentSink {
+public:
+    seastar::future<> deliver(const log_engine::agent::DeliveryBatch&) override {
         return seastar::make_ready_future<>();
-    case SinkKind::stdout:
+    }
+    std::string name() const override {
+        return "none";
+    }
+};
+
+class StdoutSink final : public AgentSink {
+public:
+    seastar::future<> deliver(const log_engine::agent::DeliveryBatch& batch) override {
         log_engine::agent::write_stdout_batch(batch.records);
         return seastar::make_ready_future<>();
-    case SinkKind::http:
-        if (!endpoint) {
-            throw std::runtime_error("sink-kind=http requires sink-http-url");
-        }
-        return log_engine::agent::post_http_batch_async(
-            *endpoint,
-            log_engine::agent::render_delivery_batch_json(options.agent_id, batch),
-            options.sink_http_options);
-    case SinkKind::kafka:
-        throw std::runtime_error("sink-kind=kafka is configured but Kafka sink is not linked in this build");
-    case SinkKind::object_store:
-        throw std::runtime_error("sink-kind=object_store is configured but object store sink is not linked in this build");
     }
-    return seastar::make_ready_future<>();
+    std::string name() const override {
+        return "stdout";
+    }
+};
+
+class HttpSink final : public AgentSink {
+public:
+    HttpSink(
+        std::string agent_id,
+        log_engine::agent::HttpEndpoint endpoint,
+        log_engine::agent::HttpPostOptions options)
+        : _agent_id(std::move(agent_id))
+        , _endpoint(std::move(endpoint))
+        , _options(std::move(options)) {
+    }
+
+    seastar::future<> deliver(const log_engine::agent::DeliveryBatch& batch) override {
+        return log_engine::agent::post_http_batch_async(
+            _endpoint,
+            log_engine::agent::render_delivery_batch_json(_agent_id, batch),
+            _options);
+    }
+    std::string name() const override {
+        return "http";
+    }
+
+private:
+    std::string _agent_id;
+    log_engine::agent::HttpEndpoint _endpoint;
+    log_engine::agent::HttpPostOptions _options;
+};
+
+class KafkaSidecarSink final : public AgentSink {
+public:
+    KafkaSidecarSink(std::string agent_id, log_engine::agent::KafkaSidecarOptions options)
+        : _agent_id(std::move(agent_id))
+        , _options(std::move(options)) {
+    }
+
+    seastar::future<> deliver(const log_engine::agent::DeliveryBatch& batch) override {
+        const auto preview = log_engine::agent::render_kafka_sidecar_batch_json(_agent_id, batch, _options);
+        throw std::runtime_error("sink-kind=kafka requires an external Kafka sidecar in this build; sidecar payload preview: " + preview);
+    }
+    std::string name() const override {
+        return "kafka";
+    }
+
+private:
+    std::string _agent_id;
+    log_engine::agent::KafkaSidecarOptions _options;
+};
+
+class ObjectStoreManifestSink final : public AgentSink {
+public:
+    ObjectStoreManifestSink(std::string agent_id, log_engine::agent::ObjectStoreOptions options)
+        : _agent_id(std::move(agent_id))
+        , _options(std::move(options)) {
+    }
+
+    seastar::future<> deliver(const log_engine::agent::DeliveryBatch& batch) override {
+        const auto manifest = log_engine::agent::render_object_store_manifest_json(_agent_id, batch, _options);
+        throw std::runtime_error("sink-kind=object_store requires an external uploader sidecar in this build; manifest preview: " + manifest);
+    }
+    std::string name() const override {
+        return "object_store";
+    }
+
+private:
+    std::string _agent_id;
+    log_engine::agent::ObjectStoreOptions _options;
+};
+
+std::unique_ptr<AgentSink> make_agent_sink(const AgentRuntimeOptions& options) {
+    switch (options.sink_kind) {
+    case SinkKind::none:
+        return std::make_unique<NullSink>();
+    case SinkKind::stdout:
+        return std::make_unique<StdoutSink>();
+    case SinkKind::http: {
+        auto endpoint = log_engine::agent::parse_http_endpoint(options.sink_http_url);
+        if (!endpoint) {
+            throw std::invalid_argument("sink-kind=http requires a valid http:// sink-http-url; use a local TLS proxy for https endpoints");
+        }
+        return std::make_unique<HttpSink>(options.agent_id, *endpoint, options.sink_http_options);
+    }
+    case SinkKind::kafka:
+        return std::make_unique<KafkaSidecarSink>(options.agent_id, options.kafka_options);
+    case SinkKind::object_store:
+        return std::make_unique<ObjectStoreManifestSink>(options.agent_id, options.object_store_options);
+    }
+    return std::make_unique<NullSink>();
 }
 
 seastar::future<> run_http_sink_loop(
@@ -655,12 +787,9 @@ seastar::future<> run_http_sink_loop(
     if (options.sink_kind == SinkKind::none) {
         return seastar::make_ready_future<>();
     }
-    auto endpoint = log_engine::agent::parse_http_endpoint(options.sink_http_url);
-    if (options.sink_kind == SinkKind::http && !endpoint) {
-        throw std::invalid_argument("sink-kind=http requires a valid http:// sink-http-url");
-    }
 
-    return seastar::async([&context, options = std::move(options), endpoint, &stopping] {
+    return seastar::async([&context, options = std::move(options), &stopping] {
+        auto sink = make_agent_sink(options);
         std::map<unsigned, std::uint64_t> next_by_shard;
         for (const auto& offset : log_engine::agent::load_delivery_offsets(options.delivery_offset_path)) {
             next_by_shard[offset.shard] = offset.next_sequence;
@@ -710,10 +839,14 @@ seastar::future<> run_http_sink_loop(
                 }
 
                 const auto start = std::chrono::steady_clock::now();
-                deliver_batch(options, endpoint, *pending).get();
+                sink->deliver(*pending).get();
                 const auto end = std::chrono::steady_clock::now();
-                context.stats.last_sink_latency_ms.store(
-                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()),
+                const auto latency_ms = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+                context.stats.last_sink_latency_ms.store(latency_ms, std::memory_order_relaxed);
+                const auto previous_average = context.stats.sink_latency_average_ms.load(std::memory_order_relaxed);
+                context.stats.sink_latency_average_ms.store(
+                    previous_average == 0 ? latency_ms : ((previous_average * 7) + latency_ms) / 8,
                     std::memory_order_relaxed);
 
                 next_by_shard[pending->shard] = pending->next_sequence;
@@ -858,6 +991,11 @@ int main(int argc, char** argv) {
         ("sink-http-headers", bpo::value<std::string>()->default_value(""), "Semicolon-separated HTTP sink headers, e.g. Authorization: Bearer token; X-Agent: edge")
         ("sink-http-timeout-ms", bpo::value<std::uint64_t>()->default_value(5000), "HTTP sink request timeout in milliseconds, 0 disables timeout")
         ("sink-http-retryable-statuses", bpo::value<std::string>()->default_value("408,425,429,500,502,503,504"), "Comma-separated HTTP sink status codes treated as retryable")
+        ("kafka-topic", bpo::value<std::string>()->default_value("logs"), "Kafka sidecar topic metadata when sink-kind=kafka")
+        ("kafka-bootstrap-servers", bpo::value<std::string>()->default_value(""), "Kafka sidecar bootstrap metadata when sink-kind=kafka")
+        ("object-store-bucket", bpo::value<std::string>()->default_value(""), "Object-store sidecar bucket metadata when sink-kind=object_store")
+        ("object-store-prefix", bpo::value<std::string>()->default_value("logs"), "Object-store deterministic object name prefix")
+        ("object-store-compression", bpo::value<std::string>()->default_value("none"), "Object-store sidecar compression metadata")
         ("delivery-offset-path", bpo::value<std::string>()->default_value("agent-delivery.offset"), "HTTP sink delivery offset checkpoint")
         ("pending-delivery-path", bpo::value<std::string>()->default_value("agent-delivery.pending"), "Durable pending sink batch file")
         ("sink-batch-size", bpo::value<std::size_t>()->default_value(100), "HTTP sink batch size")
@@ -866,6 +1004,8 @@ int main(int argc, char** argv) {
         ("max-sink-backlog-records", bpo::value<std::uint64_t>()->default_value(0), "Pause sources when sink backlog reaches this many records")
         ("max-recent-sink-failures", bpo::value<std::uint64_t>()->default_value(0), "Pause sources after this many sink failures")
         ("max-sink-latency-ms", bpo::value<std::uint64_t>()->default_value(0), "Pause sources when latest sink latency reaches this value")
+        ("max-pending-agent-bytes", bpo::value<std::uint64_t>()->default_value(0), "Pause sources when local agent log bytes reach this value")
+        ("max-sink-latency-average-ms", bpo::value<std::uint64_t>()->default_value(0), "Pause sources when moving average sink latency reaches this value")
         ("max-buffer-bytes", bpo::value<std::uint64_t>()->default_value(0), "Pause file source when log buffer reaches this size")
         ("resume-buffer-bytes", bpo::value<std::uint64_t>()->default_value(0), "Resume file source when log buffer drops to this size");
 
@@ -966,6 +1106,16 @@ int main(int argc, char** argv) {
                     file_values,
                     "sink-http-retryable-statuses",
                     options["sink-http-retryable-statuses"].as<std::string>()));
+            runtime_options.kafka_options.topic = log_engine::resolve_string_option(
+                options, file_values, "kafka-topic", options["kafka-topic"].as<std::string>());
+            runtime_options.kafka_options.bootstrap_servers = log_engine::resolve_string_option(
+                options, file_values, "kafka-bootstrap-servers", options["kafka-bootstrap-servers"].as<std::string>());
+            runtime_options.object_store_options.bucket = log_engine::resolve_string_option(
+                options, file_values, "object-store-bucket", options["object-store-bucket"].as<std::string>());
+            runtime_options.object_store_options.prefix = log_engine::resolve_string_option(
+                options, file_values, "object-store-prefix", options["object-store-prefix"].as<std::string>());
+            runtime_options.object_store_options.compression = log_engine::resolve_string_option(
+                options, file_values, "object-store-compression", options["object-store-compression"].as<std::string>());
             runtime_options.delivery_offset_path = log_engine::resolve_string_option(
                 options, file_values, "delivery-offset-path", options["delivery-offset-path"].as<std::string>());
             runtime_options.pending_delivery_path = log_engine::resolve_string_option(
@@ -982,6 +1132,10 @@ int main(int argc, char** argv) {
                 options, file_values, "max-recent-sink-failures", options["max-recent-sink-failures"].as<std::uint64_t>());
             runtime_options.max_sink_latency_ms = log_engine::resolve_u64_option(
                 options, file_values, "max-sink-latency-ms", options["max-sink-latency-ms"].as<std::uint64_t>());
+            runtime_options.max_pending_bytes = log_engine::resolve_u64_option(
+                options, file_values, "max-pending-agent-bytes", options["max-pending-agent-bytes"].as<std::uint64_t>());
+            runtime_options.max_sink_latency_average_ms = log_engine::resolve_u64_option(
+                options, file_values, "max-sink-latency-average-ms", options["max-sink-latency-average-ms"].as<std::uint64_t>());
             runtime_options.disk_quota.max_buffer_bytes = log_engine::resolve_u64_option(
                 options, file_values, "max-buffer-bytes", options["max-buffer-bytes"].as<std::uint64_t>());
             runtime_options.disk_quota.resume_buffer_bytes = log_engine::resolve_u64_option(

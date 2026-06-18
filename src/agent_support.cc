@@ -844,6 +844,9 @@ BackpressureDecision evaluate_backpressure(const std::string& path, const DiskQu
     if (quota.max_buffer_bytes > 0 && disk_bytes >= quota.max_buffer_bytes) {
         return BackpressureDecision{.pause = true, .reason = "disk_quota"};
     }
+    if (state.max_pending_bytes > 0 && state.pending_bytes >= state.max_pending_bytes) {
+        return BackpressureDecision{.pause = true, .reason = "pending_bytes"};
+    }
     if (state.max_sink_backlog_records > 0 && state.sink_backlog_records >= state.max_sink_backlog_records) {
         return BackpressureDecision{.pause = true, .reason = "sink_backlog"};
     }
@@ -852,6 +855,9 @@ BackpressureDecision evaluate_backpressure(const std::string& path, const DiskQu
     }
     if (state.max_sink_latency_ms > 0 && state.last_sink_latency_ms >= state.max_sink_latency_ms) {
         return BackpressureDecision{.pause = true, .reason = "sink_latency"};
+    }
+    if (state.max_sink_latency_average_ms > 0 && state.sink_latency_average_ms >= state.max_sink_latency_average_ms) {
+        return BackpressureDecision{.pause = true, .reason = "sink_latency_average"};
     }
     return BackpressureDecision{};
 }
@@ -1160,6 +1166,63 @@ std::string render_agent_record_envelope(const AgentRecordEnvelope& record) {
         body += "}";
     }
     body += "}";
+    return body;
+}
+
+std::string render_kafka_sidecar_batch_json(
+    std::string_view agent_id,
+    const DeliveryBatch& batch,
+    const KafkaSidecarOptions& options) {
+    std::string body = "{";
+    body += "\"sink\":\"kafka_sidecar\"";
+    body += ",\"agent_id\":\"";
+    body += json_escape(agent_id);
+    body += "\",\"topic\":\"";
+    body += json_escape(options.topic);
+    body += "\",\"bootstrap_servers\":\"";
+    body += json_escape(options.bootstrap_servers);
+    body += "\",\"key\":\"";
+    body += json_escape(std::to_string(batch.shard) + ":" + std::to_string(batch.first_sequence));
+    body += "\",\"headers\":{";
+    body += "\"shard\":\"";
+    body += std::to_string(batch.shard);
+    body += "\",\"first_sequence\":\"";
+    body += std::to_string(batch.first_sequence);
+    body += "\",\"next_sequence\":\"";
+    body += std::to_string(batch.next_sequence);
+    body += "\"},\"payload\":";
+    body += render_delivery_batch_json(agent_id, batch);
+    body += "}";
+    return body;
+}
+
+std::string render_object_store_manifest_json(
+    std::string_view agent_id,
+    const DeliveryBatch& batch,
+    const ObjectStoreOptions& options) {
+    const auto object_name = options.prefix + "/shard-" + std::to_string(batch.shard) +
+        "/" + std::to_string(batch.first_sequence) + "-" + std::to_string(batch.next_sequence) + ".json";
+    std::string body = "{";
+    body += "\"sink\":\"object_store\"";
+    body += ",\"agent_id\":\"";
+    body += json_escape(agent_id);
+    body += "\",\"bucket\":\"";
+    body += json_escape(options.bucket);
+    body += "\",\"object_name\":\"";
+    body += json_escape(object_name);
+    body += "\",\"compression\":\"";
+    body += json_escape(options.compression);
+    body += "\",\"shard\":";
+    body += std::to_string(batch.shard);
+    body += ",\"first_sequence\":";
+    body += std::to_string(batch.first_sequence);
+    body += ",\"next_sequence\":";
+    body += std::to_string(batch.next_sequence);
+    body += ",\"record_count\":";
+    body += std::to_string(batch.records.size());
+    body += ",\"commit_marker\":\"";
+    body += json_escape(object_name + ".commit");
+    body += "\"}";
     return body;
 }
 
