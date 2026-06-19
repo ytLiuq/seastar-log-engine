@@ -2,6 +2,7 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -17,6 +18,8 @@
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/future-util.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
@@ -117,6 +120,8 @@ struct AgentStats {
     std::atomic<std::uint64_t> sink_failed{0};
     std::atomic<std::uint64_t> sink_retries{0};
     std::atomic<std::uint64_t> sink_backlog_records{0};
+    std::atomic<std::uint64_t> sink_dispatch_queue_batches{0};
+    std::atomic<std::uint64_t> sink_dispatch_active_workers{0};
     std::atomic<std::uint64_t> last_sink_latency_ms{0};
     std::atomic<std::uint64_t> sink_latency_average_ms{0};
     std::atomic<std::uint64_t> backpressure_pause_duration_ms{0};
@@ -137,7 +142,7 @@ struct AgentContext {
         const auto health = log_engine::compute_health_status(health_snapshot);
         const auto manager_stats = log_engine::get_log_manager_stats();
         return fmt::format(
-            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"source_dropped\":{},\"udp_dropped\":{},\"malformed_ingest\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"last_sink_latency_ms\":{},\"sink_latency_average_ms\":{},\"current_backpressure_reason\":\"{}\",\"backpressure_pause_duration_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
+            "{{\"health\":\"{}\",\"accepted\":{},\"rejected\":{},\"source_read\":{},\"source_committed\":{},\"source_rotations\":{},\"source_dropped\":{},\"udp_dropped\":{},\"malformed_ingest\":{},\"sink_sent\":{},\"sink_failed\":{},\"sink_retries\":{},\"sink_backlog_records\":{},\"sink_dispatch_queue_batches\":{},\"sink_dispatch_active_workers\":{},\"last_sink_latency_ms\":{},\"sink_latency_average_ms\":{},\"current_backpressure_reason\":\"{}\",\"backpressure_pause_duration_ms\":{},\"disk_backpressure\":{},\"dynamic_backpressure\":{},\"checkpoint_write_successes\":{},\"checkpoint_write_failures\":{},\"recovery_fallbacks\":{},\"recovery_from_checkpoints\":{},\"recovery_full_scans\":{},\"recovery_empty_files\":{},\"last_recovery_fallback_reason\":\"{}\"}}",
             log_engine::health_status_to_string(health),
             stats.accepted.load(std::memory_order_relaxed),
             stats.rejected.load(std::memory_order_relaxed),
@@ -151,6 +156,8 @@ struct AgentContext {
             stats.sink_failed.load(std::memory_order_relaxed),
             stats.sink_retries.load(std::memory_order_relaxed),
             stats.sink_backlog_records.load(std::memory_order_relaxed),
+            stats.sink_dispatch_queue_batches.load(std::memory_order_relaxed),
+            stats.sink_dispatch_active_workers.load(std::memory_order_relaxed),
             stats.last_sink_latency_ms.load(std::memory_order_relaxed),
             stats.sink_latency_average_ms.load(std::memory_order_relaxed),
             json_escape(current_backpressure_reason),
@@ -216,6 +223,9 @@ struct AgentRuntimeOptions {
     std::string delivery_offset_path = "agent-delivery.offset";
     std::string pending_delivery_path = "agent-delivery.pending";
     std::size_t sink_batch_size = 100;
+    std::size_t sink_dispatcher_concurrency = 4;
+    std::size_t sink_dispatch_queue_capacity = 64;
+    std::size_t delivery_scan_idle_ms = 100;
     std::size_t sink_retry_backoff_ms = 1000;
     std::size_t sink_retry_max_backoff_ms = 30000;
     std::uint64_t max_sink_backlog_records = 0;
@@ -780,95 +790,196 @@ std::unique_ptr<AgentSink> make_agent_sink(const AgentRuntimeOptions& options) {
     return std::make_unique<NullSink>();
 }
 
-seastar::future<> run_http_sink_loop(
-    AgentContext& context,
-    AgentRuntimeOptions options,
-    std::atomic<bool>& stopping) {
-    if (options.sink_kind == SinkKind::none) {
-        return seastar::make_ready_future<>();
+struct DeliveryWork {
+    log_engine::agent::DeliveryBatch batch;
+    seastar::promise<> completion;
+};
+
+class DeliveryDispatcher {
+public:
+    DeliveryDispatcher(
+        AgentContext& context,
+        AgentRuntimeOptions options,
+        std::atomic<bool>& stopping)
+        : _context(context)
+        , _options(std::move(options))
+        , _stopping(stopping) {
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
-        auto sink = make_agent_sink(options);
-        std::map<unsigned, std::uint64_t> next_by_shard;
-        for (const auto& offset : log_engine::agent::load_delivery_offsets(options.delivery_offset_path)) {
-            next_by_shard[offset.shard] = offset.next_sequence;
+    void start() {
+        _workers.reserve(_options.sink_dispatcher_concurrency);
+        for (std::size_t index = 0; index < _options.sink_dispatcher_concurrency; ++index) {
+            _workers.push_back(run_worker());
         }
-        for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
-            next_by_shard.try_emplace(shard, 0);
+    }
+
+    seastar::future<> submit(log_engine::agent::DeliveryBatch batch) {
+        auto work = std::make_unique<DeliveryWork>();
+        work->batch = std::move(batch);
+        auto completion = work->completion.get_future();
+
+        co_await _queue_not_full.wait([this] {
+            return _stopping.load(std::memory_order_relaxed) ||
+                _queue.size() < _options.sink_dispatch_queue_capacity;
+        });
+        if (_stopping.load(std::memory_order_relaxed)) {
+            throw std::runtime_error("delivery dispatcher is stopping");
         }
 
-        auto pending = log_engine::agent::load_pending_delivery_batch(options.pending_delivery_path);
-        std::size_t current_backoff_ms = options.sink_retry_backoff_ms;
-        while (!stopping.load(std::memory_order_relaxed)) {
+        _context.stats.sink_backlog_records.fetch_add(work->batch.records.size(), std::memory_order_relaxed);
+        _queue.push_back(std::move(work));
+        _context.stats.sink_dispatch_queue_batches.store(_queue.size(), std::memory_order_relaxed);
+        _queue_not_empty.broadcast();
+        co_await std::move(completion);
+    }
+
+    seastar::future<> stop() {
+        _queue_not_empty.broadcast();
+        _queue_not_full.broadcast();
+        if (!_workers.empty()) {
+            co_await seastar::when_all_succeed(_workers.begin(), _workers.end());
+        }
+    }
+
+private:
+    seastar::future<> run_worker() {
+        auto sink = make_agent_sink(_options);
+        while (true) {
+            co_await _queue_not_empty.wait([this] {
+                return _stopping.load(std::memory_order_relaxed) || !_queue.empty();
+            });
+            if (_queue.empty()) {
+                if (_stopping.load(std::memory_order_relaxed)) {
+                    co_return;
+                }
+                continue;
+            }
+
+            auto work = std::move(_queue.front());
+            _queue.pop_front();
+            _context.stats.sink_dispatch_queue_batches.store(_queue.size(), std::memory_order_relaxed);
+            _queue_not_full.broadcast();
+
+            const auto record_count = work->batch.records.size();
+            const auto start = std::chrono::steady_clock::now();
+            _context.stats.sink_dispatch_active_workers.fetch_add(1, std::memory_order_relaxed);
             try {
-                if (!pending) {
-                    for (unsigned shard = 0; shard < seastar::smp::count && !pending; ++shard) {
-                        log_engine::ReadQuery query;
-                        query.include_archive = true;
-                        query.limit = options.sink_batch_size;
-                        query.shard = shard;
-                        query.seq_from = next_by_shard[shard];
-                        const auto segments = log_engine::collect_segments(context.engine_config, query);
-                        const auto records = log_engine::read_records(segments, query);
-                        if (records.empty()) {
-                            continue;
-                        }
-
-                        log_engine::agent::DeliveryBatch batch;
-                        batch.shard = shard;
-                        batch.first_sequence = next_by_shard[shard];
-                        batch.next_sequence = next_by_shard[shard];
-                        batch.records.reserve(records.size());
-                        for (const auto& record : records) {
-                            batch.records.push_back(record.payload);
-                            if (record.has_sequence) {
-                                batch.next_sequence = std::max(batch.next_sequence, record.sequence + 1);
-                            }
-                        }
-                        pending = std::move(batch);
-                        log_engine::agent::store_pending_delivery_batch(options.pending_delivery_path, *pending);
-                        context.stats.sink_backlog_records.store(pending->records.size(), std::memory_order_relaxed);
-                    }
-                }
-
-                if (!pending) {
-                    context.stats.sink_backlog_records.store(0, std::memory_order_relaxed);
-                    seastar::sleep(std::chrono::milliseconds(options.sink_retry_backoff_ms)).get();
-                    continue;
-                }
-
-                const auto start = std::chrono::steady_clock::now();
-                sink->deliver(*pending).get();
-                const auto end = std::chrono::steady_clock::now();
+                co_await sink->deliver(work->batch);
                 const auto latency_ms = static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-                context.stats.last_sink_latency_ms.store(latency_ms, std::memory_order_relaxed);
-                const auto previous_average = context.stats.sink_latency_average_ms.load(std::memory_order_relaxed);
-                context.stats.sink_latency_average_ms.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start).count());
+                _context.stats.last_sink_latency_ms.store(latency_ms, std::memory_order_relaxed);
+                const auto previous_average = _context.stats.sink_latency_average_ms.load(std::memory_order_relaxed);
+                _context.stats.sink_latency_average_ms.store(
                     previous_average == 0 ? latency_ms : ((previous_average * 7) + latency_ms) / 8,
                     std::memory_order_relaxed);
-
-                next_by_shard[pending->shard] = pending->next_sequence;
-                std::vector<log_engine::agent::DeliveryOffset> offsets;
-                offsets.reserve(next_by_shard.size());
-                for (const auto& [shard, next] : next_by_shard) {
-                    offsets.push_back(log_engine::agent::DeliveryOffset{.shard = shard, .next_sequence = next});
-                }
-                log_engine::agent::store_delivery_offsets(options.delivery_offset_path, offsets);
-                log_engine::agent::remove_pending_delivery_batch(options.pending_delivery_path);
-                context.stats.sink_sent.fetch_add(pending->records.size(), std::memory_order_relaxed);
-                context.stats.sink_backlog_records.store(0, std::memory_order_relaxed);
-                pending.reset();
-                current_backoff_ms = options.sink_retry_backoff_ms;
+                _context.stats.sink_sent.fetch_add(record_count, std::memory_order_relaxed);
+                work->completion.set_value();
             } catch (...) {
-                ++context.stats.sink_failed;
-                ++context.stats.sink_retries;
-                seastar::sleep(std::chrono::milliseconds(current_backoff_ms)).get();
-                current_backoff_ms = std::min(current_backoff_ms * 2, options.sink_retry_max_backoff_ms);
+                ++_context.stats.sink_failed;
+                ++_context.stats.sink_retries;
+                work->completion.set_exception(std::current_exception());
             }
+            _context.stats.sink_dispatch_active_workers.fetch_sub(1, std::memory_order_relaxed);
+            _context.stats.sink_backlog_records.fetch_sub(record_count, std::memory_order_relaxed);
         }
-    });
+    }
+
+private:
+    AgentContext& _context;
+    AgentRuntimeOptions _options;
+    std::atomic<bool>& _stopping;
+    std::deque<std::unique_ptr<DeliveryWork>> _queue;
+    seastar::condition_variable _queue_not_empty;
+    seastar::condition_variable _queue_not_full;
+    std::vector<seastar::future<>> _workers;
+};
+
+seastar::future<> migrate_legacy_pending_delivery(const AgentRuntimeOptions& options) {
+    const auto legacy =
+        co_await log_engine::agent::load_pending_delivery_batch_async(options.pending_delivery_path);
+    if (!legacy) {
+        co_return;
+    }
+    const auto shard_path = log_engine::agent::shard_state_path(options.pending_delivery_path, legacy->shard);
+    if (co_await log_engine::agent::load_pending_delivery_batch_async(shard_path)) {
+        throw std::runtime_error("both legacy and per-shard pending delivery files exist");
+    }
+    co_await log_engine::agent::store_pending_delivery_batch_async(shard_path, *legacy);
+    co_await log_engine::agent::remove_pending_delivery_batch_async(options.pending_delivery_path);
+}
+
+seastar::future<> run_shard_delivery_scanner(
+    log_engine::EngineConfig config,
+    AgentRuntimeOptions options,
+    unsigned shard,
+    unsigned dispatcher_shard,
+    DeliveryDispatcher* dispatcher,
+    std::atomic<bool>& stopping,
+    std::uint64_t legacy_next_sequence) {
+    const auto offset_path = log_engine::agent::shard_state_path(options.delivery_offset_path, shard);
+    const auto pending_path = log_engine::agent::shard_state_path(options.pending_delivery_path, shard);
+    auto next_sequence = legacy_next_sequence;
+    if (const auto offset = co_await log_engine::agent::load_delivery_offset_async(offset_path)) {
+        if (offset->shard != shard) {
+            throw std::runtime_error("delivery offset shard does not match scanner shard");
+        }
+        next_sequence = offset->next_sequence;
+    }
+    auto pending = co_await log_engine::agent::load_pending_delivery_batch_async(pending_path);
+    if (pending && pending->shard != shard) {
+        throw std::runtime_error("pending delivery shard does not match scanner shard");
+    }
+    std::size_t current_backoff_ms = options.sink_retry_backoff_ms;
+
+    while (!stopping.load(std::memory_order_relaxed)) {
+        std::exception_ptr delivery_error;
+        try {
+            if (!pending) {
+                log_engine::ReadQuery query;
+                query.include_archive = true;
+                query.limit = options.sink_batch_size;
+                query.shard = shard;
+                query.seq_from = next_sequence;
+                const auto segments = log_engine::collect_segments(config, query);
+                const auto records = co_await log_engine::read_records_async(segments, query);
+                if (records.empty()) {
+                    co_await seastar::sleep(std::chrono::milliseconds(options.delivery_scan_idle_ms));
+                    continue;
+                }
+                pending =
+                    log_engine::agent::build_delivery_batch_from_records(records, shard, next_sequence);
+                co_await log_engine::agent::store_pending_delivery_batch_async(pending_path, *pending);
+            }
+
+            co_await seastar::smp::submit_to(
+                dispatcher_shard,
+                [dispatcher, batch = *pending] () mutable {
+                    return dispatcher->submit(std::move(batch));
+                });
+
+            next_sequence = pending->next_sequence;
+            co_await log_engine::agent::store_delivery_offset_async(
+                offset_path,
+                log_engine::agent::DeliveryOffset{
+                    .shard = shard,
+                    .next_sequence = next_sequence,
+                });
+            co_await log_engine::agent::remove_pending_delivery_batch_async(pending_path);
+            pending.reset();
+            current_backoff_ms = options.sink_retry_backoff_ms;
+        } catch (...) {
+            delivery_error = std::current_exception();
+        }
+        if (delivery_error) {
+            if (stopping.load(std::memory_order_relaxed)) {
+                break;
+            }
+            co_await seastar::sleep(std::chrono::milliseconds(current_backoff_ms));
+            current_backoff_ms =
+                std::min(current_backoff_ms * 2, options.sink_retry_max_backoff_ms);
+        }
+    }
 }
 
 void set_agent_routes(seastar::httpd::routes& routes, AgentContext& context) {
@@ -999,6 +1110,9 @@ int main(int argc, char** argv) {
         ("delivery-offset-path", bpo::value<std::string>()->default_value("agent-delivery.offset"), "HTTP sink delivery offset checkpoint")
         ("pending-delivery-path", bpo::value<std::string>()->default_value("agent-delivery.pending"), "Durable pending sink batch file")
         ("sink-batch-size", bpo::value<std::size_t>()->default_value(100), "HTTP sink batch size")
+        ("sink-dispatcher-concurrency", bpo::value<std::size_t>()->default_value(4), "Concurrent sink dispatcher workers")
+        ("sink-dispatch-queue-capacity", bpo::value<std::size_t>()->default_value(64), "Maximum batches queued for sink dispatch")
+        ("delivery-scan-idle-ms", bpo::value<std::size_t>()->default_value(100), "Idle delay for each shard delivery scanner")
         ("sink-retry-backoff-ms", bpo::value<std::size_t>()->default_value(1000), "HTTP sink idle/retry backoff")
         ("sink-retry-max-backoff-ms", bpo::value<std::size_t>()->default_value(30000), "HTTP sink max retry backoff")
         ("max-sink-backlog-records", bpo::value<std::uint64_t>()->default_value(0), "Pause sources when sink backlog reaches this many records")
@@ -1122,6 +1236,21 @@ int main(int argc, char** argv) {
                 options, file_values, "pending-delivery-path", options["pending-delivery-path"].as<std::string>());
             runtime_options.sink_batch_size = log_engine::resolve_size_option(
                 options, file_values, "sink-batch-size", options["sink-batch-size"].as<std::size_t>());
+            runtime_options.sink_dispatcher_concurrency = log_engine::resolve_size_option(
+                options,
+                file_values,
+                "sink-dispatcher-concurrency",
+                options["sink-dispatcher-concurrency"].as<std::size_t>());
+            runtime_options.sink_dispatch_queue_capacity = log_engine::resolve_size_option(
+                options,
+                file_values,
+                "sink-dispatch-queue-capacity",
+                options["sink-dispatch-queue-capacity"].as<std::size_t>());
+            runtime_options.delivery_scan_idle_ms = log_engine::resolve_size_option(
+                options,
+                file_values,
+                "delivery-scan-idle-ms",
+                options["delivery-scan-idle-ms"].as<std::size_t>());
             runtime_options.sink_retry_backoff_ms = log_engine::resolve_size_option(
                 options, file_values, "sink-retry-backoff-ms", options["sink-retry-backoff-ms"].as<std::size_t>());
             runtime_options.sink_retry_max_backoff_ms = log_engine::resolve_size_option(
@@ -1140,6 +1269,17 @@ int main(int argc, char** argv) {
                 options, file_values, "max-buffer-bytes", options["max-buffer-bytes"].as<std::uint64_t>());
             runtime_options.disk_quota.resume_buffer_bytes = log_engine::resolve_u64_option(
                 options, file_values, "resume-buffer-bytes", options["resume-buffer-bytes"].as<std::uint64_t>());
+            if (runtime_options.sink_kind != SinkKind::none) {
+                if (runtime_options.sink_dispatcher_concurrency == 0) {
+                    throw std::invalid_argument("sink-dispatcher-concurrency must be greater than zero");
+                }
+                if (runtime_options.sink_dispatch_queue_capacity == 0) {
+                    throw std::invalid_argument("sink-dispatch-queue-capacity must be greater than zero");
+                }
+                if (runtime_options.delivery_scan_idle_ms == 0) {
+                    throw std::invalid_argument("delivery-scan-idle-ms must be greater than zero");
+                }
+            }
 
             log_engine::register_health_metrics();
             auto unregister_health_metrics = seastar::defer([] () noexcept {
@@ -1174,16 +1314,60 @@ int main(int argc, char** argv) {
             auto tcp_source_done = run_tcp_source_loop(context, runtime_options, stopping);
             auto udp_source_done = run_udp_source_loop(context, runtime_options, stopping);
             auto unix_source_done = run_unix_socket_source_loop(context, runtime_options, stopping);
-            auto sink_done = run_http_sink_loop(context, runtime_options, stopping);
+
+            const auto dispatcher_shard = seastar::this_shard_id();
+            std::optional<DeliveryDispatcher> dispatcher;
+            std::vector<seastar::future<>> delivery_scanners;
+            if (runtime_options.sink_kind != SinkKind::none) {
+                migrate_legacy_pending_delivery(runtime_options).get();
+                std::map<unsigned, std::uint64_t> legacy_next_by_shard;
+                for (const auto& offset : log_engine::agent::load_delivery_offsets_file_async(
+                         runtime_options.delivery_offset_path).get()) {
+                    legacy_next_by_shard[offset.shard] = offset.next_sequence;
+                }
+
+                dispatcher.emplace(context, runtime_options, stopping);
+                dispatcher->start();
+                delivery_scanners.reserve(seastar::smp::count);
+                for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
+                    const auto legacy_next = legacy_next_by_shard.contains(shard)
+                        ? legacy_next_by_shard[shard]
+                        : 0;
+                    delivery_scanners.push_back(seastar::smp::submit_to(
+                        shard,
+                        [
+                            config,
+                            runtime_options,
+                            shard,
+                            dispatcher_shard,
+                            dispatcher_ptr = &*dispatcher,
+                            &stopping,
+                            legacy_next] () mutable {
+                            return run_shard_delivery_scanner(
+                                std::move(config),
+                                std::move(runtime_options),
+                                shard,
+                                dispatcher_shard,
+                                dispatcher_ptr,
+                                stopping,
+                                legacy_next);
+                        }));
+                }
+            }
 
             stop_signal.wait().get();
             stopping.store(true, std::memory_order_relaxed);
+            if (dispatcher) {
+                dispatcher->stop().get();
+            }
+            if (!delivery_scanners.empty()) {
+                seastar::when_all_succeed(delivery_scanners.begin(), delivery_scanners.end()).get();
+            }
             file_source_done.get();
             stdin_source_done.get();
             tcp_source_done.get();
             udp_source_done.get();
             unix_source_done.get();
-            sink_done.get();
         });
     });
 }

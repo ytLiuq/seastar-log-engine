@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include <seastar/core/future.hh>
 #include <seastar/core/metrics_registration.hh>
 
 #include "log_engine/config.hh"
@@ -38,6 +39,9 @@ struct ReaderStats {
 
 std::vector<layout::SegmentDescriptor> collect_segments(const EngineConfig& config, const ReadQuery& query);
 std::vector<ParsedRecord> read_records(const std::vector<layout::SegmentDescriptor>& segments, const ReadQuery& query);
+seastar::future<std::vector<ParsedRecord>> read_records_async(
+    const std::vector<layout::SegmentDescriptor>& segments,
+    const ReadQuery& query);
 ReaderStats get_reader_stats() noexcept;
 void reset_reader_stats() noexcept;
 void register_reader_metrics();

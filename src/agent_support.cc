@@ -1,16 +1,20 @@
 #include "log_engine/agent_support.hh"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 #include <glob.h>
 #include <sys/socket.h>
@@ -19,8 +23,10 @@
 #include <netdb.h>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/dns.hh>
@@ -382,14 +388,10 @@ std::uint64_t parse_u64(std::string_view value, const char* field) {
     return parsed;
 }
 
-std::map<std::string, std::string> load_kv_file(const std::string& path) {
-    std::ifstream in(path);
-    if (!in.good()) {
-        return {};
-    }
-
+std::map<std::string, std::string> parse_kv_text(std::string_view content) {
     std::map<std::string, std::string> values;
     std::string line;
+    std::istringstream in{std::string(content)};
     while (std::getline(in, line)) {
         const auto pos = line.find('=');
         if (pos == std::string::npos) {
@@ -398,6 +400,16 @@ std::map<std::string, std::string> load_kv_file(const std::string& path) {
         values[line.substr(0, pos)] = line.substr(pos + 1);
     }
     return values;
+}
+
+std::map<std::string, std::string> load_kv_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return {};
+    }
+    return parse_kv_text(std::string(
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()));
 }
 
 void store_text_file(const std::string& path, const std::string& content) {
@@ -419,6 +431,103 @@ void store_text_file(const std::string& path, const std::string& content) {
         }
     }
     fs::rename(tmp, target);
+}
+
+seastar::future<std::optional<std::string>> load_text_file_async(const std::string& path) {
+    if (!co_await seastar::file_exists(path)) {
+        co_return std::nullopt;
+    }
+
+    seastar::file file;
+    try {
+        file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+    } catch (const std::system_error& ex) {
+        if (ex.code().value() == ENOENT) {
+            co_return std::nullopt;
+        }
+        throw;
+    }
+
+    auto input = seastar::make_file_input_stream(
+        file,
+        seastar::file_input_stream_options{
+            .buffer_size = 16 * 1024,
+            .read_ahead = 1,
+        });
+    std::string content;
+    std::exception_ptr read_error;
+    try {
+        while (auto buffer = co_await input.read()) {
+            content.append(buffer.get(), buffer.size());
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    co_await input.close().handle_exception([] (std::exception_ptr) {});
+    co_await file.close();
+    if (read_error) {
+        std::rethrow_exception(read_error);
+    }
+    co_return content;
+}
+
+seastar::future<> remove_file_if_exists_async(const std::string& path);
+
+seastar::future<> store_text_file_async(const std::string& path, const std::string& content) {
+    const fs::path target(path);
+    if (target.has_parent_path()) {
+        co_await seastar::recursive_touch_directory(target.parent_path().string());
+    }
+
+    const auto tmp = target.string() + ".tmp";
+    auto file = co_await seastar::open_file_dma(
+        tmp,
+        seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    auto output = co_await seastar::make_file_output_stream(file);
+    std::exception_ptr write_error;
+    try {
+        co_await output.write(content.data(), content.size());
+        co_await output.flush();
+        co_await file.flush();
+    } catch (...) {
+        write_error = std::current_exception();
+    }
+    co_await output.close().handle_exception([&write_error] (std::exception_ptr ep) {
+        if (!write_error) {
+            write_error = ep;
+        }
+    });
+    co_await file.close();
+    if (write_error) {
+        co_await remove_file_if_exists_async(tmp);
+        std::rethrow_exception(write_error);
+    }
+
+    std::exception_ptr rename_error;
+    try {
+        co_await seastar::rename_file(tmp, target.string());
+        co_await seastar::sync_directory(
+            target.has_parent_path() ? target.parent_path().string() : ".");
+    } catch (...) {
+        rename_error = std::current_exception();
+    }
+    if (rename_error) {
+        co_await remove_file_if_exists_async(tmp);
+        std::rethrow_exception(rename_error);
+    }
+}
+
+seastar::future<> remove_file_if_exists_async(const std::string& path) {
+    if (!co_await seastar::file_exists(path)) {
+        co_return;
+    }
+    try {
+        co_await seastar::remove_file(path);
+    } catch (const std::system_error& ex) {
+        if (ex.code().value() != ENOENT) {
+            throw;
+        }
+    }
 }
 
 std::uint64_t inode_of(const std::string& path) {
@@ -578,26 +687,12 @@ void store_source_offset(const std::string& path, const SourceOffset& offset) {
             "offset=" + std::to_string(offset.offset) + "\n");
 }
 
-std::optional<DeliveryOffset> load_delivery_offset(const std::string& path) {
-    const auto offsets = load_delivery_offsets(path);
-    if (!offsets.empty()) {
-        return offsets.front();
-    }
-    return std::nullopt;
-}
+namespace {
 
-void store_delivery_offset(const std::string& path, const DeliveryOffset& offset) {
-    store_delivery_offsets(path, {offset});
-}
-
-std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path) {
-    std::ifstream in(path);
-    if (!in.good()) {
-        return {};
-    }
-
+std::vector<DeliveryOffset> parse_delivery_offsets_text(std::string_view content) {
     std::vector<DeliveryOffset> offsets;
     std::string line;
+    std::istringstream in{std::string(content)};
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             continue;
@@ -610,24 +705,20 @@ std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path) {
             const auto seq_eq = seq_part.find('=');
             if (shard_eq != std::string::npos && seq_eq != std::string::npos) {
                 offsets.push_back(DeliveryOffset{
-                    .shard = static_cast<unsigned>(parse_u64(std::string_view(shard_part).substr(shard_eq + 1), "shard")),
-                    .next_sequence = parse_u64(std::string_view(seq_part).substr(seq_eq + 1), "next_sequence"),
+                    .shard = static_cast<unsigned>(
+                        parse_u64(std::string_view(shard_part).substr(shard_eq + 1), "shard")),
+                    .next_sequence =
+                        parse_u64(std::string_view(seq_part).substr(seq_eq + 1), "next_sequence"),
                 });
             }
             continue;
         }
     }
     if (!offsets.empty()) {
-        std::sort(offsets.begin(), offsets.end(), [] (const auto& lhs, const auto& rhs) {
-            return lhs.shard < rhs.shard;
-        });
         return offsets;
     }
 
-    const auto values = load_kv_file(path);
-    if (values.empty()) {
-        return {};
-    }
+    const auto values = parse_kv_text(content);
     const auto shard_it = values.find("shard");
     const auto sequence_it = values.find("next_sequence");
     if (shard_it == values.end() || sequence_it == values.end()) {
@@ -639,7 +730,17 @@ std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path) {
     }};
 }
 
-void store_delivery_offsets(const std::string& path, const std::vector<DeliveryOffset>& offsets) {
+std::vector<DeliveryOffset> load_delivery_offsets_exact(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return {};
+    }
+    return parse_delivery_offsets_text(std::string(
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()));
+}
+
+std::string render_delivery_offsets(const std::vector<DeliveryOffset>& offsets) {
     std::vector<DeliveryOffset> sorted = offsets;
     std::sort(sorted.begin(), sorted.end(), [] (const auto& lhs, const auto& rhs) {
         return lhs.shard < rhs.shard;
@@ -650,21 +751,115 @@ void store_delivery_offsets(const std::string& path, const std::vector<DeliveryO
         content += "shard=" + std::to_string(offset.shard) +
             ",next_sequence=" + std::to_string(offset.next_sequence) + "\n";
     }
-    store_text_file(path, content);
+    return content;
 }
 
-std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.good()) {
-        return std::nullopt;
+}  // namespace
+
+std::optional<DeliveryOffset> load_delivery_offset(const std::string& path) {
+    const auto offsets = load_delivery_offsets_exact(path);
+    return offsets.empty() ? std::nullopt : std::optional<DeliveryOffset>(offsets.front());
+}
+
+void store_delivery_offset(const std::string& path, const DeliveryOffset& offset) {
+    store_delivery_offsets(path, {offset});
+}
+
+seastar::future<std::optional<DeliveryOffset>> load_delivery_offset_async(const std::string& path) {
+    const auto content = co_await load_text_file_async(path);
+    if (!content) {
+        co_return std::nullopt;
+    }
+    const auto offsets = parse_delivery_offsets_text(*content);
+    co_return offsets.empty()
+        ? std::nullopt
+        : std::optional<DeliveryOffset>(offsets.front());
+}
+
+seastar::future<> store_delivery_offset_async(const std::string& path, const DeliveryOffset& offset) {
+    co_await store_text_file_async(path, render_delivery_offsets({offset}));
+}
+
+seastar::future<std::vector<DeliveryOffset>> load_delivery_offsets_file_async(
+    const std::string& path) {
+    const auto content = co_await load_text_file_async(path);
+    co_return content
+        ? parse_delivery_offsets_text(*content)
+        : std::vector<DeliveryOffset>{};
+}
+
+std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path) {
+    std::map<unsigned, std::uint64_t> next_by_shard;
+    for (const auto& offset : load_delivery_offsets_exact(path)) {
+        next_by_shard[offset.shard] = offset.next_sequence;
     }
 
+    const fs::path base(path);
+    const auto directory = base.has_parent_path() ? base.parent_path() : fs::path(".");
+    const auto prefix = base.filename().string() + ".";
+    std::error_code ec;
+    if (fs::exists(directory, ec)) {
+        for (const auto& entry : fs::directory_iterator(directory, fs::directory_options::skip_permission_denied, ec)) {
+            if (ec || !entry.is_regular_file()) {
+                continue;
+            }
+            const auto filename = entry.path().filename().string();
+            if (filename.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            const auto shard_text = std::string_view(filename).substr(prefix.size());
+            std::uint64_t shard = 0;
+            const auto parsed = std::from_chars(
+                shard_text.data(),
+                shard_text.data() + shard_text.size(),
+                shard,
+                10);
+            if (parsed.ec != std::errc{} || parsed.ptr != shard_text.data() + shard_text.size()) {
+                continue;
+            }
+            if (shard > std::numeric_limits<unsigned>::max()) {
+                continue;
+            }
+            if (const auto offset = load_delivery_offset(entry.path().string())) {
+                if (offset->shard != shard) {
+                    throw std::runtime_error(
+                        "delivery offset shard does not match state file suffix: " +
+                        entry.path().string());
+                }
+                next_by_shard[static_cast<unsigned>(shard)] = offset->next_sequence;
+            }
+        }
+    }
+
+    std::vector<DeliveryOffset> offsets;
+    offsets.reserve(next_by_shard.size());
+    for (const auto& [shard, next_sequence] : next_by_shard) {
+        offsets.push_back(DeliveryOffset{
+            .shard = shard,
+            .next_sequence = next_sequence,
+        });
+    }
+    return offsets;
+}
+
+void store_delivery_offsets(const std::string& path, const std::vector<DeliveryOffset>& offsets) {
+    store_text_file(path, render_delivery_offsets(offsets));
+}
+
+std::string shard_state_path(std::string_view base_path, unsigned shard) {
+    return std::string(base_path) + "." + std::to_string(shard);
+}
+
+namespace {
+
+std::optional<DeliveryBatch> parse_pending_delivery_batch(std::string_view content) {
     DeliveryBatch batch;
     bool saw_version = false;
     bool saw_shard = false;
     bool saw_first_sequence = false;
     bool saw_next_sequence = false;
     std::string line;
+    std::istringstream in{std::string(content)};
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             continue;
@@ -703,7 +898,7 @@ std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path
     return batch;
 }
 
-void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch) {
+std::string render_pending_delivery_batch(const DeliveryBatch& batch) {
     std::string content = "format_version=1\n";
     content += "shard=" + std::to_string(batch.shard) + "\n";
     content += "first_sequence=" + std::to_string(batch.first_sequence) + "\n";
@@ -711,13 +906,51 @@ void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& 
     for (const auto& record : batch.records) {
         content += "record_b64=" + base64_encode(record) + "\n";
     }
-    store_text_file(path, content);
+    return content;
+}
+
+}  // namespace
+
+std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return std::nullopt;
+    }
+    return parse_pending_delivery_batch(std::string(
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()));
+}
+
+void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch) {
+    store_text_file(path, render_pending_delivery_batch(batch));
 }
 
 void remove_pending_delivery_batch(const std::string& path) {
     std::error_code ec;
     fs::remove(path, ec);
     fs::remove(path + ".tmp", ec);
+}
+
+seastar::future<std::optional<DeliveryBatch>> load_pending_delivery_batch_async(
+    const std::string& path) {
+    const auto content = co_await load_text_file_async(path);
+    co_return content
+        ? parse_pending_delivery_batch(*content)
+        : std::nullopt;
+}
+
+seastar::future<> store_pending_delivery_batch_async(
+    const std::string& path,
+    const DeliveryBatch& batch) {
+    co_await store_text_file_async(path, render_pending_delivery_batch(batch));
+}
+
+seastar::future<> remove_pending_delivery_batch_async(const std::string& path) {
+    co_await remove_file_if_exists_async(path);
+    co_await remove_file_if_exists_async(path + ".tmp");
+    const fs::path target(path);
+    co_await seastar::sync_directory(
+        target.has_parent_path() ? target.parent_path().string() : ".");
 }
 
 std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, const ReplayOptions& options) {

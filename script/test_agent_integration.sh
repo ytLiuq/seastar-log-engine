@@ -89,7 +89,7 @@ start_agent() {
     --sink-retry-max-backoff-ms 500 \
     --delivery-offset-path "${TMP_DIR}/agent-delivery.offset" \
     --pending-delivery-path "${TMP_DIR}/agent-delivery.pending" \
-    -c 1 >/tmp/seastar-log-agent-integration-agent.out 2>&1 &
+    -c 2 >/tmp/seastar-log-agent-integration-agent.out 2>&1 &
   AGENT_PID=$!
   if ! wait_http "http://127.0.0.1:${HTTP_PORT}/healthz"; then
     echo "--- agent output ---" >&2
@@ -157,7 +157,8 @@ echo "--- agent integration: rotate + tail + delivery offset ---"
 printf 'file-c\nfile-d\n' >> "${SOURCE_DIR}/app.log"
 require_sink_contains "file-c"
 require_sink_contains "file-d"
-test -f "${TMP_DIR}/agent-delivery.offset"
+test -f "${TMP_DIR}/agent-delivery.offset.0"
+test -f "${TMP_DIR}/agent-delivery.offset.1"
 
 echo "--- agent integration: permission error smoke ---"
 set +e

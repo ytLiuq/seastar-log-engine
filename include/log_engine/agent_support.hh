@@ -148,11 +148,18 @@ void store_source_offset(const std::string& path, const SourceOffset& offset);
 
 std::optional<DeliveryOffset> load_delivery_offset(const std::string& path);
 void store_delivery_offset(const std::string& path, const DeliveryOffset& offset);
+seastar::future<std::optional<DeliveryOffset>> load_delivery_offset_async(const std::string& path);
+seastar::future<> store_delivery_offset_async(const std::string& path, const DeliveryOffset& offset);
+seastar::future<std::vector<DeliveryOffset>> load_delivery_offsets_file_async(const std::string& path);
 std::vector<DeliveryOffset> load_delivery_offsets(const std::string& path);
 void store_delivery_offsets(const std::string& path, const std::vector<DeliveryOffset>& offsets);
+std::string shard_state_path(std::string_view base_path, unsigned shard);
 std::optional<DeliveryBatch> load_pending_delivery_batch(const std::string& path);
 void store_pending_delivery_batch(const std::string& path, const DeliveryBatch& batch);
 void remove_pending_delivery_batch(const std::string& path);
+seastar::future<std::optional<DeliveryBatch>> load_pending_delivery_batch_async(const std::string& path);
+seastar::future<> store_pending_delivery_batch_async(const std::string& path, const DeliveryBatch& batch);
+seastar::future<> remove_pending_delivery_batch_async(const std::string& path);
 std::vector<DeliveryBatch> build_replay_batches(const EngineConfig& config, const ReplayOptions& options);
 DeliveryBatch build_delivery_batch_from_records(
     const std::vector<ParsedRecord>& records,

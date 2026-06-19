@@ -547,7 +547,11 @@ seastar::future<> test_archive_duplicate_prefers_plain_log(const std::string& ro
             "active-record");
     }
 
-    const auto records = read_back_records(config, true, 10);
+    log_engine::ReadQuery query;
+    query.include_archive = true;
+    query.limit = 10;
+    const auto segments = log_engine::collect_segments(config, query);
+    const auto records = co_await log_engine::read_records_async(segments, query);
     require(records.size() == 2, "duplicate archive test should only return one archived record plus one active record");
     require(records[0].payload == "plain-archive-record", "duplicate archive test should prefer plain archive record");
     require(records[1].payload == "active-record", "duplicate archive test should keep active record");
@@ -1508,6 +1512,9 @@ seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_
     require(loaded[0].shard == 0 && loaded[0].next_sequence == 7, "agent shard 0 delivery offset mismatch");
     require(loaded[1].shard == 1 && loaded[1].next_sequence == 19, "agent shard 1 delivery offset mismatch");
     require(loaded[2].shard == 2 && loaded[2].next_sequence == 42, "agent shard 2 delivery offset mismatch");
+    const auto async_loaded =
+        co_await log_engine::agent::load_delivery_offsets_file_async(path);
+    require(async_loaded.size() == 3, "agent should asynchronously load legacy delivery offsets");
 
     const auto legacy_path = (dir / "legacy.offset").string();
     {
@@ -1517,6 +1524,28 @@ seastar::future<> test_agent_per_shard_delivery_offsets(const std::string& root_
     const auto legacy = log_engine::agent::load_delivery_offsets(legacy_path);
     require(legacy.size() == 1, "agent should keep legacy delivery offset compatibility");
     require(legacy[0].shard == 3 && legacy[0].next_sequence == 88, "agent legacy delivery offset mismatch");
+
+    log_engine::agent::store_delivery_offset(
+        log_engine::agent::shard_state_path(path, 0),
+        log_engine::agent::DeliveryOffset{.shard = 0, .next_sequence = 11});
+    log_engine::agent::store_delivery_offset(
+        log_engine::agent::shard_state_path(path, 3),
+        log_engine::agent::DeliveryOffset{.shard = 3, .next_sequence = 51});
+    co_await log_engine::agent::store_delivery_offset_async(
+        log_engine::agent::shard_state_path(path, 4),
+        log_engine::agent::DeliveryOffset{.shard = 4, .next_sequence = 63});
+    const auto async_offset = co_await log_engine::agent::load_delivery_offset_async(
+        log_engine::agent::shard_state_path(path, 4));
+    require(
+        async_offset && async_offset->shard == 4 && async_offset->next_sequence == 63,
+        "agent async per-shard delivery offset roundtrip mismatch");
+    const auto merged = log_engine::agent::load_delivery_offsets(path);
+    require(merged.size() == 5, "agent should merge legacy and per-shard delivery offsets");
+    require(merged[0].shard == 0 && merged[0].next_sequence == 11, "per-shard delivery offset should override legacy shard state");
+    require(merged[1].shard == 1 && merged[1].next_sequence == 19, "legacy shard 1 delivery offset mismatch after merge");
+    require(merged[2].shard == 2 && merged[2].next_sequence == 42, "legacy shard 2 delivery offset mismatch after merge");
+    require(merged[3].shard == 3 && merged[3].next_sequence == 51, "per-shard delivery offset shard 3 mismatch");
+    require(merged[4].shard == 4 && merged[4].next_sequence == 63, "async per-shard delivery offset shard 4 mismatch");
     co_return;
 }
 
@@ -1547,8 +1576,27 @@ seastar::future<> test_agent_pending_delivery_batch_roundtrip(const std::string&
     require(body.find("\"sequence\":11") != std::string::npos, "agent delivery JSON should include per-record sequence");
     require(body.find("line\\nbreak") != std::string::npos, "agent delivery JSON should escape record payload");
 
+    const auto shard_path = log_engine::agent::shard_state_path(path, batch.shard);
+    log_engine::agent::store_pending_delivery_batch(shard_path, batch);
+    const auto shard_loaded = log_engine::agent::load_pending_delivery_batch(shard_path);
+    require(shard_loaded.has_value(), "agent per-shard pending batch should load");
+    require(shard_loaded->records == batch.records, "agent per-shard pending records mismatch");
+
+    const auto async_path =
+        log_engine::agent::shard_state_path(path + ".async", batch.shard);
+    co_await log_engine::agent::store_pending_delivery_batch_async(async_path, batch);
+    const auto async_loaded =
+        co_await log_engine::agent::load_pending_delivery_batch_async(async_path);
+    require(async_loaded.has_value(), "agent async pending batch should load");
+    require(async_loaded->records == batch.records, "agent async pending records mismatch");
+
     log_engine::agent::remove_pending_delivery_batch(path);
+    log_engine::agent::remove_pending_delivery_batch(shard_path);
+    co_await log_engine::agent::remove_pending_delivery_batch_async(async_path);
     require(!log_engine::agent::load_pending_delivery_batch(path).has_value(), "agent pending delivery batch should be removable");
+    require(
+        !(co_await log_engine::agent::load_pending_delivery_batch_async(async_path)).has_value(),
+        "agent async pending delivery batch should be removable");
     co_return;
 }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from pathlib import Path
 class SinkHandler(BaseHTTPRequestHandler):
     request_count = 0
     fail_first = 0
+    delay_ms = 0
     output_path: Path
 
     def do_GET(self) -> None:
@@ -25,6 +27,8 @@ class SinkHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace")
+        if type(self).delay_ms > 0:
+            time.sleep(type(self).delay_ms / 1000)
         type(self).request_count += 1
         record = {
             "path": self.path,
@@ -55,10 +59,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=19090)
     parser.add_argument("--out", default="/tmp/seastar-log-agent-fake-sink.ndjson")
     parser.add_argument("--fail-first", type=int, default=0)
+    parser.add_argument("--delay-ms", type=int, default=0)
     args = parser.parse_args()
 
     SinkHandler.output_path = Path(args.out)
     SinkHandler.fail_first = args.fail_first
+    SinkHandler.delay_ms = args.delay_ms
     server = ThreadingHTTPServer((args.host, args.port), SinkHandler)
     server.serve_forever()
     return 0

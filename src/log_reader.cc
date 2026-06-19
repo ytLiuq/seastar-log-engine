@@ -2,13 +2,20 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <system_error>
 #include <utility>
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 
 #include <zlib.h>
@@ -103,6 +110,81 @@ StreamResult stream_plain_lines(const std::string& path, Consumer&& consume_line
         .stopped_early = false,
         .read_error = !in.eof() && in.fail(),
     };
+}
+
+template <typename Consumer>
+seastar::future<StreamResult> stream_plain_lines_async(
+    const std::string& path,
+    Consumer&& consume_line) {
+    if (!co_await seastar::file_exists(path)) {
+        readerlog.warn("segment file disappeared (likely cleaned up concurrently): {}", path);
+        co_return StreamResult{.stopped_early = false, .read_error = true, .file_missing = true};
+    }
+
+    seastar::file file;
+    try {
+        file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+    } catch (const std::system_error& ex) {
+        if (ex.code().value() == ENOENT) {
+            readerlog.warn("segment file disappeared (likely cleaned up concurrently): {}", path);
+            co_return StreamResult{.stopped_early = false, .read_error = true, .file_missing = true};
+        }
+        throw;
+    }
+
+    auto input = seastar::make_file_input_stream(
+        file,
+        seastar::file_input_stream_options{
+            .buffer_size = 64 * 1024,
+            .read_ahead = 1,
+        });
+    std::string pending;
+    bool stopped_early = false;
+    std::exception_ptr read_error;
+    try {
+        while (auto buffer = co_await input.read()) {
+            std::string_view chunk(buffer.get(), buffer.size());
+            std::size_t begin = 0;
+            while (begin < chunk.size()) {
+                const auto newline = chunk.find('\n', begin);
+                if (newline == std::string_view::npos) {
+                    pending.append(chunk.substr(begin));
+                    break;
+                }
+
+                if (pending.empty()) {
+                    if (!consume_line(chunk.substr(begin, newline - begin))) {
+                        stopped_early = true;
+                        break;
+                    }
+                } else {
+                    pending.append(chunk.substr(begin, newline - begin));
+                    if (!consume_line(pending)) {
+                        stopped_early = true;
+                        break;
+                    }
+                    pending.clear();
+                }
+                begin = newline + 1;
+            }
+            if (stopped_early) {
+                break;
+            }
+            co_await seastar::yield();
+        }
+
+        if (!stopped_early && !pending.empty() && !consume_line(pending)) {
+            stopped_early = true;
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    co_await input.close().handle_exception([] (std::exception_ptr) {});
+    co_await file.close();
+    if (read_error) {
+        co_return StreamResult{.stopped_early = stopped_early, .read_error = true};
+    }
+    co_return StreamResult{.stopped_early = stopped_early};
 }
 
 template <typename Consumer>
@@ -224,6 +306,72 @@ std::vector<ParsedRecord> read_records_from_segments(
     return records;
 }
 
+seastar::future<std::vector<ParsedRecord>> read_records_from_segments_async(
+    const std::vector<layout::SegmentDescriptor>& segments,
+    const ReadQuery& query) {
+    std::vector<ParsedRecord> records;
+    records.reserve(query.limit);
+
+    if (query.limit == 0) {
+        co_return records;
+    }
+
+    for (const auto& segment : segments) {
+        ++g_segments_read;
+        if (segment.archived) {
+            ++g_archive_segments_read;
+        } else {
+            ++g_active_segments_read;
+        }
+
+        bool segment_corrupted = false;
+        auto consume_line = [&] (std::string_view line) {
+            const auto parsed = parse_record_line(line);
+            if (!parsed) {
+                segment_corrupted = true;
+                ++g_corrupted_lines;
+                record_reader_corrupted_line();
+                return false;
+            }
+            if (!matches_record_query(*parsed, query)) {
+                return true;
+            }
+            records.push_back(*parsed);
+            ++g_records_returned;
+            return records.size() < query.limit;
+        };
+
+        StreamResult result;
+        if (segment.compressed) {
+            result = stream_gzip_lines(segment.path, consume_line);
+        } else {
+            result = co_await stream_plain_lines_async(segment.path, consume_line);
+        }
+        if (result.file_missing) {
+            readerlog.warn(
+                "skipping segment that disappeared (likely concurrent archive cleanup): path={}",
+                segment.path);
+            continue;
+        }
+        if (segment_corrupted || result.read_error) {
+            ++g_corrupted_segments;
+            record_reader_corrupted_segment();
+            readerlog.warn(
+                "stopped reading corrupted segment: path={}, compressed={}, parse_error={}, read_error={}",
+                segment.path,
+                segment.compressed,
+                segment_corrupted,
+                result.read_error);
+            continue;
+        }
+        if (result.stopped_early) {
+            break;
+        }
+    }
+
+    co_return records;
+}
+
 }  // namespace
 
 std::vector<layout::SegmentDescriptor> collect_segments(const EngineConfig& config, const ReadQuery& query) {
@@ -232,6 +380,12 @@ std::vector<layout::SegmentDescriptor> collect_segments(const EngineConfig& conf
 
 std::vector<ParsedRecord> read_records(const std::vector<layout::SegmentDescriptor>& segments, const ReadQuery& query) {
     return read_records_from_segments(segments, query);
+}
+
+seastar::future<std::vector<ParsedRecord>> read_records_async(
+    const std::vector<layout::SegmentDescriptor>& segments,
+    const ReadQuery& query) {
+    return read_records_from_segments_async(segments, query);
 }
 
 ReaderStats get_reader_stats() noexcept {

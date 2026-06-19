@@ -149,11 +149,15 @@ sink-http-retryable-statuses=408,425,429,500,502,503,504
 delivery-offset-path=/var/lib/seastar-log-agent/delivery.offset
 pending-delivery-path=/var/lib/seastar-log-agent/delivery.pending
 sink-batch-size=100
+sink-dispatcher-concurrency=4
+sink-dispatch-queue-capacity=64
+delivery-scan-idle-ms=100
 sink-retry-backoff-ms=1000
 sink-retry-max-backoff-ms=30000
 ```
 
 Each batch includes `agent_id`, `shard`, `first_sequence`, `next_sequence`, and per-record sequence metadata. Downstream receivers should use these fields for deduplication.
+Each shard scans and retries independently. Batches are handed to a bounded dispatcher, whose concurrency controls the maximum number of simultaneous sink requests.
 
 ### Kafka And Object Store Sidecars
 

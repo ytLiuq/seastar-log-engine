@@ -9,6 +9,12 @@ This document tracks follow-up work after the current agent/checkpoint iteration
 
 ## Completed
 
+- 2026-06-19: Replaced the single global delivery scanner with per-shard scanners,
+  per-shard pending/offset state, and a bounded dispatcher with configurable
+  concurrent sink workers.
+- 2026-06-19: Moved plain active/archive scanning and delivery pending/offset
+  state I/O onto Seastar asynchronous file streams. Compressed archive
+  decompression remains on the synchronous zlib path.
 - 2026-06-17: Added durable pending delivery batches. The agent persists a batch to `pending-delivery-path` before sink delivery, reloads it on restart, advances per-shard delivery offsets only after sink ACK, and removes the pending file after ACK.
 - 2026-06-17: Added sink idempotency metadata to HTTP delivery batches: `agent_id`, `shard`, `first_sequence`, `next_sequence`, and per-record `sequence`.
 - 2026-06-17: Exposed `last_recovery_fallback_reason` through `/v1/status`.

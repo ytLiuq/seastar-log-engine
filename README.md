@@ -79,6 +79,7 @@ docker build --target test .
 ```bash
 ./script/bench_regression.sh --messages 100000 --repeats 3 --shards 1
 ./script/bench_soak.sh --target log_engine --duration-seconds 300 --messages 50000 --payload-size 2048 --batch-size 8192 --inflight 1 --shards 1 --ack-mode write_ack
+bash ./script/bench_delivery_scanner.sh --messages 20000 --shards 1,2,4 --dispatchers 1,4 --sink-delays-ms 0,10,50 --repeats 3
 ```
 
 运行日志 agent MVP：
@@ -117,6 +118,10 @@ curl http://127.0.0.1:18081/v1/status
 ```
 
 这个模式会 tail 本地文件，只提交已经换行结束的完整日志行；glob 模式下每个文件维护独立的 `source-offset-path.*`，检测到 rename rotation 或 truncate 后会从新文件头继续读取，并在 `/v1/status` 的 `source_rotations` 里累计。sink 投递前会把当前批次写到 `pending-delivery-path`，批次 JSON 带 `agent_id`、`shard`、`first_sequence`、`next_sequence`，成功收到 sink ACK 后再按 shard 推进 `delivery-offset-path` 并删除 pending 文件；如果进程在 ACK 前崩溃，重启后会优先重放 pending 批次。如果本地缓冲目录达到 `max-buffer-bytes`，或者 sink backlog / 失败数 / 延迟超过动态阈值，输入源会暂停，避免继续放大积压。
+
+每个 shard 独立运行 delivery scanner，并维护自己的 offset、pending batch 和重试状态；扫描出的批次进入控制 shard 上的有界 Dispatcher 队列，由可配置数量的异步 sink worker 并发发送。这样单个 shard 的远端失败不会阻塞其他 shard，同时通过队列容量限制远端并发和内存占用。
+
+Scanner 使用 Seastar file streams 异步读取 active log 和未压缩 archive，并通过异步临时文件写入、flush、rename、directory sync 持久化 per-shard pending/offset。压缩 archive 仍由 zlib 同步解压。
 
 可靠性语义是 at-least-once：ACK 前崩溃会重放 pending 批次；如果远端 sink 已经 ACK、但本地 delivery offset 还没持久化就崩溃，重启后可能重复投递该批次。重复窗口被 `agent_id + shard + first_sequence + next_sequence` 限定，远端 sink 应按这些幂等字段去重。
 

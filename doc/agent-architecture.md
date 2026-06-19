@@ -11,9 +11,10 @@ flowchart LR
     C --> D["Per-shard active logs"]
     D --> E["Checkpoint sidecars"]
     D --> F["Archive segments"]
-    C --> G["Delivery scanner"]
-    G --> H["Pending delivery batch"]
-    H --> I["Remote sink<br/>stdout, HTTP, sidecar target"]
+    C --> G["Per-shard delivery scanners"]
+    G --> H["Per-shard pending delivery batches"]
+    H --> Q["Bounded dispatcher queue"]
+    Q --> I["Concurrent sink workers<br/>stdout, HTTP, sidecar target"]
     I --> J["Sink ACK"]
     J --> K["Per-shard delivery offsets"]
 ```
@@ -58,13 +59,20 @@ This means records written after the checkpoint can still be recovered by tail s
 
 ### Delivery Scanner
 
-Remote delivery is driven by per-shard delivery offsets:
+Remote delivery is driven by one scanner per shard and per-shard delivery offsets:
 
 ```text
-next sequence per shard -> query local records -> build batch -> persist pending batch -> send to sink
+local shard sequence -> query local records -> build batch -> persist shard pending batch
+    -> bounded dispatcher queue -> sink worker -> ACK
 ```
 
-The pending delivery batch is written before sending. If the process crashes during delivery, restart reloads the pending batch first. Delivery offset files are advanced only after the sink ACKs.
+Each scanner runs on its owning Seastar shard and keeps one in-flight batch, retry state, and offset. Pending and offset files use a shard suffix. A dispatcher on the control shard owns a bounded queue and a configurable number of asynchronous sink workers. The pending delivery batch is written before enqueueing. If the process crashes during delivery, restart reloads each shard's pending batch first. Delivery offset files are advanced only after the sink ACKs.
+
+Plain active and archive segments are read through `open_file_dma` and
+`make_file_input_stream`. Pending and offset files use asynchronous Seastar
+streams plus temp-file rename and directory sync. Segment enumeration and gzip
+decompression remain synchronous and should be measured separately when archive
+counts or compressed history become large.
 
 ### Sink Boundary
 
@@ -85,21 +93,24 @@ Typical state files in the agent data directory:
 agent-logs/
 agent-archive/
 agent-source.offset
-agent-delivery.offset
-agent-delivery.pending
+agent-delivery.offset.0
+agent-delivery.offset.1
+agent-delivery.pending.0
+agent-delivery.pending.1
 shard-0.log.checkpoint
 ```
 
-`agent-source.offset` tracks how far file inputs have been consumed. `agent-delivery.offset` tracks how far remote sinks have acknowledged. `agent-delivery.pending` stores the batch currently in the retry window.
+`agent-source.offset` tracks how far file inputs have been consumed. Each `agent-delivery.offset.<shard>` tracks how far the remote sink has acknowledged that shard. Each `agent-delivery.pending.<shard>` stores the shard batch currently in the retry window. Legacy unsuffixed delivery files are migrated or used as initial offsets during upgrade.
 
 ## Restart Timeline
 
 ```mermaid
 sequenceDiagram
-    participant P as Process
+    participant P as Shard scanner
     participant L as Local log
     participant C as Checkpoint
     participant D as Delivery state
+    participant Q as Dispatcher
     participant S as Sink
 
     P->>C: Load checkpoint
@@ -110,13 +121,15 @@ sequenceDiagram
     end
     P->>D: Load pending batch and delivery offsets
     alt pending batch exists
-        P->>S: Retry pending batch
+        P->>Q: Enqueue pending batch
     else no pending batch
         P->>L: Scan from per-shard delivery offsets
         P->>D: Persist new pending batch
-        P->>S: Deliver batch
+        P->>Q: Enqueue new batch
     end
-    S-->>P: ACK
+    Q->>S: Deliver batch
+    S-->>Q: ACK
+    Q-->>P: Complete batch
     P->>D: Atomically advance delivery offset
 ```
 
