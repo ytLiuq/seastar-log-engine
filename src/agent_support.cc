@@ -464,7 +464,6 @@ seastar::future<std::optional<std::string>> load_text_file_async(const std::stri
         read_error = std::current_exception();
     }
     co_await input.close().handle_exception([] (std::exception_ptr) {});
-    co_await file.close();
     if (read_error) {
         std::rethrow_exception(read_error);
     }
@@ -497,7 +496,6 @@ seastar::future<> store_text_file_async(const std::string& path, const std::stri
             write_error = ep;
         }
     });
-    co_await file.close();
     if (write_error) {
         co_await remove_file_if_exists_async(tmp);
         std::rethrow_exception(write_error);
@@ -1137,6 +1135,77 @@ TailBatch tail_file_once(
     }
     batch.next_offset.offset = committed_offset;
     return batch;
+}
+
+seastar::future<TailBatch> tail_file_once_async(
+    const std::string& path,
+    const std::optional<SourceOffset>& previous,
+    std::size_t max_lines) {
+    TailBatch batch;
+    batch.next_offset.path = path;
+    batch.next_offset.inode = inode_of(path);
+
+    std::uint64_t start_offset = 0;
+    const auto file_size = co_await seastar::file_size(path);
+    if (previous && previous->path == path && previous->inode == batch.next_offset.inode && previous->offset <= file_size) {
+        start_offset = previous->offset;
+    } else if (previous) {
+        batch.file_rotated_or_truncated = true;
+    }
+    batch.next_offset.offset = start_offset;
+
+    if (max_lines == 0 || start_offset >= file_size) {
+        co_return batch;
+    }
+
+    auto file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+    auto input = seastar::make_file_input_stream(
+        file,
+        start_offset,
+        file_size - start_offset,
+        seastar::file_input_stream_options{
+            .buffer_size = 16 * 1024,
+            .read_ahead = 1,
+        });
+
+    std::string pending;
+    std::uint64_t consumed_offset = start_offset;
+    std::exception_ptr read_error;
+    try {
+        while (batch.lines.size() < max_lines) {
+            auto buffer = co_await input.read();
+            if (buffer.empty()) {
+                break;
+            }
+            std::string_view chunk(buffer.get(), buffer.size());
+            std::size_t begin = 0;
+            while (batch.lines.size() < max_lines) {
+                const auto newline = chunk.find('\n', begin);
+                if (newline == std::string_view::npos) {
+                    pending.append(chunk.substr(begin));
+                    break;
+                }
+                const auto completed_line_size = pending.size() + (newline - begin);
+                pending.append(chunk.substr(begin, newline - begin));
+                batch.lines.push_back(std::move(pending));
+                pending.clear();
+                consumed_offset += completed_line_size + 1;
+                begin = newline + 1;
+            }
+            if (batch.lines.size() >= max_lines) {
+                break;
+            }
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    co_await input.close().handle_exception([] (std::exception_ptr) {});
+    if (read_error) {
+        std::rethrow_exception(read_error);
+    }
+
+    batch.next_offset.offset = consumed_offset;
+    co_return batch;
 }
 
 std::vector<std::string> expand_glob_paths(std::string_view pattern) {

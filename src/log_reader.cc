@@ -15,6 +15,7 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 
@@ -170,7 +171,7 @@ seastar::future<StreamResult> stream_plain_lines_async(
             if (stopped_early) {
                 break;
             }
-            co_await seastar::yield();
+            co_await seastar::sleep(std::chrono::milliseconds(0));
         }
 
         if (!stopped_early && !pending.empty() && !consume_line(pending)) {

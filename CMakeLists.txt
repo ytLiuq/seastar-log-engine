@@ -105,6 +105,13 @@ target_link_libraries(log_engine_bench
     PRIVATE
         log_engine_core)
 
+add_executable(log_engine_agent_dispatch_bench
+    src/agent_dispatch_bench.cc)
+
+target_link_libraries(log_engine_agent_dispatch_bench
+    PRIVATE
+        log_engine_core)
+
 add_executable(log_engine_verify
     src/verify.cc)
 

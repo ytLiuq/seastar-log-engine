@@ -29,15 +29,8 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/unix_address.hh>
 #include <seastar/util/defer.hh>
-
-#include <arpa/inet.h>
-#include <cerrno>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 #include "log_engine/agent_support.hh"
 #include "log_engine/config_loader.hh"
@@ -236,36 +229,6 @@ struct AgentRuntimeOptions {
     log_engine::agent::DiskQuota disk_quota;
 };
 
-class FdGuard {
-public:
-    explicit FdGuard(int fd = -1) noexcept : _fd(fd) {}
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-    ~FdGuard() {
-        if (_fd >= 0) {
-            ::close(_fd);
-        }
-    }
-    int get() const noexcept {
-        return _fd;
-    }
-    int release() noexcept {
-        const int fd = _fd;
-        _fd = -1;
-        return fd;
-    }
-
-private:
-    int _fd = -1;
-};
-
-void set_nonblocking(int fd) {
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        throw std::runtime_error("failed to set socket nonblocking");
-    }
-}
-
 std::vector<log_engine::LogMessage> lines_to_messages(
     const std::vector<std::string>& lines,
     const AgentRuntimeOptions& options,
@@ -335,18 +298,18 @@ void update_backpressure_status(AgentContext& context, const log_engine::agent::
     }
 }
 
-void append_source_lines(
+seastar::future<> append_source_lines(
     AgentContext& context,
     const AgentRuntimeOptions& options,
     const std::string& source_id,
     std::uint64_t first_source_offset,
     const std::vector<std::string>& lines) {
     if (lines.empty()) {
-        return;
+        co_return;
     }
     const auto records = log_engine::agent::apply_multiline_records(lines, options.multiline_options);
     if (records.empty()) {
-        return;
+        co_return;
     }
     const auto backpressure = evaluate_agent_backpressure(context, options);
     update_backpressure_status(context, backpressure);
@@ -375,25 +338,25 @@ void append_source_lines(
         accepted_records.push_back(record);
     }
     if (accepted_records.empty()) {
-        return;
+        co_return;
     }
 
     context.stats.source_read.fetch_add(accepted_records.size(), std::memory_order_relaxed);
-    context.engine.append_batch(lines_to_messages(accepted_records, options, source_id, first_source_offset)).get();
+    co_await context.engine.append_batch(lines_to_messages(accepted_records, options, source_id, first_source_offset));
     context.stats.source_committed.fetch_add(accepted_records.size(), std::memory_order_relaxed);
 }
 
-std::uint64_t append_stream_source_lines(
+seastar::future<std::uint64_t> append_stream_source_lines(
     AgentContext& context,
     const AgentRuntimeOptions& options,
     const std::string& source_id,
     std::uint64_t next_source_offset,
     const std::vector<std::string>& lines) {
-    append_source_lines(context, options, source_id, next_source_offset, lines);
+    co_await append_source_lines(context, options, source_id, next_source_offset, lines);
     for (const auto& line : lines) {
         next_source_offset += line.size() + 1;
     }
-    return next_source_offset;
+    co_return next_source_offset;
 }
 
 seastar::future<> run_file_source_loop(
@@ -401,58 +364,60 @@ seastar::future<> run_file_source_loop(
     AgentRuntimeOptions options,
     std::atomic<bool>& stopping) {
     if (options.file_source_path.empty() && options.file_source_glob.empty()) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
-        std::map<std::string, log_engine::agent::SourceOffset> offsets;
-        while (!stopping.load(std::memory_order_relaxed)) {
-            try {
-                std::vector<std::string> paths;
-                if (!options.file_source_path.empty()) {
-                    paths.push_back(options.file_source_path);
-                }
-                const auto glob_paths = log_engine::agent::expand_glob_paths(options.file_source_glob);
-                paths.insert(paths.end(), glob_paths.begin(), glob_paths.end());
-                std::sort(paths.begin(), paths.end());
-                paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
-
-                bool consumed = false;
-                for (const auto& path : paths) {
-                    auto& offset = offsets[path];
-                    if (offset.path.empty()) {
-                        if (auto loaded = log_engine::agent::load_source_offset(source_offset_path_for(options, path))) {
-                            offset = *loaded;
-                        }
-                    }
-                    const auto previous = offset.path.empty() ? std::optional<log_engine::agent::SourceOffset>{} : std::optional(offset);
-                    auto batch = log_engine::agent::tail_file_once(path, previous, options.source_max_lines);
-                    if (batch.file_rotated_or_truncated) {
-                        ++context.stats.source_rotations;
-                    }
-                    if (batch.lines.empty()) {
-                        offset = batch.next_offset;
-                        continue;
-                    }
-                    auto first_source_offset = batch.next_offset.offset;
-                    for (const auto& line : batch.lines) {
-                        first_source_offset -= line.size() + 1;
-                    }
-                    append_source_lines(context, options, path, first_source_offset, batch.lines);
-                    log_engine::agent::store_source_offset(source_offset_path_for(options, path), batch.next_offset);
-                    offset = batch.next_offset;
-                    consumed = true;
-                }
-
-                if (!consumed) {
-                    seastar::sleep(std::chrono::milliseconds(options.source_poll_ms)).get();
-                }
-            } catch (...) {
-                ++context.stats.rejected;
-                seastar::sleep(std::chrono::milliseconds(options.source_poll_ms)).get();
+    std::map<std::string, log_engine::agent::SourceOffset> offsets;
+    while (!stopping.load(std::memory_order_relaxed)) {
+        bool poll_after_error = false;
+        try {
+            std::vector<std::string> paths;
+            if (!options.file_source_path.empty()) {
+                paths.push_back(options.file_source_path);
             }
+            const auto glob_paths = log_engine::agent::expand_glob_paths(options.file_source_glob);
+            paths.insert(paths.end(), glob_paths.begin(), glob_paths.end());
+            std::sort(paths.begin(), paths.end());
+            paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+
+            bool consumed = false;
+            for (const auto& path : paths) {
+                auto& offset = offsets[path];
+                if (offset.path.empty()) {
+                    if (auto loaded = log_engine::agent::load_source_offset(source_offset_path_for(options, path))) {
+                        offset = *loaded;
+                    }
+                }
+                const auto previous = offset.path.empty() ? std::optional<log_engine::agent::SourceOffset>{} : std::optional(offset);
+                auto batch = co_await log_engine::agent::tail_file_once_async(path, previous, options.source_max_lines);
+                if (batch.file_rotated_or_truncated) {
+                    ++context.stats.source_rotations;
+                }
+                if (batch.lines.empty()) {
+                    offset = batch.next_offset;
+                    continue;
+                }
+                auto first_source_offset = batch.next_offset.offset;
+                for (const auto& line : batch.lines) {
+                    first_source_offset -= line.size() + 1;
+                }
+                co_await append_source_lines(context, options, path, first_source_offset, batch.lines);
+                log_engine::agent::store_source_offset(source_offset_path_for(options, path), batch.next_offset);
+                offset = batch.next_offset;
+                consumed = true;
+            }
+
+            if (!consumed) {
+                co_await seastar::sleep(std::chrono::milliseconds(options.source_poll_ms));
+            }
+        } catch (...) {
+            ++context.stats.rejected;
+            poll_after_error = true;
         }
-    });
+        if (poll_after_error) {
+            co_await seastar::sleep(std::chrono::milliseconds(options.source_poll_ms));
+        }
+    }
 }
 
 seastar::future<> run_stdin_source_loop(
@@ -463,7 +428,7 @@ seastar::future<> run_stdin_source_loop(
         return seastar::make_ready_future<>();
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
+    return seastar::do_with(std::move(options), [&context, &stopping](AgentRuntimeOptions& options) -> seastar::future<> {
         std::vector<std::string> lines;
         lines.reserve(options.source_max_lines);
         std::string line;
@@ -471,36 +436,37 @@ seastar::future<> run_stdin_source_loop(
         while (!stopping.load(std::memory_order_relaxed) && std::getline(std::cin, line)) {
             lines.push_back(line);
             if (lines.size() >= options.source_max_lines) {
-                next_source_offset = append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
+                next_source_offset = co_await append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
                 lines.clear();
             }
         }
         if (!lines.empty()) {
-            append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
+            co_await append_stream_source_lines(context, options, "stdin", next_source_offset, lines);
         }
     });
 }
 
-void consume_line_stream_fd(
-    int fd,
+seastar::future<> consume_line_stream(
+    seastar::input_stream<char> input,
     AgentContext& context,
     const AgentRuntimeOptions& options,
     std::string source_id,
     std::atomic<bool>& stopping) {
-    FdGuard guard(fd);
     std::string pending;
-    char buffer[4096];
     std::uint64_t next_source_offset = 0;
+    std::exception_ptr read_error;
     while (!stopping.load(std::memory_order_relaxed)) {
-        const auto rc = ::recv(guard.get(), buffer, sizeof(buffer), 0);
-        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            seastar::sleep(std::chrono::milliseconds(10)).get();
-            continue;
-        }
-        if (rc <= 0) {
+        seastar::temporary_buffer<char> buffer;
+        try {
+            buffer = co_await input.read();
+        } catch (...) {
+            read_error = std::current_exception();
             break;
         }
-        pending.append(buffer, static_cast<std::size_t>(rc));
+        if (buffer.empty()) {
+            break;
+        }
+        pending.append(buffer.get(), buffer.size());
         std::size_t start = 0;
         std::vector<std::string> lines;
         while (true) {
@@ -515,14 +481,18 @@ void consume_line_stream_fd(
             lines.push_back(std::move(line));
             start = newline + 1;
             if (lines.size() >= options.source_max_lines) {
-                next_source_offset = append_stream_source_lines(context, options, source_id, next_source_offset, lines);
+                next_source_offset = co_await append_stream_source_lines(context, options, source_id, next_source_offset, lines);
                 lines.clear();
             }
         }
         if (!lines.empty()) {
-            next_source_offset = append_stream_source_lines(context, options, source_id, next_source_offset, lines);
+            next_source_offset = co_await append_stream_source_lines(context, options, source_id, next_source_offset, lines);
         }
         pending.erase(0, start);
+    }
+    co_await input.close().handle_exception([] (std::exception_ptr) {});
+    if (read_error) {
+        std::rethrow_exception(read_error);
     }
 }
 
@@ -534,48 +504,34 @@ seastar::future<> run_tcp_source_loop(
         return seastar::make_ready_future<>();
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
-        FdGuard server(::socket(AF_INET, SOCK_STREAM, 0));
-        if (server.get() < 0) {
-            throw std::runtime_error("failed to create TCP source socket");
-        }
-        set_nonblocking(server.get());
-        int reuse = 1;
-        ::setsockopt(server.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
-        address.sin_port = htons(options.tcp_source_port);
-        if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(server.get(), 16) != 0) {
-            throw std::runtime_error("failed to bind/listen TCP source socket");
-        }
+    return seastar::do_with(std::move(options), [&context, &stopping](AgentRuntimeOptions& options) -> seastar::future<> {
+        auto server = seastar::listen(
+            seastar::socket_address(seastar::ipv4_addr{options.tcp_source_port}),
+            seastar::listen_options{
+                .reuse_address = true,
+                .listen_backlog = 16,
+            });
         std::uint64_t connection_id = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
-            const int client = ::accept(server.get(), nullptr, nullptr);
-            if (client < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    seastar::sleep(std::chrono::milliseconds(50)).get();
-                }
-                continue;
-            }
+            auto accepted = co_await server.accept();
             if (options.max_socket_connections > 0 && connection_id >= options.max_socket_connections) {
                 ++context.stats.source_dropped;
-                ::close(client);
+                accepted.connection.shutdown_output();
                 continue;
             }
-            set_nonblocking(client);
             try {
-                consume_line_stream_fd(
-                    client,
+                auto input = accepted.connection.input();
+                co_await consume_line_stream(
+                    std::move(input),
                     context,
                     options,
                     fmt::format("tcp:{}:{}", options.tcp_source_port, connection_id++),
                     stopping);
             } catch (...) {
                 ++context.stats.rejected;
-                ::close(client);
             }
         }
+        server.abort_accept();
     });
 }
 
@@ -587,35 +543,21 @@ seastar::future<> run_udp_source_loop(
         return seastar::make_ready_future<>();
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
-        FdGuard server(::socket(AF_INET, SOCK_DGRAM, 0));
-        if (server.get() < 0) {
-            throw std::runtime_error("failed to create UDP source socket");
-        }
-        set_nonblocking(server.get());
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
-        address.sin_port = htons(options.udp_source_port);
-        if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-            throw std::runtime_error("failed to bind UDP source socket");
-        }
-        char buffer[65535];
+    return seastar::do_with(std::move(options), [&context, &stopping](AgentRuntimeOptions& options) -> seastar::future<> {
+        auto channel = seastar::make_bound_datagram_channel(
+            seastar::socket_address(seastar::ipv4_addr{options.udp_source_port}));
         std::uint64_t next_source_offset = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
-            const auto rc = ::recv(server.get(), buffer, sizeof(buffer), 0);
-            if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                seastar::sleep(std::chrono::milliseconds(50)).get();
-                continue;
-            }
-            if (rc <= 0) {
-                continue;
-            }
+            auto datagram = co_await channel.receive();
+            auto& payload = datagram.get_data();
+            payload.linearize();
+            const auto payload_size = payload.len();
             std::vector<std::string> records;
-            records.push_back(std::string(buffer, static_cast<std::size_t>(rc)));
-            append_source_lines(context, options, fmt::format("udp:{}", options.udp_source_port), next_source_offset, records);
-            next_source_offset += static_cast<std::uint64_t>(rc);
+            records.push_back(std::string(payload.get_header(0, payload_size), payload_size));
+            co_await append_source_lines(context, options, fmt::format("udp:{}", options.udp_source_port), next_source_offset, records);
+            next_source_offset += static_cast<std::uint64_t>(payload_size);
         }
+        channel.close();
     });
 }
 
@@ -627,50 +569,36 @@ seastar::future<> run_unix_socket_source_loop(
         return seastar::make_ready_future<>();
     }
 
-    return seastar::async([&context, options = std::move(options), &stopping] {
-        ::unlink(options.unix_socket_path.c_str());
-        FdGuard server(::socket(AF_UNIX, SOCK_STREAM, 0));
-        if (server.get() < 0) {
-            throw std::runtime_error("failed to create Unix source socket");
-        }
-        set_nonblocking(server.get());
-        sockaddr_un address {};
-        address.sun_family = AF_UNIX;
-        if (options.unix_socket_path.size() >= sizeof(address.sun_path)) {
-            throw std::runtime_error("unix-socket-source-path is too long");
-        }
-        std::strncpy(address.sun_path, options.unix_socket_path.c_str(), sizeof(address.sun_path) - 1);
-        if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || ::listen(server.get(), 16) != 0) {
-            throw std::runtime_error("failed to bind/listen Unix source socket");
-        }
+    return seastar::do_with(std::move(options), [&context, &stopping](AgentRuntimeOptions& options) -> seastar::future<> {
+        co_await seastar::remove_file(options.unix_socket_path).handle_exception([] (std::exception_ptr) {});
+        auto server = seastar::listen(
+            seastar::socket_address(seastar::unix_domain_addr(options.unix_socket_path)),
+            seastar::listen_options{
+                .reuse_address = true,
+                .listen_backlog = 16,
+            });
         std::uint64_t connection_id = 0;
         while (!stopping.load(std::memory_order_relaxed)) {
-            const int client = ::accept(server.get(), nullptr, nullptr);
-            if (client < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    seastar::sleep(std::chrono::milliseconds(50)).get();
-                }
-                continue;
-            }
+            auto accepted = co_await server.accept();
             if (options.max_socket_connections > 0 && connection_id >= options.max_socket_connections) {
                 ++context.stats.source_dropped;
-                ::close(client);
+                accepted.connection.shutdown_output();
                 continue;
             }
-            set_nonblocking(client);
             try {
-                consume_line_stream_fd(
-                    client,
+                auto input = accepted.connection.input();
+                co_await consume_line_stream(
+                    std::move(input),
                     context,
                     options,
                     fmt::format("unix:{}:{}", options.unix_socket_path, connection_id++),
                     stopping);
             } catch (...) {
                 ++context.stats.rejected;
-                ::close(client);
             }
         }
-        ::unlink(options.unix_socket_path.c_str());
+        server.abort_accept();
+        co_await seastar::remove_file(options.unix_socket_path).handle_exception([] (std::exception_ptr) {});
     });
 }
 
@@ -913,7 +841,6 @@ seastar::future<> run_shard_delivery_scanner(
     log_engine::EngineConfig config,
     AgentRuntimeOptions options,
     unsigned shard,
-    unsigned dispatcher_shard,
     DeliveryDispatcher* dispatcher,
     std::atomic<bool>& stopping,
     std::uint64_t legacy_next_sequence) {
@@ -952,11 +879,8 @@ seastar::future<> run_shard_delivery_scanner(
                 co_await log_engine::agent::store_pending_delivery_batch_async(pending_path, *pending);
             }
 
-            co_await seastar::smp::submit_to(
-                dispatcher_shard,
-                [dispatcher, batch = *pending] () mutable {
-                    return dispatcher->submit(std::move(batch));
-                });
+            auto batch = *pending;
+            co_await dispatcher->submit(std::move(batch));
 
             next_sequence = pending->next_sequence;
             co_await log_engine::agent::store_delivery_offset_async(
@@ -1123,8 +1047,7 @@ int main(int argc, char** argv) {
         ("max-buffer-bytes", bpo::value<std::uint64_t>()->default_value(0), "Pause file source when log buffer reaches this size")
         ("resume-buffer-bytes", bpo::value<std::uint64_t>()->default_value(0), "Resume file source when log buffer drops to this size");
 
-    return app.run(argc, argv, [&app] {
-        return seastar::async([&app] {
+    return app.run(argc, argv, [&app] () -> seastar::future<> {
             StopSignal stop_signal;
             auto& options = app.configuration();
             const auto file_values = log_engine::load_config_file(options["config"].as<std::string>());
@@ -1290,23 +1213,17 @@ int main(int argc, char** argv) {
                 log_engine::unregister_log_manager_metrics();
             });
 
-            context.engine.start(config).get();
-            auto stop_engine = seastar::defer([&context] () noexcept {
-                context.engine.stop().get();
-            });
+            co_await context.engine.start(config);
 
             seastar::httpd::http_server_control http_server;
-            http_server.start("seastar-log-agent").get();
-            auto stop_http = seastar::defer([&http_server] () noexcept {
-                http_server.stop().get();
-            });
-            http_server.set_routes([&context](seastar::httpd::routes& routes) {
+            co_await http_server.start("seastar-log-agent");
+            co_await http_server.set_routes([&context](seastar::httpd::routes& routes) {
                 set_agent_routes(routes, context);
-            }).get();
-            http_server.listen(
+            });
+            co_await http_server.listen(
                 seastar::socket_address{
                     seastar::net::inet_address(options["http-ingest-address"].as<std::string>()),
-                    options["http-ingest-port"].as<uint16_t>()}).get();
+                    options["http-ingest-port"].as<uint16_t>()});
 
             std::atomic<bool> stopping{false};
             auto file_source_done = run_file_source_loop(context, runtime_options, stopping);
@@ -1315,19 +1232,15 @@ int main(int argc, char** argv) {
             auto udp_source_done = run_udp_source_loop(context, runtime_options, stopping);
             auto unix_source_done = run_unix_socket_source_loop(context, runtime_options, stopping);
 
-            const auto dispatcher_shard = seastar::this_shard_id();
-            std::optional<DeliveryDispatcher> dispatcher;
             std::vector<seastar::future<>> delivery_scanners;
             if (runtime_options.sink_kind != SinkKind::none) {
-                migrate_legacy_pending_delivery(runtime_options).get();
+                co_await migrate_legacy_pending_delivery(runtime_options);
                 std::map<unsigned, std::uint64_t> legacy_next_by_shard;
-                for (const auto& offset : log_engine::agent::load_delivery_offsets_file_async(
-                         runtime_options.delivery_offset_path).get()) {
+                for (const auto& offset : co_await log_engine::agent::load_delivery_offsets_file_async(
+                         runtime_options.delivery_offset_path)) {
                     legacy_next_by_shard[offset.shard] = offset.next_sequence;
                 }
 
-                dispatcher.emplace(context, runtime_options, stopping);
-                dispatcher->start();
                 delivery_scanners.reserve(seastar::smp::count);
                 for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
                     const auto legacy_next = legacy_next_by_shard.contains(shard)
@@ -1336,38 +1249,46 @@ int main(int argc, char** argv) {
                     delivery_scanners.push_back(seastar::smp::submit_to(
                         shard,
                         [
+                            &context,
                             config,
                             runtime_options,
                             shard,
-                            dispatcher_shard,
-                            dispatcher_ptr = &*dispatcher,
                             &stopping,
                             legacy_next] () mutable {
-                            return run_shard_delivery_scanner(
-                                std::move(config),
-                                std::move(runtime_options),
-                                shard,
-                                dispatcher_shard,
-                                dispatcher_ptr,
-                                stopping,
-                                legacy_next);
+                            return seastar::do_with(
+                                DeliveryDispatcher(context, runtime_options, stopping),
+                                [
+                                    config = std::move(config),
+                                    runtime_options = std::move(runtime_options),
+                                    shard,
+                                    &stopping,
+                                    legacy_next] (DeliveryDispatcher& dispatcher) mutable {
+                                    dispatcher.start();
+                                    return run_shard_delivery_scanner(
+                                        std::move(config),
+                                        std::move(runtime_options),
+                                        shard,
+                                        &dispatcher,
+                                        stopping,
+                                        legacy_next).finally([&dispatcher] {
+                                        return dispatcher.stop();
+                                    });
+                            });
                         }));
                 }
             }
 
-            stop_signal.wait().get();
+            co_await stop_signal.wait();
             stopping.store(true, std::memory_order_relaxed);
-            if (dispatcher) {
-                dispatcher->stop().get();
-            }
             if (!delivery_scanners.empty()) {
-                seastar::when_all_succeed(delivery_scanners.begin(), delivery_scanners.end()).get();
+                co_await seastar::when_all_succeed(delivery_scanners.begin(), delivery_scanners.end());
             }
-            file_source_done.get();
-            stdin_source_done.get();
-            tcp_source_done.get();
-            udp_source_done.get();
-            unix_source_done.get();
-        });
+            co_await std::move(file_source_done);
+            co_await std::move(stdin_source_done);
+            co_await std::move(tcp_source_done);
+            co_await std::move(udp_source_done);
+            co_await std::move(unix_source_done);
+            co_await http_server.stop();
+            co_await context.engine.stop();
     });
 }

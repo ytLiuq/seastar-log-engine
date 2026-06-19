@@ -175,6 +175,10 @@ TailBatch tail_file_once(
     const std::string& path,
     const std::optional<SourceOffset>& previous,
     std::size_t max_lines);
+seastar::future<TailBatch> tail_file_once_async(
+    const std::string& path,
+    const std::optional<SourceOffset>& previous,
+    std::size_t max_lines);
 std::vector<std::string> expand_glob_paths(std::string_view pattern);
 std::vector<std::string> apply_multiline_records(const std::vector<std::string>& lines, const MultilineOptions& options);
 SourceLimitDecision evaluate_source_limits(
